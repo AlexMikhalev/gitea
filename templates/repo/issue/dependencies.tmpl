@@ -1,0 +1,74 @@
+{{if .IssueGraphEnabled}}
+<div class="ui segment">
+	<div class="ui header">
+		{{ctx.Locale.Tr "repo.issues.dependencies"}}
+	</div>
+	
+	{{if .IssueDependencies}}
+	<div class="ui list">
+		{{range .IssueDependencies}}
+		<div class="item">
+			{{if eq .DepType "blocks"}}
+			<span class="ui red label">{{ctx.Locale.Tr "repo.issues.dependency.blocks"}}</span>
+			{{else if eq .DepType "relates_to"}}
+			<span class="ui blue label">{{ctx.Locale.Tr "repo.issues.dependency.relates_to"}}</span>
+			{{else if eq .DepType "duplicates"}}
+			<span class="ui yellow label">{{ctx.Locale.Tr "repo.issues.dependency.duplicates"}}</span>
+			{{else if eq .DepType "supersedes"}}
+			<span class="ui green label">{{ctx.Locale.Tr "repo.issues.dependency.supersedes"}}</span>
+			{{end}}
+			<a href="{{$.RepoLink}}/issues/{{.DependsOnIndex}}">#{{.DependsOnIndex}} {{.DependsOnTitle}}</a>
+			{{if $.CanEditIssue}}
+			<form class="ui form" method="post" action="{{$.RepoLink}}/issues/{{$.Issue.Index}}/dependencies/delete" style="display: inline;">
+				{{$.CsrfTokenHtml}}
+				<input type="hidden" name="dependency_id" value="{{.ID}}">
+				<button type="submit" class="ui tiny basic negative button">{{ctx.Locale.Tr "repo.issues.dependency.remove"}}</button>
+			</form>
+			{{end}}
+		</div>
+		{{end}}
+	</div>
+	{{else}}
+	<p class="text grey">{{ctx.Locale.Tr "repo.issues.dependencies.none"}}</p>
+	{{end}}
+
+	{{if .IssueDependents}}
+	<div class="ui header">
+		{{ctx.Locale.Tr "repo.issues.dependents"}}
+	</div>
+	<div class="ui list">
+		{{range .IssueDependents}}
+		<div class="item">
+			{{if eq .DepType "blocks"}}
+			<span class="ui red label">{{ctx.Locale.Tr "repo.issues.dependency.blocked_by"}}</span>
+			{{end}}
+			<a href="{{$.RepoLink}}/issues/{{.IssueIndex}}">#{{.IssueIndex}} {{.IssueTitle}}</a>
+		</div>
+		{{end}}
+	</div>
+	{{end}}
+
+	{{if .CanEditIssue}}
+	<div class="ui divider"></div>
+	<form class="ui form" method="post" action="{{.RepoLink}}/issues/{{.Issue.Index}}/dependencies">
+		{{.CsrfTokenHtml}}
+		<div class="fields">
+			<div class="field">
+				<label>{{ctx.Locale.Tr "repo.issues.dependency.add"}}</label>
+				<input type="number" name="depends_on" placeholder="Issue #" min="1" required>
+			</div>
+			<div class="field">
+				<label>{{ctx.Locale.Tr "repo.issues.dependency.type"}}</label>
+				<select name="dep_type" class="ui dropdown">
+					<option value="blocks">{{ctx.Locale.Tr "repo.issues.dependency.blocks"}}</option>
+					<option value="relates_to">{{ctx.Locale.Tr "repo.issues.dependency.relates_to"}}</option>
+					<option value="duplicates">{{ctx.Locale.Tr "repo.issues.dependency.duplicates"}}</option>
+					<option value="supersedes">{{ctx.Locale.Tr "repo.issues.dependency.supersedes"}}</option>
+				</select>
+			</div>
+		</div>
+		<button type="submit" class="ui primary button">{{ctx.Locale.Tr "repo.issues.dependency.add_submit"}}</button>
+	</form>
+	{{end}}
+</div>
+{{end}}
