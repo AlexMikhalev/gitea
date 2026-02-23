@@ -42,7 +42,14 @@ func UpdatePageRank(ctx context.Context, repoID, issueID int64, pageRank float64
 		IssueID:  issueID,
 		PageRank: pageRank,
 	}
-	_, err := db.GetEngine(ctx).Upsert(cache)
+	// Try update first, then insert
+	affected, err := db.GetEngine(ctx).Where("repo_id = ? AND issue_id = ?", repoID, issueID).Cols("page_rank", "updated_unix").Update(cache)
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		_, err = db.GetEngine(ctx).Insert(cache)
+	}
 	return err
 }
 
