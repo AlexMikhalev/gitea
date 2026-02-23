@@ -74,8 +74,11 @@ func (s *Service) Triage(ctx context.Context, repoID int64) (*TriageResponse, er
 		return nil, err
 	}
 
-	// Get all issues for repo
-	issues, err := issues_model.GetIssuesByRepoID(ctx, repoID)
+	// Get all issues for repo using IssuesOptions
+	opts := &issues_model.IssuesOptions{
+		RepoIDs: []int64{repoID},
+	}
+	issues, err := issues_model.Issues(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
