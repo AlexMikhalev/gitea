@@ -14,14 +14,14 @@ import (
 // Triage returns prioritized list of issues for agents
 func Triage(ctx *context.APIContext) {
 	if !setting.IssueGraph.Enabled {
-		ctx.Error(http.StatusNotFound, "IssueGraphDisabled", "Issue graph features are disabled")
+		ctx.APIError(http.StatusNotFound, "Issue graph features are disabled")
 		return
 	}
 
 	svc := robot.NewService()
 	response, err := svc.Triage(ctx, ctx.Repo.Repository.ID)
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "Triage", err)
+		ctx.APIError(http.StatusInternalServerError, err)
 		return
 	}
 
