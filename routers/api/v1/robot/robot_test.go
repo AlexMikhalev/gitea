@@ -14,7 +14,6 @@ import (
 	repo_model "code.gitea.io/gitea/models/repo"
 	user_model "code.gitea.io/gitea/models/user"
 	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/services/context"
 )
 
 // mockAPIContext is a minimal mock of context.APIContext for testing
@@ -201,7 +200,7 @@ func TestCheckRepoPermission(t *testing.T) {
 // Test Triage handler - missing parameters
 func TestTriage_MissingParams(t *testing.T) {
 	// Enable feature
-	setting.IssueGraph.Enabled = true
+	setting.IssueGraphSettings.Enabled = true
 
 	tests := []struct {
 		name           string
@@ -252,7 +251,7 @@ func TestTriage_MissingParams(t *testing.T) {
 // Test Triage handler - invalid characters
 func TestTriage_InvalidCharacters(t *testing.T) {
 	// Enable feature
-	setting.IssueGraph.Enabled = true
+	setting.IssueGraphSettings.Enabled = true
 
 	tests := []struct {
 		name           string
@@ -309,12 +308,12 @@ func TestTriage_InvalidCharacters(t *testing.T) {
 // Test Triage handler - feature disabled
 func TestTriage_FeatureDisabled(t *testing.T) {
 	// Disable feature
-	setting.IssueGraph.Enabled = false
+	setting.IssueGraphSettings.Enabled = false
 
 	mockCtx := newMockAPIContext()
 
 	// Simulate the feature check in Triage
-	if !setting.IssueGraph.Enabled {
+	if !setting.IssueGraphSettings.Enabled {
 		mockCtx.NotFound()
 	}
 
@@ -323,13 +322,13 @@ func TestTriage_FeatureDisabled(t *testing.T) {
 	}
 
 	// Re-enable for other tests
-	setting.IssueGraph.Enabled = true
+	setting.IssueGraphSettings.Enabled = true
 }
 
 // Test Triage handler - unauthorized access (private repo, not signed in)
 func TestTriage_UnauthorizedAccess(t *testing.T) {
 	// Enable feature
-	setting.IssueGraph.Enabled = true
+	setting.IssueGraphSettings.Enabled = true
 
 	// This test documents the expected behavior:
 	// When a private repo is accessed by an unsigned user, return 404
@@ -357,7 +356,7 @@ func TestTriage_UnauthorizedAccess(t *testing.T) {
 // Test Triage handler - authorized access
 func TestTriage_AuthorizedAccess(t *testing.T) {
 	// Enable feature
-	setting.IssueGraph.Enabled = true
+	setting.IssueGraphSettings.Enabled = true
 
 	// This test documents the expected behavior:
 	// When a public repo is accessed, return 200

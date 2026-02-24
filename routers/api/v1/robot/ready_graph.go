@@ -9,9 +9,7 @@ import (
 
 	"code.gitea.io/gitea/models/db"
 	"code.gitea.io/gitea/models/issues"
-	"code.gitea.io/gitea/models/perm/access"
 	"code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/models/unit"
 	"code.gitea.io/gitea/modules/log"
 	"code.gitea.io/gitea/modules/setting"
 	"code.gitea.io/gitea/services/context"
@@ -43,18 +41,18 @@ type ReadyResponse struct {
 // Ready returns issues that are ready to be worked on (no blocking dependencies)
 func Ready(ctx *context.APIContext) {
 	// 1. Check feature enabled
-	if !setting.IssueGraph.Enabled {
-		ctx.NotFound()
+	if !setting.IssueGraphSettings.Enabled {
+		ctx.APIErrorNotFound()
 		return
 	}
 
-	// Get parameters from URL
-	owner := ctx.Params(":owner")
-	repoName := ctx.Params(":repo")
+	// Get parameters from query string
+	owner := ctx.FormString("owner")
+	repoName := ctx.FormString("repo")
 
 	// 2. Validate input
 	if err := validateOwnerRepoInput(owner, repoName); err != nil {
-		ctx.Error(http.StatusBadRequest, "ValidationError", err.Error())
+		ctx.APIError(http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -71,8 +69,8 @@ func Ready(ctx *context.APIContext) {
 				var userID int64
 				var username string
 				if ctx.IsSigned && ctx.Doer != nil {
-					userID = ctx.Doer.GetID()
-					username = ctx.Doer.GetName()
+					userID = ctx.Doer.ID
+					username = ctx.Doer.Name
 				} else {
 					userID = 0
 					username = "anonymous"
@@ -88,11 +86,11 @@ func Ready(ctx *context.APIContext) {
 					"repository not found",
 				)
 			}
-			ctx.NotFound()
+			ctx.APIErrorNotFound()
 			return
 		}
 		log.Error("Failed to get repository %s/%s: %v", owner, repoName, err)
-		ctx.Error(http.StatusInternalServerError, "GetRepository", err)
+		ctx.APIError(http.StatusInternalServerError, err)
 		return
 	}
 
@@ -110,7 +108,7 @@ func Ready(ctx *context.APIContext) {
 				"authentication required for private repository",
 			)
 		}
-		ctx.NotFound()
+		ctx.APIErrorNotFound()
 		return
 	}
 
@@ -121,8 +119,8 @@ func Ready(ctx *context.APIContext) {
 			var userID int64
 			var username string
 			if ctx.IsSigned && ctx.Doer != nil {
-				userID = ctx.Doer.GetID()
-				username = ctx.Doer.GetName()
+				userID = ctx.Doer.ID
+				username = ctx.Doer.Name
 			} else {
 				userID = 0
 				username = "anonymous"
@@ -146,8 +144,8 @@ func Ready(ctx *context.APIContext) {
 		var userID int64
 		var username string
 		if ctx.IsSigned && ctx.Doer != nil {
-			userID = ctx.Doer.GetID()
-			username = ctx.Doer.GetName()
+			userID = ctx.Doer.ID
+			username = ctx.Doer.Name
 		} else {
 			userID = 0
 			username = "anonymous"
@@ -168,7 +166,7 @@ func Ready(ctx *context.APIContext) {
 	readyIssues, err := getReadyIssues(ctx, repository)
 	if err != nil {
 		log.Error("Failed to get ready issues for repo %d: %v", repository.ID, err)
-		ctx.Error(http.StatusInternalServerError, "GetReadyIssues", err)
+		ctx.APIError(http.StatusInternalServerError, err)
 		return
 	}
 
@@ -317,18 +315,18 @@ type GraphResponse struct {
 // Graph returns the dependency graph for a repository
 func Graph(ctx *context.APIContext) {
 	// 1. Check feature enabled
-	if !setting.IssueGraph.Enabled {
-		ctx.NotFound()
+	if !setting.IssueGraphSettings.Enabled {
+		ctx.APIErrorNotFound()
 		return
 	}
 
-	// Get parameters from URL
-	owner := ctx.Params(":owner")
-	repoName := ctx.Params(":repo")
+	// Get parameters from query string
+	owner := ctx.FormString("owner")
+	repoName := ctx.FormString("repo")
 
 	// 2. Validate input
 	if err := validateOwnerRepoInput(owner, repoName); err != nil {
-		ctx.Error(http.StatusBadRequest, "ValidationError", err.Error())
+		ctx.APIError(http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -345,8 +343,8 @@ func Graph(ctx *context.APIContext) {
 				var userID int64
 				var username string
 				if ctx.IsSigned && ctx.Doer != nil {
-					userID = ctx.Doer.GetID()
-					username = ctx.Doer.GetName()
+					userID = ctx.Doer.ID
+					username = ctx.Doer.Name
 				} else {
 					userID = 0
 					username = "anonymous"
@@ -362,11 +360,11 @@ func Graph(ctx *context.APIContext) {
 					"repository not found",
 				)
 			}
-			ctx.NotFound()
+			ctx.APIErrorNotFound()
 			return
 		}
 		log.Error("Failed to get repository %s/%s: %v", owner, repoName, err)
-		ctx.Error(http.StatusInternalServerError, "GetRepository", err)
+		ctx.APIError(http.StatusInternalServerError, err)
 		return
 	}
 
@@ -384,7 +382,7 @@ func Graph(ctx *context.APIContext) {
 				"authentication required for private repository",
 			)
 		}
-		ctx.NotFound()
+		ctx.APIErrorNotFound()
 		return
 	}
 
@@ -395,8 +393,8 @@ func Graph(ctx *context.APIContext) {
 			var userID int64
 			var username string
 			if ctx.IsSigned && ctx.Doer != nil {
-				userID = ctx.Doer.GetID()
-				username = ctx.Doer.GetName()
+				userID = ctx.Doer.ID
+				username = ctx.Doer.Name
 			} else {
 				userID = 0
 				username = "anonymous"
@@ -420,8 +418,8 @@ func Graph(ctx *context.APIContext) {
 		var userID int64
 		var username string
 		if ctx.IsSigned && ctx.Doer != nil {
-			userID = ctx.Doer.GetID()
-			username = ctx.Doer.GetName()
+			userID = ctx.Doer.ID
+			username = ctx.Doer.Name
 		} else {
 			userID = 0
 			username = "anonymous"
@@ -442,7 +440,7 @@ func Graph(ctx *context.APIContext) {
 	nodes, edges, err := getDependencyGraph(ctx, repository)
 	if err != nil {
 		log.Error("Failed to get dependency graph for repo %d: %v", repository.ID, err)
-		ctx.Error(http.StatusInternalServerError, "GetDependencyGraph", err)
+		ctx.APIError(http.StatusInternalServerError, err)
 		return
 	}
 

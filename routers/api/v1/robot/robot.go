@@ -60,14 +60,14 @@ func checkRepoPermissionForTriage(ctx *context.APIContext, repository *repo_mode
 	perm, err := access_model.GetUserRepoPermission(ctx, repository, ctx.Doer)
 	if err != nil {
 		log.Error("Failed to get user repo permission: %v", err)
-		ctx.NotFound()
+		ctx.APIErrorNotFound()
 		return false
 	}
 
 	// Check if user can read issues
 	if !perm.CanRead(unit.TypeIssues) {
 		// Return 404 to avoid leaking repository existence
-		ctx.NotFound()
+		ctx.APIErrorNotFound()
 		return false
 	}
 
@@ -78,8 +78,8 @@ func checkRepoPermissionForTriage(ctx *context.APIContext, repository *repo_mode
 // Returns prioritized issues using PageRank algorithm
 func Triage(ctx *context.APIContext) {
 	// 1. Check feature enabled
-	if !setting.IssueGraphEnabled() {
-		ctx.NotFound()
+	if !setting.IsIssueGraphEnabled() {
+		ctx.APIErrorNotFound()
 		return
 	}
 
@@ -89,7 +89,7 @@ func Triage(ctx *context.APIContext) {
 
 	// 2. Validate input
 	if err := validateOwnerRepoInput(owner, repoName); err != nil {
-		ctx.Error(http.StatusBadRequest, "ValidationError", err.Error())
+		ctx.APIError(http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -100,18 +100,18 @@ func Triage(ctx *context.APIContext) {
 	// 4. Lookup repository
 	repository, err := repo_model.GetRepositoryByOwnerAndName(ctx, owner, repoName)
 	if err != nil {
-		if errors.Is(err, db.ErrNotExist) {
+		if db.IsErrNotExist(err) {
 			// Return 404 to avoid leaking repository existence
-			ctx.NotFound()
+			ctx.APIErrorNotFound()
 			return
 		}
-		ctx.Error(http.StatusInternalServerError, "RepoLookupError", err.Error())
+		ctx.APIError(http.StatusInternalServerError, err)
 		return
 	}
 
 	// Check if repository is private and user is not signed in
 	if repository.IsPrivate && !ctx.IsSigned {
-		ctx.NotFound()
+		ctx.APIErrorNotFound()
 		return
 	}
 
@@ -120,12 +120,12 @@ func Triage(ctx *context.APIContext) {
 		// checkRepoPermission already set the response
 		// Log the denied access
 		robot.LogRobotAccessQuick(
-			ctx.Doer.GetID(),
-			ctx.Doer.GetName(),
+			ctx.Doer.ID,
+			ctx.Doer.Name,
 			owner,
 			repoName,
 			"/api/v1/robot/triage",
-			ctx.RemoteAddr,
+			ctx.RemoteAddr(),
 			false,
 			"insufficient_permissions",
 		)
@@ -134,22 +134,22 @@ func Triage(ctx *context.APIContext) {
 
 	// 6. Log access
 	robot.LogRobotAccessQuick(
-		ctx.Doer.GetID(),
-		ctx.Doer.GetName(),
+		ctx.Doer.ID,
+		ctx.Doer.Name,
 		owner,
 		repoName,
 		"/api/v1/robot/triage",
-		ctx.RemoteAddr,
+		ctx.RemoteAddr(),
 		true,
 		"",
 	)
 
 	// 7. Call service
 	service := robot.NewService()
-	response, err := service.Triage(ctx, repository)
+	response, err := service.Triage(ctx, repository.ID)
 	if err != nil {
 		log.Error("Robot triage service error: %v", err)
-		ctx.Error(http.StatusInternalServerError, "ServiceError", err.Error())
+		ctx.APIError(http.StatusInternalServerError, err)
 		return
 	}
 
