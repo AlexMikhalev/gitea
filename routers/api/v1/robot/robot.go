@@ -12,9 +12,9 @@ import (
 	access_model "code.gitea.io/gitea/models/perm/access"
 	repo_model "code.gitea.io/gitea/models/repo"
 	"code.gitea.io/gitea/models/unit"
-	"code.gitea.io/gitea/modules/context"
 	"code.gitea.io/gitea/modules/log"
 	"code.gitea.io/gitea/modules/setting"
+	"code.gitea.io/gitea/services/context"
 	"code.gitea.io/gitea/services/robot"
 )
 
@@ -78,7 +78,7 @@ func checkRepoPermissionForTriage(ctx *context.APIContext, repository *repo_mode
 // Returns prioritized issues using PageRank algorithm
 func Triage(ctx *context.APIContext) {
 	// 1. Check feature enabled
-	if !setting.IssueGraph.Enabled {
+	if !setting.IssueGraphEnabled() {
 		ctx.NotFound()
 		return
 	}

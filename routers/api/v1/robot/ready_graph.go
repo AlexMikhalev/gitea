@@ -12,10 +12,12 @@ import (
 	"code.gitea.io/gitea/models/perm/access"
 	"code.gitea.io/gitea/models/repo"
 	"code.gitea.io/gitea/models/unit"
-	"code.gitea.io/gitea/modules/context"
 	"code.gitea.io/gitea/modules/log"
 	"code.gitea.io/gitea/modules/setting"
+	"code.gitea.io/gitea/services/context"
 	"code.gitea.io/gitea/services/robot"
+
+	"code.gitea.io/gitea/modules/optional"
 )
 
 // ReadyIssue represents an issue that is ready to be worked on
@@ -183,22 +185,28 @@ func Ready(ctx *context.APIContext) {
 // getReadyIssues queries the database for issues that are ready to be worked on
 // (open issues with no blocking dependencies)
 func getReadyIssues(ctx *context.APIContext, repository *repo.Repository) ([]ReadyIssue, error) {
-	// Get all open issues for the repository
-	issuesList, err := issues.GetIssuesByRepoID(ctx, repository.ID, issues.IssuesOptions{
-		State: "open",
+	// Get all open issues for the repository using correct API
+	issuesList, err := issues.Issues(ctx, &issues.IssuesOptions{
+		RepoIDs:  []int64{repository.ID},
+		IsClosed: optional.Some(false),
+		IsPull:   optional.Some(false),
 	})
 	if err != nil {
 		return nil, err
 	}
 
+	// Get PageRank scores for all issues in this repo
+	pageRanks, err := issues.GetPageRanksForRepo(ctx, repository.ID)
+	if err != nil {
+		log.Warn("Failed to get PageRank scores: %v", err)
+		pageRanks = make(map[int64]float64)
+	}
+
+	baseline := 1.0 - setting.IssueGraphSettings.DampingFactor
+
 	readyIssues := make([]ReadyIssue, 0)
 
 	for _, issue := range issuesList {
-		// Skip pull requests (they are also issues in Gitea)
-		if issue.IsPull {
-			continue
-		}
-
 		// Get dependency count for this issue
 		// In Gitea, dependencies are stored in issue_dependency table
 		// We need to check if this issue has any open blockers
@@ -215,8 +223,11 @@ func getReadyIssues(ctx *context.APIContext, repository *repo.Repository) ([]Rea
 		// Calculate priority based on labels, comments, etc.
 		priority := calculatePriority(issue)
 
-		// Get PageRank score (placeholder - would come from cache or calculation)
-		pageRank := 0.5 // Default score
+		// Get PageRank score from cache or use baseline
+		pageRank := baseline
+		if score, ok := pageRanks[issue.ID]; ok && score > 0 {
+			pageRank = score
+		}
 
 		readyIssues = append(readyIssues, ReadyIssue{
 			ID:           issue.ID,
@@ -449,13 +460,23 @@ func Graph(ctx *context.APIContext) {
 
 // getDependencyGraph builds the dependency graph for a repository
 func getDependencyGraph(ctx *context.APIContext, repository *repo.Repository) ([]GraphNode, []GraphEdge, error) {
-	// Get all issues for the repository (both open and closed)
-	issuesList, err := issues.GetIssuesByRepoID(ctx, repository.ID, issues.IssuesOptions{
-		State: "all", // Get both open and closed
+	// Get all issues for the repository (both open and closed) using correct API
+	issuesList, err := issues.Issues(ctx, &issues.IssuesOptions{
+		RepoIDs: []int64{repository.ID},
+		IsPull:  optional.Some(false),
 	})
 	if err != nil {
 		return nil, nil, err
 	}
+
+	// Get PageRank scores for all issues in this repo
+	pageRanks, err := issues.GetPageRanksForRepo(ctx, repository.ID)
+	if err != nil {
+		log.Warn("Failed to get PageRank scores: %v", err)
+		pageRanks = make(map[int64]float64)
+	}
+
+	baseline := 1.0 - setting.IssueGraphSettings.DampingFactor
 
 	// Build node map
 	nodeMap := make(map[int64]GraphNode)
@@ -467,8 +488,11 @@ func getDependencyGraph(ctx *context.APIContext, repository *repo.Repository) ([
 			continue
 		}
 
-		// Get PageRank score (placeholder)
-		pageRank := 0.5
+		// Get PageRank score from cache or use baseline
+		pageRank := baseline
+		if score, ok := pageRanks[issue.ID]; ok && score > 0 {
+			pageRank = score
+		}
 
 		node := GraphNode{
 			ID:       issue.ID,
