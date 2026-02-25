@@ -4,7 +4,6 @@
 package robot
 
 import (
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -381,9 +380,9 @@ func TestTriage_AuthorizedAccess(t *testing.T) {
 
 // Test error types
 func TestErrorTypes(t *testing.T) {
-	// Verify db.ErrNotExist is properly detected
+	// Verify db.ErrNotExist is properly detected using IsErrNotExist
 	err := db.ErrNotExist{Resource: "repository"}
-	if !errors.Is(err, db.ErrNotExist{}) {
+	if !db.IsErrNotExist(err) {
 		t.Error("Expected db.ErrNotExist to be properly detected")
 	}
 }

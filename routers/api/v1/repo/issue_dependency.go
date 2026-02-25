@@ -12,7 +12,7 @@ import (
 
 // ListIssueDependencies lists all dependencies for an issue
 func ListIssueDependencies(ctx *context.APIContext) {
-	if !setting.IssueGraph.Enabled {
+	if !setting.IssueGraphSettings.Enabled {
 		ctx.APIErrorNotFound("Issue graph features are disabled")
 		return
 	}
