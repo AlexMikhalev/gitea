@@ -103,7 +103,7 @@ func triageCmd() {
 		fmt.Println(data)
 	} else {
 		// Pretty print as markdown
-		var result map[string]interface{}
+		var result map[string]any
 		json.Unmarshal([]byte(data), &result)
 		printTriageMarkdown(result)
 	}
@@ -171,7 +171,7 @@ func addDepCmd() {
 
 	url := fmt.Sprintf("%s/api/v1/repos/%s/%s/issues/%d/dependencies", giteaURL, *owner, *repo, *issue)
 	body := fmt.Sprintf(`{"depends_on": %d, "dep_type": "%s"}`, dependsOn, depType)
-	
+
 	req, _ := http.NewRequest("POST", url, strings.NewReader(body))
 	req.Header.Set("Authorization", "token "+giteaToken)
 	req.Header.Set("Content-Type", "application/json")
@@ -222,22 +222,22 @@ func apiGet(url string) string {
 	return string(body)
 }
 
-func printTriageMarkdown(result map[string]interface{}) {
+func printTriageMarkdown(result map[string]any) {
 	fmt.Println("## Triage Report")
 	fmt.Println()
 
-	if quickRef, ok := result["quick_ref"].(map[string]interface{}); ok {
+	if quickRef, ok := result["quick_ref"].(map[string]any); ok {
 		fmt.Printf("**Stats:** Total: %.0f, Open: %.0f, Blocked: %.0f, Ready: %.0f\n\n",
 			quickRef["total"], quickRef["open"], quickRef["blocked"], quickRef["ready"])
 	}
 
-	if recs, ok := result["recommendations"].([]interface{}); ok {
+	if recs, ok := result["recommendations"].([]any); ok {
 		fmt.Println("### Top Recommendations")
 		for i, r := range recs {
 			if i >= 5 {
 				break
 			}
-			rec := r.(map[string]interface{})
+			rec := r.(map[string]any)
 			fmt.Printf("%d. **#%.0f: %s** (PageRank: %.4f)\n",
 				i+1, rec["index"], rec["title"], rec["pagerank"])
 		}

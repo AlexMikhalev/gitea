@@ -6,22 +6,22 @@ package repo
 import (
 	"net/http"
 
-	"code.gitea.io/gitea/services/context"
 	"code.gitea.io/gitea/modules/setting"
+	"code.gitea.io/gitea/services/context"
 )
 
 // GetIssueDependencies lists dependencies for an issue
 func GetIssueDependencies(ctx *context.APIContext) {
-	if !setting.IssueGraph.Enabled {
+	if !setting.IssueGraphSettings.Enabled {
 		ctx.APIErrorNotFound("Issue graph features are disabled")
 		return
 	}
-	ctx.JSON(http.StatusOK, []interface{}{})
+	ctx.JSON(http.StatusOK, []any{})
 }
 
 // CreateIssueDependency creates a dependency
 func CreateIssueDependency(ctx *context.APIContext) {
-	if !setting.IssueGraph.Enabled {
+	if !setting.IssueGraphSettings.Enabled {
 		ctx.APIErrorNotFound("Issue graph features are disabled")
 		return
 	}
@@ -30,7 +30,7 @@ func CreateIssueDependency(ctx *context.APIContext) {
 
 // RemoveIssueDependency removes a dependency
 func RemoveIssueDependency(ctx *context.APIContext) {
-	if !setting.IssueGraph.Enabled {
+	if !setting.IssueGraphSettings.Enabled {
 		ctx.APIErrorNotFound("Issue graph features are disabled")
 		return
 	}
@@ -39,16 +39,16 @@ func RemoveIssueDependency(ctx *context.APIContext) {
 
 // GetIssueBlocks lists blocking issues
 func GetIssueBlocks(ctx *context.APIContext) {
-	if !setting.IssueGraph.Enabled {
+	if !setting.IssueGraphSettings.Enabled {
 		ctx.APIErrorNotFound("Issue graph features are disabled")
 		return
 	}
-	ctx.JSON(http.StatusOK, []interface{}{})
+	ctx.JSON(http.StatusOK, []any{})
 }
 
 // CreateIssueBlocking creates a blocking relationship
 func CreateIssueBlocking(ctx *context.APIContext) {
-	if !setting.IssueGraph.Enabled {
+	if !setting.IssueGraphSettings.Enabled {
 		ctx.APIErrorNotFound("Issue graph features are disabled")
 		return
 	}
@@ -57,7 +57,7 @@ func CreateIssueBlocking(ctx *context.APIContext) {
 
 // RemoveIssueBlocking removes a blocking relationship
 func RemoveIssueBlocking(ctx *context.APIContext) {
-	if !setting.IssueGraph.Enabled {
+	if !setting.IssueGraphSettings.Enabled {
 		ctx.APIErrorNotFound("Issue graph features are disabled")
 		return
 	}

@@ -9,13 +9,13 @@ import (
 
 	"code.gitea.io/gitea/models/db"
 	"code.gitea.io/gitea/models/issues"
-	"code.gitea.io/gitea/models/perm/access"
 	"code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/models/unit"
-	"code.gitea.io/gitea/modules/context"
 	"code.gitea.io/gitea/modules/log"
 	"code.gitea.io/gitea/modules/setting"
+	"code.gitea.io/gitea/services/context"
 	"code.gitea.io/gitea/services/robot"
+
+	"code.gitea.io/gitea/modules/optional"
 )
 
 // ReadyIssue represents an issue that is ready to be worked on
@@ -41,18 +41,18 @@ type ReadyResponse struct {
 // Ready returns issues that are ready to be worked on (no blocking dependencies)
 func Ready(ctx *context.APIContext) {
 	// 1. Check feature enabled
-	if !setting.IssueGraph.Enabled {
-		ctx.NotFound()
+	if !setting.IssueGraphSettings.Enabled {
+		ctx.APIErrorNotFound()
 		return
 	}
 
-	// Get parameters from URL
-	owner := ctx.Params(":owner")
-	repoName := ctx.Params(":repo")
+	// Get parameters from query string
+	owner := ctx.FormString("owner")
+	repoName := ctx.FormString("repo")
 
 	// 2. Validate input
 	if err := validateOwnerRepoInput(owner, repoName); err != nil {
-		ctx.Error(http.StatusBadRequest, "ValidationError", err.Error())
+		ctx.APIError(http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -69,8 +69,8 @@ func Ready(ctx *context.APIContext) {
 				var userID int64
 				var username string
 				if ctx.IsSigned && ctx.Doer != nil {
-					userID = ctx.Doer.GetID()
-					username = ctx.Doer.GetName()
+					userID = ctx.Doer.ID
+					username = ctx.Doer.Name
 				} else {
 					userID = 0
 					username = "anonymous"
@@ -86,11 +86,11 @@ func Ready(ctx *context.APIContext) {
 					"repository not found",
 				)
 			}
-			ctx.NotFound()
+			ctx.APIErrorNotFound()
 			return
 		}
 		log.Error("Failed to get repository %s/%s: %v", owner, repoName, err)
-		ctx.Error(http.StatusInternalServerError, "GetRepository", err)
+		ctx.APIError(http.StatusInternalServerError, err)
 		return
 	}
 
@@ -108,7 +108,7 @@ func Ready(ctx *context.APIContext) {
 				"authentication required for private repository",
 			)
 		}
-		ctx.NotFound()
+		ctx.APIErrorNotFound()
 		return
 	}
 
@@ -119,8 +119,8 @@ func Ready(ctx *context.APIContext) {
 			var userID int64
 			var username string
 			if ctx.IsSigned && ctx.Doer != nil {
-				userID = ctx.Doer.GetID()
-				username = ctx.Doer.GetName()
+				userID = ctx.Doer.ID
+				username = ctx.Doer.Name
 			} else {
 				userID = 0
 				username = "anonymous"
@@ -144,8 +144,8 @@ func Ready(ctx *context.APIContext) {
 		var userID int64
 		var username string
 		if ctx.IsSigned && ctx.Doer != nil {
-			userID = ctx.Doer.GetID()
-			username = ctx.Doer.GetName()
+			userID = ctx.Doer.ID
+			username = ctx.Doer.Name
 		} else {
 			userID = 0
 			username = "anonymous"
@@ -166,7 +166,7 @@ func Ready(ctx *context.APIContext) {
 	readyIssues, err := getReadyIssues(ctx, repository)
 	if err != nil {
 		log.Error("Failed to get ready issues for repo %d: %v", repository.ID, err)
-		ctx.Error(http.StatusInternalServerError, "GetReadyIssues", err)
+		ctx.APIError(http.StatusInternalServerError, err)
 		return
 	}
 
@@ -183,22 +183,28 @@ func Ready(ctx *context.APIContext) {
 // getReadyIssues queries the database for issues that are ready to be worked on
 // (open issues with no blocking dependencies)
 func getReadyIssues(ctx *context.APIContext, repository *repo.Repository) ([]ReadyIssue, error) {
-	// Get all open issues for the repository
-	issuesList, err := issues.GetIssuesByRepoID(ctx, repository.ID, issues.IssuesOptions{
-		State: "open",
+	// Get all open issues for the repository using correct API
+	issuesList, err := issues.Issues(ctx, &issues.IssuesOptions{
+		RepoIDs:  []int64{repository.ID},
+		IsClosed: optional.Some(false),
+		IsPull:   optional.Some(false),
 	})
 	if err != nil {
 		return nil, err
 	}
 
+	// Get PageRank scores for all issues in this repo
+	pageRanks, err := issues.GetPageRanksForRepo(ctx, repository.ID)
+	if err != nil {
+		log.Warn("Failed to get PageRank scores: %v", err)
+		pageRanks = make(map[int64]float64)
+	}
+
+	baseline := 1.0 - setting.IssueGraphSettings.DampingFactor
+
 	readyIssues := make([]ReadyIssue, 0)
 
 	for _, issue := range issuesList {
-		// Skip pull requests (they are also issues in Gitea)
-		if issue.IsPull {
-			continue
-		}
-
 		// Get dependency count for this issue
 		// In Gitea, dependencies are stored in issue_dependency table
 		// We need to check if this issue has any open blockers
@@ -215,8 +221,11 @@ func getReadyIssues(ctx *context.APIContext, repository *repo.Repository) ([]Rea
 		// Calculate priority based on labels, comments, etc.
 		priority := calculatePriority(issue)
 
-		// Get PageRank score (placeholder - would come from cache or calculation)
-		pageRank := 0.5 // Default score
+		// Get PageRank score from cache or use baseline
+		pageRank := baseline
+		if score, ok := pageRanks[issue.ID]; ok && score > 0 {
+			pageRank = score
+		}
 
 		readyIssues = append(readyIssues, ReadyIssue{
 			ID:           issue.ID,
@@ -306,18 +315,18 @@ type GraphResponse struct {
 // Graph returns the dependency graph for a repository
 func Graph(ctx *context.APIContext) {
 	// 1. Check feature enabled
-	if !setting.IssueGraph.Enabled {
-		ctx.NotFound()
+	if !setting.IssueGraphSettings.Enabled {
+		ctx.APIErrorNotFound()
 		return
 	}
 
-	// Get parameters from URL
-	owner := ctx.Params(":owner")
-	repoName := ctx.Params(":repo")
+	// Get parameters from query string
+	owner := ctx.FormString("owner")
+	repoName := ctx.FormString("repo")
 
 	// 2. Validate input
 	if err := validateOwnerRepoInput(owner, repoName); err != nil {
-		ctx.Error(http.StatusBadRequest, "ValidationError", err.Error())
+		ctx.APIError(http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -334,8 +343,8 @@ func Graph(ctx *context.APIContext) {
 				var userID int64
 				var username string
 				if ctx.IsSigned && ctx.Doer != nil {
-					userID = ctx.Doer.GetID()
-					username = ctx.Doer.GetName()
+					userID = ctx.Doer.ID
+					username = ctx.Doer.Name
 				} else {
 					userID = 0
 					username = "anonymous"
@@ -351,11 +360,11 @@ func Graph(ctx *context.APIContext) {
 					"repository not found",
 				)
 			}
-			ctx.NotFound()
+			ctx.APIErrorNotFound()
 			return
 		}
 		log.Error("Failed to get repository %s/%s: %v", owner, repoName, err)
-		ctx.Error(http.StatusInternalServerError, "GetRepository", err)
+		ctx.APIError(http.StatusInternalServerError, err)
 		return
 	}
 
@@ -373,7 +382,7 @@ func Graph(ctx *context.APIContext) {
 				"authentication required for private repository",
 			)
 		}
-		ctx.NotFound()
+		ctx.APIErrorNotFound()
 		return
 	}
 
@@ -384,8 +393,8 @@ func Graph(ctx *context.APIContext) {
 			var userID int64
 			var username string
 			if ctx.IsSigned && ctx.Doer != nil {
-				userID = ctx.Doer.GetID()
-				username = ctx.Doer.GetName()
+				userID = ctx.Doer.ID
+				username = ctx.Doer.Name
 			} else {
 				userID = 0
 				username = "anonymous"
@@ -409,8 +418,8 @@ func Graph(ctx *context.APIContext) {
 		var userID int64
 		var username string
 		if ctx.IsSigned && ctx.Doer != nil {
-			userID = ctx.Doer.GetID()
-			username = ctx.Doer.GetName()
+			userID = ctx.Doer.ID
+			username = ctx.Doer.Name
 		} else {
 			userID = 0
 			username = "anonymous"
@@ -431,7 +440,7 @@ func Graph(ctx *context.APIContext) {
 	nodes, edges, err := getDependencyGraph(ctx, repository)
 	if err != nil {
 		log.Error("Failed to get dependency graph for repo %d: %v", repository.ID, err)
-		ctx.Error(http.StatusInternalServerError, "GetDependencyGraph", err)
+		ctx.APIError(http.StatusInternalServerError, err)
 		return
 	}
 
@@ -449,13 +458,23 @@ func Graph(ctx *context.APIContext) {
 
 // getDependencyGraph builds the dependency graph for a repository
 func getDependencyGraph(ctx *context.APIContext, repository *repo.Repository) ([]GraphNode, []GraphEdge, error) {
-	// Get all issues for the repository (both open and closed)
-	issuesList, err := issues.GetIssuesByRepoID(ctx, repository.ID, issues.IssuesOptions{
-		State: "all", // Get both open and closed
+	// Get all issues for the repository (both open and closed) using correct API
+	issuesList, err := issues.Issues(ctx, &issues.IssuesOptions{
+		RepoIDs: []int64{repository.ID},
+		IsPull:  optional.Some(false),
 	})
 	if err != nil {
 		return nil, nil, err
 	}
+
+	// Get PageRank scores for all issues in this repo
+	pageRanks, err := issues.GetPageRanksForRepo(ctx, repository.ID)
+	if err != nil {
+		log.Warn("Failed to get PageRank scores: %v", err)
+		pageRanks = make(map[int64]float64)
+	}
+
+	baseline := 1.0 - setting.IssueGraphSettings.DampingFactor
 
 	// Build node map
 	nodeMap := make(map[int64]GraphNode)
@@ -467,8 +486,11 @@ func getDependencyGraph(ctx *context.APIContext, repository *repo.Repository) ([
 			continue
 		}
 
-		// Get PageRank score (placeholder)
-		pageRank := 0.5
+		// Get PageRank score from cache or use baseline
+		pageRank := baseline
+		if score, ok := pageRanks[issue.ID]; ok && score > 0 {
+			pageRank = score
+		}
 
 		node := GraphNode{
 			ID:       issue.ID,

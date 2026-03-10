@@ -15,7 +15,7 @@ type mockConfigProvider struct {
 	data map[string]map[string]string
 }
 
-func (m *mockConfigProvider) Section(name string) *ini.Section {
+func (m *mockConfigProvider) Section(name string) ConfigSection {
 	// Create a temporary ini file to parse
 	cfg := ini.Empty()
 	sec, _ := cfg.NewSection(name)
@@ -25,11 +25,77 @@ func (m *mockConfigProvider) Section(name string) *ini.Section {
 			sec.Key(key).SetValue(value)
 		}
 	}
-	return sec
+	return &mockConfigSection{sec: sec}
+}
+
+type mockConfigSection struct {
+	sec *ini.Section
+}
+
+func (m *mockConfigSection) Name() string {
+	return m.sec.Name()
+}
+
+func (m *mockConfigSection) MapTo(v any) error {
+	return m.sec.MapTo(v)
+}
+
+func (m *mockConfigSection) HasKey(key string) bool {
+	return m.sec.HasKey(key)
+}
+
+func (m *mockConfigSection) NewKey(name, value string) (ConfigKey, error) {
+	return m.sec.NewKey(name, value)
+}
+
+func (m *mockConfigSection) Key(name string) ConfigKey {
+	return m.sec.Key(name)
+}
+
+func (m *mockConfigSection) DeleteKey(key string) {}
+
+func (m *mockConfigSection) Keys() []ConfigKey {
+	return nil
+}
+
+func (m *mockConfigSection) ChildSections() []ConfigSection {
+	return nil
 }
 
 func (m *mockConfigProvider) MustValue(key string) string {
 	return ""
+}
+
+func (m *mockConfigProvider) Sections() []ConfigSection {
+	return nil
+}
+
+func (m *mockConfigProvider) NewSection(name string) (ConfigSection, error) {
+	return nil, nil
+}
+
+func (m *mockConfigProvider) GetSection(name string) (ConfigSection, error) {
+	return nil, nil
+}
+
+func (m *mockConfigProvider) DeleteSection(name string) {}
+
+func (m *mockConfigProvider) Save() error {
+	return nil
+}
+
+func (m *mockConfigProvider) SaveTo(filename string) error {
+	return nil
+}
+
+func (m *mockConfigProvider) DisableSaving() {}
+
+func (m *mockConfigProvider) PrepareSaving() (ConfigProvider, error) {
+	return m, nil
+}
+
+func (m *mockConfigProvider) IsLoadedFromEmpty() bool {
+	return true
 }
 
 func TestLoadIssueGraphFrom_Defaults(t *testing.T) {

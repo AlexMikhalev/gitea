@@ -4,6 +4,8 @@
 package setting
 
 import (
+	"strconv"
+
 	"code.gitea.io/gitea/modules/log"
 )
 
@@ -35,7 +37,11 @@ func loadIssueGraphFrom(rootCfg ConfigProvider) {
 
 	// Core settings
 	IssueGraphSettings.Enabled = sec.Key("ENABLED").MustBool(true)
-	IssueGraphSettings.DampingFactor = sec.Key("DAMPING_FACTOR").MustFloat64(0.85)
+	if dampingStr := sec.Key("DAMPING_FACTOR").MustString(""); dampingStr != "" {
+		if damping, err := strconv.ParseFloat(dampingStr, 64); err == nil {
+			IssueGraphSettings.DampingFactor = damping
+		}
+	}
 	IssueGraphSettings.Iterations = sec.Key("ITERATIONS").MustInt(100)
 
 	// Security settings (new)

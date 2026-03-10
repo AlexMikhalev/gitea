@@ -4,7 +4,6 @@
 package robot
 
 import (
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,7 +12,6 @@ import (
 	"code.gitea.io/gitea/models/db"
 	repo_model "code.gitea.io/gitea/models/repo"
 	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/context"
 	"code.gitea.io/gitea/modules/setting"
 )
 
@@ -201,7 +199,7 @@ func TestCheckRepoPermission(t *testing.T) {
 // Test Triage handler - missing parameters
 func TestTriage_MissingParams(t *testing.T) {
 	// Enable feature
-	setting.IssueGraph.Enabled = true
+	setting.IssueGraphSettings.Enabled = true
 
 	tests := []struct {
 		name           string
@@ -252,7 +250,7 @@ func TestTriage_MissingParams(t *testing.T) {
 // Test Triage handler - invalid characters
 func TestTriage_InvalidCharacters(t *testing.T) {
 	// Enable feature
-	setting.IssueGraph.Enabled = true
+	setting.IssueGraphSettings.Enabled = true
 
 	tests := []struct {
 		name           string
@@ -309,12 +307,12 @@ func TestTriage_InvalidCharacters(t *testing.T) {
 // Test Triage handler - feature disabled
 func TestTriage_FeatureDisabled(t *testing.T) {
 	// Disable feature
-	setting.IssueGraph.Enabled = false
+	setting.IssueGraphSettings.Enabled = false
 
 	mockCtx := newMockAPIContext()
 
 	// Simulate the feature check in Triage
-	if !setting.IssueGraph.Enabled {
+	if !setting.IssueGraphSettings.Enabled {
 		mockCtx.NotFound()
 	}
 
@@ -323,13 +321,13 @@ func TestTriage_FeatureDisabled(t *testing.T) {
 	}
 
 	// Re-enable for other tests
-	setting.IssueGraph.Enabled = true
+	setting.IssueGraphSettings.Enabled = true
 }
 
 // Test Triage handler - unauthorized access (private repo, not signed in)
 func TestTriage_UnauthorizedAccess(t *testing.T) {
 	// Enable feature
-	setting.IssueGraph.Enabled = true
+	setting.IssueGraphSettings.Enabled = true
 
 	// This test documents the expected behavior:
 	// When a private repo is accessed by an unsigned user, return 404
@@ -357,7 +355,7 @@ func TestTriage_UnauthorizedAccess(t *testing.T) {
 // Test Triage handler - authorized access
 func TestTriage_AuthorizedAccess(t *testing.T) {
 	// Enable feature
-	setting.IssueGraph.Enabled = true
+	setting.IssueGraphSettings.Enabled = true
 
 	// This test documents the expected behavior:
 	// When a public repo is accessed, return 200
@@ -382,9 +380,9 @@ func TestTriage_AuthorizedAccess(t *testing.T) {
 
 // Test error types
 func TestErrorTypes(t *testing.T) {
-	// Verify db.ErrNotExist is properly detected
+	// Verify db.ErrNotExist is properly detected using IsErrNotExist
 	err := db.ErrNotExist{Resource: "repository"}
-	if !errors.Is(err, db.ErrNotExist{}) {
+	if !db.IsErrNotExist(err) {
 		t.Error("Expected db.ErrNotExist to be properly detected")
 	}
 }

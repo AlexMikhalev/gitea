@@ -20,7 +20,7 @@ type Service struct {
 // NewService creates a new robot service
 func NewService() *Service {
 	return &Service{
-		enabled: setting.IssueGraph.Enabled,
+		enabled: setting.IssueGraphSettings.Enabled,
 	}
 }
 

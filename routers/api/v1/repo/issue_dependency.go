@@ -6,17 +6,17 @@ package repo
 import (
 	"net/http"
 
-	"code.gitea.io/gitea/services/context"
 	"code.gitea.io/gitea/modules/setting"
+	"code.gitea.io/gitea/services/context"
 )
 
 // ListIssueDependencies lists all dependencies for an issue
 func ListIssueDependencies(ctx *context.APIContext) {
-	if !setting.IssueGraph.Enabled {
+	if !setting.IssueGraphSettings.Enabled {
 		ctx.APIErrorNotFound("Issue graph features are disabled")
 		return
 	}
 
 	// TODO: Implement using existing Gitea dependency functions
-	ctx.JSON(http.StatusOK, []interface{}{})
+	ctx.JSON(http.StatusOK, []any{})
 }
