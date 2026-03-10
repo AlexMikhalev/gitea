@@ -139,6 +139,84 @@ We're [working on it](https://github.com/go-gitea/gitea/issues/1029).
 
 In the [release log](https://github.com/go-gitea/gitea/releases) or the [change log](https://github.com/go-gitea/gitea/blob/main/CHANGELOG.md), search for the keyword `SECURITY` to find the security patches.
 
+## Robot API
+
+This fork includes an AI Agent-optimized Robot API for automated issue management:
+
+### Features
+
+- **PageRank Algorithm**: Prioritizes issues based on dependency graph analysis
+- **Triage API**: `GET /api/v1/robot/triage?owner=...&repo=...`
+- **Ready API**: `GET /api/v1/robot/ready?owner=...&repo=...`
+- **Graph API**: `GET /api/v1/robot/graph?owner=...&repo=...`
+- **CLI Tool**: `cmd/gitea-robot` for command-line access
+
+### CLI Usage
+
+```bash
+# Build CLI
+go build -o gitea-robot ./cmd/gitea-robot
+
+# Set environment variables
+export GITEA_URL="http://localhost:3000"
+export GITEA_TOKEN="your-api-token"
+
+# Get prioritized issues
+./gitea-robot triage --owner terraphim --repo gitea
+
+# Get unblocked issues
+./gitea-robot ready --owner terraphim --repo gitea
+
+# Get dependency graph
+./gitea-robot graph --owner terraphim --repo gitea
+```
+
+### Docker Images
+
+Multi-architecture images are available from multiple registries:
+
+```bash
+# GitHub Container Registry (GHCR)
+docker pull ghcr.io/terraphim/gitea:latest
+docker pull ghcr.io/terraphim/gitea:rootless
+
+# Gitea Registry
+docker pull git.terraphim.cloud/terraphim/gitea:latest
+docker pull git.terraphim.cloud/terraphim/gitea:rootless
+```
+
+**Tags available:**
+- `latest` / `1.26.0` - Regular image (177 MB)
+- `rootless` / `1.26.0-rootless` - Rootless image (160 MB)
+
+### Publishing Docker Images
+
+To push images to GitHub Container Registry (GHCR):
+
+```bash
+# Authenticate with GitHub CLI (requires 'write:packages' scope)
+gh auth token | docker login ghcr.io -u YOUR_USERNAME --password-stdin
+
+# Build and tag
+docker build -t ghcr.io/terraphim/gitea:latest .
+docker build -t ghcr.io/terraphim/gitea:rootless -f Dockerfile.rootless .
+
+# Push to GHCR
+docker push ghcr.io/terraphim/gitea:latest
+docker push ghcr.io/terraphim/gitea:rootless
+```
+
+To publish to Gitea Registry:
+
+```bash
+# Login to Gitea Registry
+docker login git.terraphim.cloud -u YOUR_USERNAME
+
+# Build, tag, and push
+docker build -t git.terraphim.cloud/terraphim/gitea:latest .
+docker push git.terraphim.cloud/terraphim/gitea:latest
+```
+
 ## License
 
 This project is licensed under the MIT License.
