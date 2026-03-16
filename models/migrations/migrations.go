@@ -403,6 +403,9 @@ func prepareMigrationTasks() []*migration {
 		newMigration(326, "Add issue graph features (dependencies and PageRank cache)", v1_26.AddGraphCache),
 		newMigration(327, "Add is_agent and agent identity tables", v1_26.AddAgentIdentity),
 		newMigration(328, "Add full-text indexes for the unified repository event stream", v1_26.AddRepoEventFullTextIndexes),
+		// Upstream numbers this migration 327 (go-gitea/gitea#36776); 327 and 328
+		// are already taken here and applied in production, so it lands at 329.
+		newMigration(329, "Add disabled state to action runners", v1_26.AddDisabledToActionRunner),
 	}
 	return preparedMigrations
 }
