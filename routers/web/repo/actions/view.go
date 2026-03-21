@@ -121,6 +121,7 @@ type ViewResponse struct {
 			CanCancel         bool          `json:"canCancel"`
 			CanApprove        bool          `json:"canApprove"` // the run needs an approval and the doer has permission to approve
 			CanRerun          bool          `json:"canRerun"`
+			CanRerunFailed    bool          `json:"canRerunFailed"`
 			CanDeleteArtifact bool          `json:"canDeleteArtifact"`
 			Done              bool          `json:"done"`
 			WorkflowID        string        `json:"workflowID"`
@@ -237,6 +238,14 @@ func ViewPost(ctx *context_module.Context) {
 	resp.State.Run.CanApprove = run.NeedApproval && ctx.Repo.CanWrite(unit.TypeActions)
 	resp.State.Run.CanRerun = run.Status.IsDone() && ctx.Repo.CanWrite(unit.TypeActions)
 	resp.State.Run.CanDeleteArtifact = run.Status.IsDone() && ctx.Repo.CanWrite(unit.TypeActions)
+	if resp.State.Run.CanRerun {
+		for _, job := range jobs {
+			if job.Status == actions_model.StatusFailure || job.Status == actions_model.StatusCancelled {
+				resp.State.Run.CanRerunFailed = true
+				break
+			}
+		}
+	}
 	resp.State.Run.Done = run.Status.IsDone()
 	resp.State.Run.WorkflowID = run.WorkflowID
 	resp.State.Run.WorkflowLink = run.WorkflowLink()
@@ -395,6 +404,22 @@ func convertToViewModel(ctx context.Context, locale translation.Locale, cursors 
 	return viewJobs, logs, nil
 }
 
+// checkRunRerunAllowed checks whether a rerun is permitted for the given run,
+// writing the appropriate JSON error to ctx and returning false when it is not.
+func checkRunRerunAllowed(ctx *context_module.Context, run *actions_model.ActionRun) bool {
+	if !run.Status.IsDone() {
+		ctx.JSONError(ctx.Locale.Tr("actions.runs.not_done"))
+		return false
+	}
+	cfgUnit := ctx.Repo.Repository.MustGetUnit(ctx, unit.TypeActions)
+	cfg := cfgUnit.ActionsConfig()
+	if cfg.IsWorkflowDisabled(run.WorkflowID) {
+		ctx.JSONError(ctx.Locale.Tr("actions.workflow.disabled"))
+		return false
+	}
+	return true
+}
+
 // Rerun will rerun jobs in the given run
 // If jobIndexStr is a blank string, it means rerun all jobs
 func Rerun(ctx *context_module.Context) {
@@ -408,17 +433,7 @@ func Rerun(ctx *context_module.Context) {
 		return
 	}
 
-	// rerun is not allowed if the run is not done
-	if !run.Status.IsDone() {
-		ctx.JSONError(ctx.Locale.Tr("actions.runs.not_done"))
-		return
-	}
-
-	// can not rerun job when workflow is disabled
-	cfgUnit := ctx.Repo.Repository.MustGetUnit(ctx, unit.TypeActions)
-	cfg := cfgUnit.ActionsConfig()
-	if cfg.IsWorkflowDisabled(run.WorkflowID) {
-		ctx.JSONError(ctx.Locale.Tr("actions.workflow.disabled"))
+	if !checkRunRerunAllowed(ctx, run) {
 		return
 	}
 
@@ -428,16 +443,44 @@ func Rerun(ctx *context_module.Context) {
 		return
 	}
 
-	var targetJob *actions_model.ActionRunJob // nil means rerun all jobs
+	jobsToRerun := jobs // no job selected means rerun every job
 	if jobIndexHas {
 		if jobIndex < 0 || jobIndex >= len(jobs) {
 			ctx.JSONError(ctx.Locale.Tr("error.not_found"))
 			return
 		}
-		targetJob = jobs[jobIndex] // only rerun the selected job
+		jobsToRerun = actions_service.GetAllRerunJobs(jobs[jobIndex], jobs)
 	}
 
-	if err := actions_service.RerunWorkflowRunJobs(ctx, ctx.Repo.Repository, run, jobs, targetJob); err != nil {
+	if err := actions_service.RerunWorkflowRunJobs(ctx, ctx.Repo.Repository, run, jobsToRerun); err != nil {
+		ctx.ServerError("RerunWorkflowRunJobs", err)
+		return
+	}
+
+	ctx.JSONOK()
+}
+
+// RerunFailed reruns all failed jobs in the given run
+func RerunFailed(ctx *context_module.Context) {
+	runIndex := getRunIndex(ctx)
+
+	run, err := actions_model.GetRunByIndex(ctx, ctx.Repo.Repository.ID, runIndex)
+	if err != nil {
+		ctx.ServerError("GetRunByIndex", err)
+		return
+	}
+
+	if !checkRunRerunAllowed(ctx, run) {
+		return
+	}
+
+	jobs, err := actions_model.GetRunJobsByRunID(ctx, run.ID)
+	if err != nil {
+		ctx.ServerError("GetRunJobsByRunID", err)
+		return
+	}
+
+	if err := actions_service.RerunWorkflowRunJobs(ctx, ctx.Repo.Repository, run, actions_service.GetFailedRerunJobs(jobs)); err != nil {
 		ctx.ServerError("RerunWorkflowRunJobs", err)
 		return
 	}
