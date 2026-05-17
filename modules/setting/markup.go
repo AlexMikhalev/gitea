@@ -53,6 +53,11 @@ var Markdown = struct {
 	EnableMath: true,
 }
 
+// Quarto settings
+var Quarto = struct {
+	Enabled bool
+}{}
+
 // MarkupRenderer defines the external parser configured in ini
 type MarkupRenderer struct {
 	MarkupName           string
@@ -79,7 +84,7 @@ func loadMarkupFrom(rootCfg ConfigProvider) {
 
 	markdownFileExtensions := rootCfg.Section("markdown").Key("FILE_EXTENSIONS").Strings(",")
 	if len(markdownFileExtensions) == 0 || len(markdownFileExtensions) == 1 && markdownFileExtensions[0] == "" {
-		markdownFileExtensions = []string{".md", ".markdown", ".mdown", ".mkd", ".livemd"}
+		markdownFileExtensions = []string{".md", ".markdown", ".mdown", ".mkd", ".livemd", ".qmd"}
 	}
 	Markdown.FileNamePatterns = fileExtensionsToPatterns("markdown", markdownFileExtensions)
 
@@ -135,6 +140,7 @@ func loadMarkupFrom(rootCfg ConfigProvider) {
 	}
 
 	MermaidMaxSourceCharacters = rootCfg.Section("markup").Key("MERMAID_MAX_SOURCE_CHARACTERS").MustInt(50000)
+	Quarto.Enabled = rootCfg.Section("markup").Key("QUARTO_ENABLED").MustBool(true)
 	ExternalMarkupRenderers = make([]*MarkupRenderer, 0, 10)
 	ExternalSanitizerRules = make([]MarkupSanitizerRule, 0, 10)
 
