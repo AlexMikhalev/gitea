@@ -238,9 +238,15 @@ jobs:
           GITEA_API_URL: ${{ github.api_url }}
           GITEA_REPO: ${{ github.repository }}
           GITEA_API_TOKEN: ${{ github.token }}
-          GUARD_ISSUE: "43"
           GUARD_DIR: ${{ steps.pin.outputs.guard-dir }}
+        # `--issue 43`, not a GUARD_ISSUE env var. The tracker issue's state is
+        # the verdict: pointing the guard at any already-closed issue yields
+        # SKIPPED and exit 0. As an argument it is fixed by this file, which
+        # pull_request_target reads from the base branch, so the PR under test
+        # cannot reach it - whereas an env read would be settable by anything
+        # able to write to the job environment on a self-hosted runner.
         run: |
           bash "${GUARD_DIR}/check-blast-radius.sh" \
             --list "${GUARD_DIR}/sync-blast-radius.txt" \
-            --changed changed-paths.txt
+            --changed changed-paths.txt \
+            --issue 43

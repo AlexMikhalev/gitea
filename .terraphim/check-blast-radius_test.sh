@@ -6,19 +6,24 @@
 #
 # check-blast-radius.sh deliberately has no environment-variable test seams:
 # it is the script that decides whether a PR may land, so an env-controlled
-# override of the issue lookup would be an env-controlled override of the
-# verdict. The stubbing here is done from outside the script instead - each
-# case runs it with a PATH pointing at a directory this suite builds, holding
-# a stub `curl` plus symlinks to the handful of real tools the script needs.
-# The jq and the no-jq parser paths are selected by whether that directory
-# contains a `jq` symlink, which is exactly the `command -v jq` decision the
-# script makes in production.
+# override of the issue lookup - or of *which* issue is looked up - would be an
+# env-controlled override of the verdict. The stubbing here is done from
+# outside the script instead - each case runs it with a PATH pointing at a
+# directory this suite builds, holding a stub `curl` plus symlinks to the
+# handful of real tools the script needs. The jq and the no-jq parser paths are
+# selected by whether that directory contains a `jq` symlink, which is exactly
+# the `command -v jq` decision the script makes in production.
 #
 # The same rule covers blast-radius-diff.sh, which runs in the same job: it
-# reads no environment variable at all, and the "no eval / no BLAST_RADIUS_*"
-# assertions below are applied to both files.
+# reads no environment variable at all. That property is asserted twice for
+# both files - statically, by enumerating the env vars each script reads and
+# checking them against a documented allowlist, and behaviourally, by running
+# the guard with hostile values set and asserting the verdict does not move.
 #
-# The diff-range cases build a throwaway git repository under $TMPDIR.
+# The diff-range and rename cases build throwaway git repositories under
+# $TMPDIR. The rename ones exist because `git diff --name-only` reports only
+# the destination of a detected rename, which let a PR move a reserved file out
+# of its reserved path and still be told PASSED.
 #
 # Run: .terraphim/check-blast-radius_test.sh
 #   - locally via ./.adf-gates.sh (the fork's ADF gate contract)
@@ -316,11 +321,19 @@ run_awk_case 'awk fallback: malformed json errors' 2 'not json at all'
 
 # --- no test seams may creep back into the production path ------------------
 # The suite stubs from outside the scripts on purpose. If someone reintroduces
-# an env-controlled fetch, parser or remote override, the guard becomes
+# an env-controlled fetch, parser, issue index or remote, the guard becomes
 # disable-able by anything that can write to the job environment on a
 # self-hosted runner. Both scripts are covered: they run in the same job, on
 # the same runner, under the same threat model, so a seam in either one is a
 # seam in the guard.
+#
+# This used to be a grep for `$BLAST_RADIUS_*`, which is a name-shaped proxy
+# for the property rather than the property: it passed happily while
+# `GUARD_ISSUE="${GUARD_ISSUE:-43}"` sat in the script, and any future seam
+# that avoided the prefix would have passed too. It is replaced by (a) an
+# enumeration of every environment variable each script actually reads,
+# checked against the documented allowlist, and (b) behavioural cases that run
+# the guard under a hostile environment and assert the verdict does not move.
 {
   for guard_script in "$SCRIPT" "$DIFF_SCRIPT"; do
     guard_name=$(basename "$guard_script")
@@ -330,24 +343,144 @@ run_awk_case 'awk fallback: malformed json errors' 2 'not json at all'
     else
       ok "${guard_name} contains no eval"
     fi
-
-    # Any BLAST_RADIUS_* read is a seam by construction: nothing in production
-    # sets one, so its only purpose would be to redirect the guard from
-    # outside. Matches both `$BLAST_RADIUS_X` and `${BLAST_RADIUS_X...}`.
-    if grep -nE '\$\{?BLAST_RADIUS_' "$guard_script" > /dev/null 2>&1; then
-      no "${guard_name} reads no BLAST_RADIUS_* env var" \
-        "$(grep -nE '\$\{?BLAST_RADIUS_' "$guard_script")"
-    else
-      ok "${guard_name} reads no BLAST_RADIUS_* env var"
-    fi
   done
 
-  if grep -n 'BLAST_RADIUS_ISSUE_FETCH\|BLAST_RADIUS_NO_JQ' "$SCRIPT" > /dev/null 2>&1; then
-    no 'no env override of the fetch or the parser' \
-      "$(grep -n 'BLAST_RADIUS_ISSUE_FETCH\|BLAST_RADIUS_NO_JQ' "$SCRIPT")"
-  else
-    ok 'no env override of the fetch or the parser'
-  fi
+  # env_reads <file> - every name the file expands but never binds itself.
+  #
+  # A name counts as bound only when it is assigned WITHOUT reading itself:
+  # `X="${X:-default}"` both assigns and reads the environment, and treating it
+  # as a binding is precisely how the GUARD_ISSUE seam stayed invisible. `for`
+  # variables, `read` targets and bare `local` declarations are bindings too.
+  env_reads() {
+    local f="$1" refs bound
+    refs=$(grep -oE '\$\{?[A-Za-z_][A-Za-z0-9_]*' "$f" | sed 's/^\$[{]\?//' | sort -u)
+    bound=$( {
+      grep -oE '(^|[[:space:];(])(local[[:space:]]+|export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=.*' "$f" |
+        while IFS= read -r line; do
+          local name=${line#"${line%%[![:space:]]*}"}
+          name=${name#local }
+          name=${name#export }
+          name=${name%%=*}
+          case "$line" in
+            *"\$${name}"* | *"\${${name}"*) ;;
+            *) printf '%s\n' "$name" ;;
+          esac
+        done
+      grep -oE '\bfor[[:space:]]+[A-Za-z_][A-Za-z0-9_]*' "$f" | awk '{print $2}'
+      grep -oE '\bread[[:space:]]+(-r[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*' "$f" | awk '{print $NF}'
+      grep -oE '\blocal[[:space:]]+[A-Za-z_ ][A-Za-z0-9_ ]*' "$f" | sed 's/^local//' | tr ' ' '\n'
+    } | grep -v '^$' | sort -u)
+    comm -23 <(printf '%s\n' "$refs") <(printf '%s\n' "$bound")
+  }
+
+  # The scanner is load-bearing, so prove it detects a seam before trusting it
+  # to report their absence. The synthetic file below is the exact shape that
+  # slipped through the old grep.
+  printf '%s\n' '#!/usr/bin/env bash' 'GUARD_ISSUE="${GUARD_ISSUE:-43}"' \
+    'if [ -n "${SNEAKY_OVERRIDE:-}" ]; then echo "$GUARD_ISSUE"; fi' > "${TMP}/seamy.sh"
+  seamy=$(env_reads "${TMP}/seamy.sh" | tr '\n' ' ')
+  case "$seamy" in
+    *GUARD_ISSUE*SNEAKY_OVERRIDE* | *SNEAKY_OVERRIDE*GUARD_ISSUE*)
+      ok 'env-read scanner detects a reintroduced seam'
+      ;;
+    *) no 'env-read scanner detects a reintroduced seam' "(reported: ${seamy})" ;;
+  esac
+
+  # The allowlist, and why each entry cannot move the verdict:
+  #   GITEA_API_URL / GITEA_REPO / GITEA_API_TOKEN - runner-supplied connection
+  #     details; misdirecting them breaks the lookup, which fails closed.
+  #   GUARD_EXEMPT_LABEL - interpolated into the failure message and compared
+  #     against nothing.
+  # Anything else is a seam. The collector's allowlist is empty.
+  check_env_allowlist() {
+    local f="$1" want="$2" got
+    got=$(env_reads "$f" | tr '\n' ' ')
+    got=${got%% }
+    if [ "$got" = "$want" ]; then
+      ok "$(basename "$f") reads only the allowlisted env vars"
+    else
+      no "$(basename "$f") reads only the allowlisted env vars" \
+        "(want '${want}', got '${got}')"
+    fi
+  }
+  check_env_allowlist "$SCRIPT" 'GITEA_API_TOKEN GITEA_API_URL GITEA_REPO GUARD_EXEMPT_LABEL'
+  check_env_allowlist "$DIFF_SCRIPT" ''
+}
+
+# --- the issue index is an argument, and the environment cannot move it -----
+# Which issue gates the check IS the verdict: point the guard at any
+# already-closed issue and it reports SKIPPED, exit 0. The header claims the
+# environment cannot do that; these cases are what makes the claim testable
+# instead of a name-pattern grep.
+#
+# The stub curl here answers by issue index - open for #43, closed for anything
+# else - so "the environment did not redirect the lookup" and "the argument
+# does redirect it" are distinguishable rather than both trivially passing.
+{
+  SHIM_IDX="${TMP}/bin-idx"
+  make_shim_dir "$SHIM_IDX" with-jq
+  cat > "${SHIM_IDX}/curl" << 'STUB'
+#!/bin/sh
+url=""
+for a in "$@"; do
+  case "$a" in http*) url="$a" ;; esac
+done
+idx=${url##*/}
+if [ "$idx" = "43" ]; then
+  printf '{"number":%s,"title":"tracker","state":"open"}' "$idx"
+else
+  printf '{"number":%s,"title":"other","state":"closed"}' "$idx"
+fi
+exit 0
+STUB
+  chmod +x "${SHIM_IDX}/curl"
+
+  idx_list="${TMP}/idx-list.txt"
+  idx_changed="${TMP}/idx-changed.txt"
+  printf '%s\n%s\n' "$HEADER" 'models/auth/oauth2.go' > "$idx_list"
+  printf '%s\n' 'models/auth/oauth2.go' > "$idx_changed"
+
+  # run_idx <expected-exit> <name> [env assignments...] -- [args...]
+  run_idx() {
+    local want="$1" name="$2" out got
+    shift 2
+    local envs=()
+    while [ $# -gt 0 ] && [ "$1" != "--" ]; do
+      envs+=("$1")
+      shift
+    done
+    [ $# -eq 0 ] || shift
+    out=$(env "${envs[@]+"${envs[@]}"}" PATH="$SHIM_IDX" \
+      GITEA_API_URL="$STUB_API_URL" GITEA_REPO="$STUB_REPO" \
+      "$BASH" "$SCRIPT" --list "$idx_list" --changed "$idx_changed" "$@" 2>&1)
+    got=$?
+    if [ "$got" -eq "$want" ]; then
+      ok "$name"
+    else
+      no "$name" "(want exit ${want}, got ${got})
+${out}"
+    fi
+  }
+
+  # baseline: the default index is 43, the stub says open, the path is reserved
+  run_idx 1 'default issue index is 43 (enforced)' --
+  # the stub really is index-sensitive, so the next case cannot pass vacuously
+  run_idx 0 '--issue selects the gating issue (closed -> skipped)' -- --issue 99
+  # the finding itself: GUARD_ISSUE in the environment must be inert
+  run_idx 1 'GUARD_ISSUE in the env cannot redirect the lookup' \
+    GUARD_ISSUE=99 --
+  run_idx 1 'GUARD_ISSUE in the env cannot override --issue' \
+    GUARD_ISSUE=99 -- --issue 43
+
+  # GUARD_EXEMPT_LABEL is message text; it must not be able to exempt anything
+  run_idx 1 'GUARD_EXEMPT_LABEL cannot exempt a violation' \
+    GUARD_EXEMPT_LABEL=sync-owner --
+
+  # a bad --issue is a usage error, not a silently different lookup
+  run_idx 2 '--issue rejects a non-numeric value' -- --issue not-a-number
+  run_idx 2 '--issue rejects a path traversal' -- --issue '43/../1'
+  run_idx 2 '--issue rejects zero' -- --issue 0
+  run_idx 2 '--issue needs a value' -- --issue
 }
 
 # --- stdin mode -------------------------------------------------------------
@@ -486,6 +619,25 @@ ${out}"
       no 'exempt label literal matches both if: conditions' \
         "(env='${env_label}', matching if: conditions=${if_labels}, want 2)"
     fi
+
+    # The tracker issue must be pinned as an ARGUMENT. As a `GUARD_ISSUE:` env
+    # key it would be one more thing on a self-hosted runner's job environment,
+    # and the script no longer reads it at all - so a workflow that only set
+    # the env var would silently fall back to the built-in default instead of
+    # failing, which is the wrong direction for a guard to drift.
+    if grep -q -- '--issue 43' "$wf"; then
+      ok 'workflow pins the tracker issue via --issue'
+    else
+      no 'workflow pins the tracker issue via --issue' \
+        '(check-blast-radius.sh takes the index as an argument, not from GUARD_ISSUE)'
+    fi
+
+    if grep -qE '^[[:space:]]*GUARD_ISSUE:' "$wf"; then
+      no 'workflow sets no GUARD_ISSUE env key' \
+        "$(grep -nE '^[[:space:]]*GUARD_ISSUE:' "$wf")"
+    else
+      ok 'workflow sets no GUARD_ISSUE env key'
+    fi
   fi
 }
 
@@ -598,6 +750,132 @@ ${out}"
     ok 'fetch failure reason is reported'
   else
     no 'fetch failure reason is reported' "(exit ${got}: ${out})"
+  fi
+}
+
+# --- renames: moving a reserved file away must still trip the guard ---------
+# `git diff --name-only` under git's default diff.renames=true prints only the
+# DESTINATION of a detected rename, so `git mv services/lfs/server.go ...`
+# reported the new path alone and the guard said PASSED - a silent
+# non-enforcement on the single most conflict-inducing thing a PR can do to an
+# in-flight cherry-pick. blast-radius-diff.sh passes --no-renames; these cases
+# pin that, because nothing else here pins the *shape* of the diff output.
+#
+# The throwaway repo sets diff.renames=true explicitly rather than relying on
+# the default: without it the case would pass for free on a box configured with
+# diff.renames=false and prove nothing.
+{
+  rrepo="${TMP}/renames"
+  mkdir -p "$rrepo"
+  (
+    cd "$rrepo" || exit 1
+    git init --quiet .
+    git symbolic-ref HEAD refs/heads/main
+    git config user.email tester@example.com
+    git config user.name tester
+    git config commit.gpgsign false
+    # the hazard is rename detection being ON; make the case independent of
+    # whatever the box's global git config says
+    git config diff.renames true
+    mkdir -p services/lfs models/auth .terraphim
+    # distinct, non-trivial content: a rename is only *detected* when the blob
+    # is similar enough, so an empty file would not exercise the flag at all
+    printf 'package lfs\nfunc A() {}\nfunc B() {}\nfunc C() {}\nfunc D() {}\n' > services/lfs/server.go
+    printf 'package auth\nfunc E() {}\nfunc F() {}\nfunc G() {}\nfunc H() {}\n' > models/auth/oauth2.go
+    printf '#!/bin/sh\n# guard matcher\nexit 0\n' > .terraphim/check-blast-radius.sh
+    # present at the base so the deletion case below has something to remove
+    printf 'lockfileVersion: 9\npackages: {}\n' > pnpm-lock.yaml
+    printf 'root\n' > root.md
+    git add -A
+    git commit --quiet -m root
+    git checkout --quiet -b feature
+  ) > /dev/null 2>&1
+
+  rbase=$(git -C "$rrepo" rev-parse main)
+
+  # expect_rename <name> <from> <to>
+  # commits the move on `feature`, collects the diff and asserts both that the
+  # source path is reported and that the guard fails on it.
+  expect_rename() {
+    local name="$1" from="$2" to="$3" out got changed
+    changed="${TMP}/rename-changed.txt"
+    (
+      cd "$rrepo" || exit 1
+      mkdir -p "$(dirname "$to")"
+      git mv "$from" "$to"
+      git commit --quiet -m "rename ${from}"
+    ) > /dev/null 2>&1
+    local rhead
+    rhead=$(git -C "$rrepo" rev-parse feature)
+
+    # git really did detect this as a rename and really did drop the source -
+    # otherwise --no-renames is being credited for something git never did and
+    # the case proves nothing
+    local plain
+    plain=$(cd "$rrepo" && git diff --name-only "$rbase" "$rhead")
+    if printf '%s\n' "$plain" | grep -qx "$to" &&
+      ! printf '%s\n' "$plain" | grep -qx "$from"; then
+      ok "${name}: plain --name-only drops the source (case is not vacuous)"
+    else
+      no "${name}: plain --name-only drops the source (case is not vacuous)" \
+        "(reported: $(printf '%s' "$plain" | tr '\n' ' '))"
+    fi
+
+    (cd "$rrepo" && bash "$DIFF_SCRIPT" --base "$rbase" --head "$rhead" --output "$changed") > /dev/null 2>&1
+    if grep -qx "$from" "$changed"; then
+      ok "${name}: source path survives the diff"
+    else
+      no "${name}: source path survives the diff" \
+        "(collected: $(tr '\n' ' ' < "$changed"))"
+    fi
+
+    out=$(run_guard "$SHIM_JQ" "$OPEN_JSON" 0 --list "$REAL_LIST" --changed "$changed")
+    got=$?
+    if [ "$got" -eq 1 ] && printf '%s' "$out" | grep -q "$from"; then
+      ok "${name}: guard fails and names the reserved source"
+    else
+      no "${name}: guard fails and names the reserved source" "(want exit 1, got ${got})
+${out}"
+    fi
+  }
+
+  # an exact entry (B4, the block the list itself calls the highest conflict
+  # risk), a glob entry (B3), and the guard's own surface - narrowing the guard
+  # by moving it must cost the same `sync-owner` label as editing it
+  expect_rename 'renamed exact reserved entry' \
+    'services/lfs/server.go' 'services/lfshandler/server.go'
+  expect_rename 'renamed glob-covered reserved entry' \
+    'models/auth/oauth2.go' 'models/authn/oauth2.go'
+  expect_rename 'renamed guard matcher' \
+    '.terraphim/check-blast-radius.sh' 'ci/check-blast-radius.sh'
+
+  # plain deletion was never affected by this - keep it pinned so a future
+  # change to the collector cannot trade one hole for the other
+  (
+    cd "$rrepo" || exit 1
+    git rm --quiet pnpm-lock.yaml
+    git commit --quiet -m 'delete a reserved path'
+  ) > /dev/null 2>&1
+  rhead=$(git -C "$rrepo" rev-parse feature)
+  changed_file="${TMP}/delete-changed.txt"
+  (cd "$rrepo" && bash "$DIFF_SCRIPT" --base "$rbase" --head "$rhead" --output "$changed_file") > /dev/null 2>&1
+  out=$(run_guard "$SHIM_JQ" "$OPEN_JSON" 0 --list "$REAL_LIST" --changed "$changed_file")
+  got=$?
+  if [ "$got" -eq 1 ]; then
+    ok 'deleting a reserved path still fails'
+  else
+    no 'deleting a reserved path still fails' "(want exit 1, got ${got})
+${out}"
+  fi
+
+  # --no-renames must be on the command line, where it outranks every config
+  # scope: a runner with diff.renames left at the default would otherwise get a
+  # different verdict than one with it turned off, for the same PR.
+  if grep -q -- '--no-renames' "$DIFF_SCRIPT"; then
+    ok 'collector passes --no-renames explicitly'
+  else
+    no 'collector passes --no-renames explicitly' \
+      '(the verdict would then depend on the runner git config)'
   fi
 }
 

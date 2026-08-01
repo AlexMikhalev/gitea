@@ -8,33 +8,46 @@
 # sync cherry-picks (#43-#51) while the tracker issue #43 is still open.
 #
 # Usage:
-#   check-blast-radius.sh --changed <file|-> [--list <file>]
+#   check-blast-radius.sh --changed <file|-> [--list <file>] [--issue <index>]
 #
 #   --changed  file with one changed path per line ("-" reads stdin)
 #   --list     blast-radius list (default: .terraphim/sync-blast-radius.txt)
+#   --issue    tracker issue index that gates the check (default: 43)
 #
 # Environment:
-#   GUARD_ISSUE       issue index that gates the check (default: 43)
-#   GUARD_EXEMPT_LABEL
-#                     name of the PR label that exempts a PR from the guard.
-#                     Only used to make the failure message actionable; the
-#                     exemption itself is applied by the workflow.
 #   GITEA_API_URL     API base, e.g. https://host/api/v1 (required)
 #   GITEA_REPO        owner/repo (required)
 #   GITEA_API_TOKEN   token for the issue lookup (optional for public repos)
+#   GUARD_EXEMPT_LABEL
+#                     name of the PR label that exempts a PR from the guard.
+#                     Message text only: it is interpolated into the failure
+#                     output and read nowhere else, so it cannot move the
+#                     verdict. The exemption itself is applied by the workflow.
 #
-# There are deliberately NO test seams here: no environment variable can
-# substitute the issue lookup or select the state parser. This script decides
-# whether a PR is allowed to land, and an env-controlled override of the API
-# call is an env-controlled override of the verdict - on a self-hosted runner
-# anything that can write to the job environment could then declare #43 closed.
-# check-blast-radius_test.sh stubs `curl` and hides `jq` by running the script
-# with a PATH of its own instead.
+# Nothing in the environment can change the verdict, and each of the three ways
+# it could is closed separately. The API call is a literal curl, so the lookup
+# cannot be substituted. The parser branch is chosen only by `command -v jq`,
+# so it cannot be selected. And *which* issue gates the check is an argument
+# (--issue), not an env read - the workflow passes it, so the value lives in a
+# file on the base branch that the PR under test cannot influence. That last
+# one is the one worth spelling out: an env-settable issue index is an
+# env-settable verdict, because pointing the guard at any already-closed issue
+# produces SKIPPED and exit 0. On a self-hosted runner anything able to write
+# to the job environment would then be able to do exactly that. The three
+# GITEA_* variables are runner-supplied connection details and are the
+# exception that proves the rule - misdirecting them breaks the lookup, and a
+# broken lookup fails closed (exit 2) rather than passing.
+#
+# check-blast-radius_test.sh therefore stubs `curl` and hides `jq` by running
+# the script with a PATH of its own, and pins the property above by running the
+# script with GUARD_ISSUE and GUARD_EXEMPT_LABEL set to hostile values and
+# asserting the verdict does not move - a behavioural check, not a grep for a
+# name pattern that any future seam could simply avoid matching.
 #
 # The rule is guard-wide, not file-wide: blast-radius-diff.sh runs in the same
-# job on the same runner, so it reads no environment variable either (its fetch
-# remote is hardcoded to `origin`). The suite asserts "no eval" and "no
-# BLAST_RADIUS_* read" against both files.
+# job on the same runner, so it reads no environment variable at all (its fetch
+# remote is hardcoded to `origin`). The suite asserts "no eval" against both
+# files.
 #
 # Exit codes: 0 = pass or skipped, 1 = blast-radius violation, 2 = usage/error.
 
@@ -43,7 +56,11 @@ set -euo pipefail
 SCRIPT_NAME=$(basename "$0")
 LIST_FILE=".terraphim/sync-blast-radius.txt"
 CHANGED_FILE=""
-GUARD_ISSUE="${GUARD_ISSUE:-43}"
+# Deliberately NOT `${GUARD_ISSUE:-43}`: see the header. The index selects the
+# issue whose state decides the verdict, so reading it from the environment
+# would hand the verdict to anything that can write to the job environment.
+GUARD_ISSUE="43"
+# Message text only; it is never compared against anything.
 GUARD_EXEMPT_LABEL="${GUARD_EXEMPT_LABEL:-}"
 
 die() {
@@ -61,6 +78,17 @@ while [ $# -gt 0 ]; do
     --changed)
       [ $# -ge 2 ] || die "--changed needs a value"
       CHANGED_FILE="$2"
+      shift 2
+      ;;
+    --issue)
+      [ $# -ge 2 ] || die "--issue needs a value"
+      # The value goes into a URL path. Constrain it to an issue index so a
+      # typo cannot turn the lookup into a different endpoint.
+      case "$2" in
+        '' | *[!0-9]*) die "--issue needs a positive integer issue index, got '$2'" ;;
+      esac
+      [ "$2" -gt 0 ] || die "--issue needs a positive integer issue index, got '$2'"
+      GUARD_ISSUE="$2"
       shift 2
       ;;
     -h | --help)

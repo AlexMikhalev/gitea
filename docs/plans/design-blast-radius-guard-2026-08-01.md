@@ -22,7 +22,15 @@ mechanical guard that blocks uplift PRs from touching sync-owned paths while #43
    a. query issue #43 state via Gitea API; exit 0 (skip) when `state != "open"`;
    b. compute PR diff paths against the **merge base** of base and head (three-dot), not
       against the base tip — the base branch moves under the PR by construction here;
-   c. fail if any changed path matches a blast-radius entry; added-only files pass.
+   c. collect those paths with **`--no-renames`**. `git diff --name-only` under git's
+      default `diff.renames=true` prints only the *destination* of a detected rename, so
+      `git mv services/lfs/server.go …` reported the new path alone and the guard said
+      PASSED — silent non-enforcement on the operation that conflicts hardest with an
+      in-flight cherry-pick. Deletions were never affected (they are reported by path).
+      `--no-renames` decomposes the rename into a delete plus an add so the reserved
+      source is collected too, and putting it on the command line rather than in config
+      keeps the verdict independent of the runner's git setup;
+   d. fail if any changed path matches a blast-radius entry; added-only files pass.
 3. No Go/TS source changes. No changes to existing workflows.
 4. The guard's own surface (`.terraphim/*`, `.github/workflows/check-blast-radius.yml`) is
    itself on the reserved-path list. Base-ref pinning already stops an edit from taking
@@ -110,11 +118,30 @@ mechanical guard that blocks uplift PRs from touching sync-owned paths while #43
   payloads and a failing lookup; assert fail, skip and fail-closed respectively. No network.
   The stubbing is done from *outside* the script — a PATH holding a stub `curl` and, for the
   fallback cases, no `jq` — because an environment variable that can replace the issue
-  lookup is an environment variable that can replace the verdict. The suite asserts that
-  *both* guard scripts contain no `eval` and read no `BLAST_RADIUS_*` variable;
-  `blast-radius-diff.sh` hardcodes `origin` as its fetch remote for that reason, and the
+  lookup is an environment variable that can replace the verdict.
+- No env seams, asserted as a *property* rather than as a name pattern. The suite used to
+  grep for `$BLAST_RADIUS_*`, which is a proxy: it passed while `GUARD_ISSUE="${GUARD_ISSUE:-43}"`
+  sat in the matcher, and *which* issue gates the check is the verdict — point it at any
+  already-closed issue and the guard reports SKIPPED, exit 0. Two things replace it. The
+  index is now an argument (`--issue 43`, passed by the workflow, which
+  `pull_request_target` reads from the base branch), not an env read. And the suite (a)
+  enumerates every environment variable each script actually reads and checks it against a
+  documented allowlist — `GITEA_API_URL`/`GITEA_REPO`/`GITEA_API_TOKEN` (connection details;
+  misdirecting them fails the lookup, which fails closed) and `GUARD_EXEMPT_LABEL` (message
+  text, compared against nothing) for the matcher, nothing at all for the collector — with a
+  self-test proving the scanner detects a reintroduced seam, and (b) runs the guard with
+  `GUARD_ISSUE` and `GUARD_EXEMPT_LABEL` set to hostile values against an index-sensitive
+  stub and asserts the verdict does not move. `eval` is still barred in both scripts;
+  `blast-radius-diff.sh` hardcodes `origin` as its fetch remote for the same reason, and the
   fetch-diagnostic case configures a dead `origin` in its throwaway repo instead of
   injecting one through the environment.
+- Renames: a throwaway repo with `diff.renames=true` set explicitly (so the case does not
+  pass for free on a box that has it off) moves a reserved file out of its reserved path —
+  an exact entry (`services/lfs/server.go`), a glob-covered one (`models/auth/*`) and the
+  guard's own matcher — and asserts the source path survives the collector and the guard
+  exits 1 naming it. Each case first asserts that plain `--name-only` *does* drop the
+  source, so it cannot pass vacuously. Deletion is pinned alongside, since it was never
+  affected and a future change to the collector must not trade one hole for the other.
 - Repo layout: the suite asserts the guard is in `.github/workflows`, that `.gitea/workflows`
   does not exist, that the trigger is `pull_request_target`, and that the exempt-label
   literal agrees with both `if:` conditions. These must *run in CI*, not only locally — the

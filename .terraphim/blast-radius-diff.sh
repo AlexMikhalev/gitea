@@ -14,6 +14,19 @@
 # is to land commits on the reserved paths, a two-dot range makes the guard
 # fire on innocent PRs by construction.
 #
+# Rename detection is disabled (`--no-renames`), and that is load-bearing. With
+# git's default `diff.renames=true`, `--name-only` prints only the DESTINATION
+# of a detected rename, so `git mv services/lfs/server.go services/lfshandler/`
+# emits the new path alone and the reserved source path never reaches
+# check-blast-radius.sh - the guard reports PASSED on the single most
+# conflict-inducing thing a PR can do to an in-flight cherry-pick. A plain
+# deletion is caught (it is reported by path), so the hole was renames only.
+# `--no-renames` decomposes the rename into a delete plus an add, which puts
+# both paths on the list and makes the reserved source match. It also makes the
+# verdict independent of the runner's git configuration: without the flag,
+# `diff.renames=false` on one box and the default on another give two different
+# answers for the same PR, with no signal that they disagree.
+#
 # Usage:
 #   blast-radius-diff.sh --base <rev> [--head <rev>] [--output <file>]
 #
@@ -95,8 +108,11 @@ have_commit "$HEAD_REV" || die "cannot resolve head revision '${HEAD_REV}'"
 merge_base=$(git merge-base "$BASE_REV" "$HEAD_REV") ||
   die "no merge base between '${BASE_REV}' and '${HEAD_REV}' - is the base branch history present?"
 
+# --no-renames: report the source path of a rename too, not just the
+# destination - see the header. The flag overrides diff.renames from any config
+# scope, so the output shape does not depend on the runner's git setup.
 if [ -n "$OUTPUT" ]; then
-  git diff --name-only "$merge_base" "$HEAD_REV" > "$OUTPUT"
+  git diff --name-only --no-renames "$merge_base" "$HEAD_REV" > "$OUTPUT"
 else
-  git diff --name-only "$merge_base" "$HEAD_REV"
+  git diff --name-only --no-renames "$merge_base" "$HEAD_REV"
 fi
