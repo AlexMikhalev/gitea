@@ -20,10 +20,16 @@
 # checking them against a documented allowlist, and behaviourally, by running
 # the guard with hostile values set and asserting the verdict does not move.
 #
-# The diff-range and rename cases build throwaway git repositories under
-# $TMPDIR. The rename ones exist because `git diff --name-only` reports only
-# the destination of a detected rename, which let a PR move a reserved file out
-# of its reserved path and still be told PASSED.
+# The diff-range, rename and quoting cases build throwaway git repositories
+# under $TMPDIR. The rename ones exist because `git diff --name-only` reports
+# only the destination of a detected rename, which let a PR move a reserved file
+# out of its reserved path and still be told PASSED. The quoting ones exist
+# because the same command C-quotes any path holding a non-ASCII or control
+# byte, and a quoted record matches no list entry - the same silent pass, for a
+# newly added file. Both are configuration-dependent by default
+# (diff.renames, core.quotePath), so both throwaway repos turn the hazardous
+# setting ON explicitly and both sets of cases first assert that the unfixed
+# command really does lose the path.
 #
 # Run: .terraphim/check-blast-radius_test.sh
 #   - locally via ./.adf-gates.sh (the fork's ADF gate contract)
@@ -347,6 +353,14 @@ run_awk_case 'awk fallback: malformed json errors' 2 'not json at all'
 
   # env_reads <file> - every name the file expands but never binds itself.
   #
+  # Scope, stated rather than implied: this sees `$VAR` / `${VAR}` expansions in
+  # the script text. Variables the *shell* consults without the script naming
+  # them - PATH above all, plus IFS and BASHOPTS - are structurally invisible to
+  # it, and PATH is exactly how this suite substitutes `curl` and `jq`. That is
+  # not a gap in the allowlist but its boundary: the guard assumes a trusted
+  # PATH on the runner, which its ability to execute the pinned scripts at all
+  # already assumes. check-blast-radius.sh's header says so in the same terms.
+  #
   # A name counts as bound only when it is assigned WITHOUT reading itself:
   # `X="${X:-default}"` both assigns and reads the environment, and treating it
   # as a binding is precisely how the GUARD_ISSUE seam stayed invisible. `for`
@@ -391,7 +405,8 @@ run_awk_case 'awk fallback: malformed json errors' 2 'not json at all'
   #     details; misdirecting them breaks the lookup, which fails closed.
   #   GUARD_EXEMPT_LABEL - interpolated into the failure message and compared
   #     against nothing.
-  # Anything else is a seam. The collector's allowlist is empty.
+  # Anything else the script *names* is a seam. The collector's allowlist is
+  # empty. PATH is out of this scanner's reach by construction - see above.
   check_env_allowlist() {
     local f="$1" want="$2" got
     got=$(env_reads "$f" | tr '\n' ' ')
@@ -679,7 +694,10 @@ ${out}"
 
   # No remote is configured in this throwaway repo and none is needed: both
   # revisions are local, so blast-radius-diff.sh never reaches its fetch.
-  out=$(cd "$repo" && bash "$DIFF_SCRIPT" --base "$base_sha" --head "$head_sha" 2> /dev/null)
+  # The collector emits NUL-terminated records, so translate before comparing -
+  # a command substitution would drop the NULs (with a warning) and run the
+  # paths together.
+  out=$(cd "$repo" && bash "$DIFF_SCRIPT" --base "$base_sha" --head "$head_sha" 2> /dev/null | tr '\0' '\n')
   got=$?
   if [ "$got" -eq 0 ] && [ "$out" = "unrelated.md" ]; then
     ok 'diff range excludes base-branch drift'
@@ -822,11 +840,13 @@ ${out}"
     fi
 
     (cd "$rrepo" && bash "$DIFF_SCRIPT" --base "$rbase" --head "$rhead" --output "$changed") > /dev/null 2>&1
-    if grep -qx "$from" "$changed"; then
+    # the collector's records are NUL-terminated (see the quoting block below),
+    # so a line-oriented grep has to be given lines first
+    if tr '\0' '\n' < "$changed" | grep -qxF "$from"; then
       ok "${name}: source path survives the diff"
     else
       no "${name}: source path survives the diff" \
-        "(collected: $(tr '\n' ' ' < "$changed"))"
+        "(collected: $(tr '\0' ' ' < "$changed"))"
     fi
 
     out=$(run_guard "$SHIM_JQ" "$OPEN_JSON" 0 --list "$REAL_LIST" --changed "$changed")
@@ -877,6 +897,178 @@ ${out}"
     no 'collector passes --no-renames explicitly' \
       '(the verdict would then depend on the runner git config)'
   fi
+
+  # -z is on the command line for exactly the same reason, against
+  # core.quotePath rather than diff.renames - see the quoting block below.
+  if grep -qE 'git diff .*-z|git diff -z' "$DIFF_SCRIPT"; then
+    ok 'collector passes -z explicitly'
+  else
+    no 'collector passes -z explicitly' \
+      '(without it core.quotePath C-quotes non-ASCII paths, which match no entry)'
+  fi
+}
+
+# --- quoted paths: a non-ASCII name must not launder a reserved path --------
+# `git diff --name-only` C-quotes any path holding a non-ASCII or control byte -
+# core.quotePath defaults to TRUE - and check-blast-radius.sh compares the record
+# verbatim against each entry, so the leading `"` makes every pattern fail. A
+# file added under a reserved glob subtree with a non-ASCII name was therefore
+# reported PASSED, and the verdict depended on the runner's core.quotePath the
+# same way it used to depend on its diff.renames. blast-radius-diff.sh passes
+# `-z`, which suppresses the quoting outright and terminates records with NUL.
+#
+# Both hazards get a case, on separate branches off the same base so neither can
+# inherit the other's violation and pass for free. Each first asserts that plain
+# --name-only DOES quote the path AND that the guard fed that quoted output
+# passes - i.e. the hole is reproduced here before -z is credited with closing
+# it. The newline case is why -z rather than `-c core.quotePath=false`: that
+# setting unquotes non-ASCII bytes but still quotes control characters.
+{
+  qrepo="${TMP}/quoted"
+  mkdir -p "$qrepo"
+  # inside models/auth/*, a reserved glob on the shipped list
+  nonascii_path='models/auth/héllo.go'
+  newline_path=$'models/auth/two\nlines.go'
+  (
+    cd "$qrepo" || exit 1
+    git init --quiet .
+    git symbolic-ref HEAD refs/heads/main
+    git config user.email tester@example.com
+    git config user.name tester
+    git config commit.gpgsign false
+    # the hazard is quoting being ON; do not depend on the box's global config
+    git config core.quotePath true
+    printf 'root\n' > root.md
+    git add -A
+    git commit --quiet -m root
+
+    git checkout --quiet -b nonascii
+    mkdir -p models/auth
+    printf 'package auth\n' > "$nonascii_path"
+    git add -A
+    git commit --quiet -m 'add a non-ASCII path under a reserved glob'
+
+    git checkout --quiet main
+    git checkout --quiet -b newline
+    mkdir -p models/auth
+    printf 'package auth\n' > "$newline_path"
+    git add -A
+    git commit --quiet -m 'add a control-character path under a reserved glob'
+  ) > /dev/null 2>&1
+
+  qbase=$(git -C "$qrepo" rev-parse main)
+
+  # expect_quoted <name> <branch>
+  #
+  # Asserted on the guard's *verdict* and on the presence of a quote character,
+  # never on the exact bytes of the path: a case-folding or normalising
+  # filesystem (macOS) stores a different byte sequence for the same name, which
+  # would make a byte-exact assertion fail for a reason that has nothing to do
+  # with the property under test.
+  expect_quoted() {
+    local name="$1" branch="$2" qhead plain out got changed total stripped
+    changed="${TMP}/quoted-changed.txt"
+    qhead=$(git -C "$qrepo" rev-parse "$branch")
+
+    plain=$(cd "$qrepo" && git diff --name-only "$qbase" "$qhead")
+    if printf '%s\n' "$plain" | grep -q '^"models/auth/'; then
+      ok "${name}: plain --name-only quotes it (case is not vacuous)"
+    else
+      no "${name}: plain --name-only quotes it (case is not vacuous)" \
+        "(reported: ${plain})"
+    fi
+
+    printf '%s\n' "$plain" > "$changed"
+    out=$(run_guard "$SHIM_JQ" "$OPEN_JSON" 0 --list "$REAL_LIST" --changed "$changed")
+    got=$?
+    if [ "$got" -eq 0 ]; then
+      ok "${name}: the quoted form is what used to slip through"
+    else
+      no "${name}: the quoted form is what used to slip through" \
+        "(want exit 0 for the quoted record, got ${got})
+${out}"
+    fi
+
+    (cd "$qrepo" && bash "$DIFF_SCRIPT" --base "$qbase" --head "$qhead" --output "$changed") > /dev/null 2>&1
+    if tr '\0' '\n' < "$changed" | grep -q '"'; then
+      no "${name}: collector emits it unquoted" \
+        "(collected: $(tr '\0' ' ' < "$changed"))"
+    else
+      ok "${name}: collector emits it unquoted"
+    fi
+
+    # and the records really are NUL-terminated, so that a future collector
+    # change cannot drop -z and still pass the case above on some other box
+    total=$(wc -c < "$changed")
+    stripped=$(tr -d '\0' < "$changed" | wc -c)
+    if [ "$total" -gt "$stripped" ]; then
+      ok "${name}: collector output is NUL-terminated"
+    else
+      no "${name}: collector output is NUL-terminated" \
+        "(no NUL in ${total} bytes)"
+    fi
+
+    out=$(run_guard "$SHIM_JQ" "$OPEN_JSON" 0 --list "$REAL_LIST" --changed "$changed")
+    got=$?
+    if [ "$got" -eq 1 ] && printf '%s' "$out" | grep -q -- '-> models/auth/\*'; then
+      ok "${name}: guard fails on the reserved glob"
+    else
+      no "${name}: guard fails on the reserved glob" "(want exit 1, got ${got})
+${out}"
+    fi
+  }
+
+  expect_quoted 'non-ASCII path' nonascii
+  expect_quoted 'newline in path' newline
+
+  # why -z and not `-c core.quotePath=false`: the latter leaves control
+  # characters quoted, so it would close the non-ASCII hole and keep the newline
+  # one. If a future git stops quoting these, this case is the notice.
+  qnl=$(git -C "$qrepo" rev-parse newline)
+  unquoted=$(cd "$qrepo" && git -c core.quotePath=false diff --name-only "$qbase" "$qnl")
+  if printf '%s\n' "$unquoted" | grep -q '^"models/auth/'; then
+    ok 'core.quotePath=false alone would not have closed this'
+  else
+    no 'core.quotePath=false alone would not have closed this' \
+      "(it no longer quotes a newline in a path: ${unquoted})"
+  fi
+
+  # the NUL-delimited reader must not have cost the newline-delimited input
+  # path, which is what `--changed -` is fed by hand and what every case above
+  # uses; a mixed input exercises both halves of the reader in one run
+  {
+    mixed="${TMP}/mixed-changed.txt"
+    printf 'README.md\0models/auth/oauth2.go\0' > "$mixed"
+    out=$(run_guard "$SHIM_JQ" "$OPEN_JSON" 0 --list "$REAL_LIST" --changed "$mixed")
+    got=$?
+    if [ "$got" -eq 1 ]; then
+      ok 'NUL-delimited input is matched'
+    else
+      no 'NUL-delimited input is matched' "(want exit 1, got ${got})
+${out}"
+    fi
+
+    # NUL records, then a tail with no terminator: the tail is split on newlines
+    printf 'README.md\0docs/a.md\nmodels/auth/oauth2.go' > "$mixed"
+    out=$(run_guard "$SHIM_JQ" "$OPEN_JSON" 0 --list "$REAL_LIST" --changed "$mixed")
+    got=$?
+    if [ "$got" -eq 1 ] && printf '%s' "$out" | grep -q 'models/auth/oauth2.go'; then
+      ok 'a newline-delimited tail after the last NUL is still read'
+    else
+      no 'a newline-delimited tail after the last NUL is still read' "(want exit 1, got ${got})
+${out}"
+    fi
+
+    printf 'README.md\0docs/a.md\0' > "$mixed"
+    out=$(run_guard "$SHIM_JQ" "$OPEN_JSON" 0 --list "$REAL_LIST" --changed "$mixed")
+    got=$?
+    if [ "$got" -eq 0 ]; then
+      ok 'NUL-delimited input with no reserved path passes'
+    else
+      no 'NUL-delimited input with no reserved path passes' "(want exit 0, got ${got})
+${out}"
+    fi
+  }
 }
 
 echo

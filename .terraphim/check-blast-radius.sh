@@ -10,7 +10,7 @@
 # Usage:
 #   check-blast-radius.sh --changed <file|-> [--list <file>] [--issue <index>]
 #
-#   --changed  file with one changed path per line ("-" reads stdin)
+#   --changed  changed paths, NUL-terminated or one per line ("-" reads stdin)
 #   --list     blast-radius list (default: .terraphim/sync-blast-radius.txt)
 #   --issue    tracker issue index that gates the check (default: 43)
 #
@@ -24,19 +24,28 @@
 #                     output and read nowhere else, so it cannot move the
 #                     verdict. The exemption itself is applied by the workflow.
 #
-# Nothing in the environment can change the verdict, and each of the three ways
-# it could is closed separately. The API call is a literal curl, so the lookup
-# cannot be substituted. The parser branch is chosen only by `command -v jq`,
-# so it cannot be selected. And *which* issue gates the check is an argument
-# (--issue), not an env read - the workflow passes it, so the value lives in a
-# file on the base branch that the PR under test cannot influence. That last
-# one is the one worth spelling out: an env-settable issue index is an
-# env-settable verdict, because pointing the guard at any already-closed issue
-# produces SKIPPED and exit 0. On a self-hosted runner anything able to write
-# to the job environment would then be able to do exactly that. The three
-# GITEA_* variables are runner-supplied connection details and are the
-# exception that proves the rule - misdirecting them breaks the lookup, and a
-# broken lookup fails closed (exit 2) rather than passing.
+# No environment variable *that this script reads* can change the verdict, and
+# each of the three ways one could is closed separately. The API call is a
+# literal curl with no command variable, so the lookup has no override. The
+# parser branch is chosen only by `command -v jq`, so it has no override
+# either. And *which* issue gates the check is an argument (--issue), not an
+# env read - the workflow passes it, so the value lives in a file on the base
+# branch that the PR under test cannot influence. That last one is the one
+# worth spelling out: an env-settable issue index is an env-settable verdict,
+# because pointing the guard at any already-closed issue produces SKIPPED and
+# exit 0. On a self-hosted runner anything able to write to the job environment
+# would then be able to do exactly that. The three GITEA_* variables are
+# runner-supplied connection details and are the exception that proves the
+# rule - misdirecting them breaks the lookup, and a broken lookup fails closed
+# (exit 2) rather than passing.
+#
+# The excluded assumption, stated rather than hidden: both `curl` and `jq` are
+# still resolved through PATH, and PATH is an environment variable. Placing an
+# executable on it substitutes either one - which is exactly how the test suite
+# below does it. So the claim is scoped to the variables this script names; the
+# guard assumes a trusted PATH on the runner, which is implied anyway by its
+# ability to execute the pinned scripts at all, and under pull_request_target no
+# PR-authored file is ever placed on the runner.
 #
 # check-blast-radius_test.sh therefore stubs `curl` and hides `jq` by running
 # the script with a PATH of its own, and pins the property above by running the
@@ -216,30 +225,61 @@ done < "$LIST_FILE"
 [ "$pattern_count" -gt 0 ] || die "no entries in $LIST_FILE"
 
 # --- 3. match the changed paths --------------------------------------------
-if [ "$CHANGED_FILE" = "-" ]; then
-  changed_input=$(cat)
-else
-  [ -f "$CHANGED_FILE" ] || die "changed-paths file not found: $CHANGED_FILE"
-  changed_input=$(cat "$CHANGED_FILE")
-fi
-
+# Input format. blast-radius-diff.sh emits `git diff -z`, i.e. NUL-terminated
+# records, so every byte of a path other than the terminator reaches the matcher
+# verbatim. That is load-bearing: `git diff --name-only` without -z C-quotes any
+# path holding a non-ASCII or control byte (core.quotePath defaults to true), and
+# a leading `"` makes every pattern below fail - a file added under a reserved
+# glob subtree with a non-ASCII name was silently reported PASSED.
+#
+# Newline-delimited input is still accepted, because it is what a human pipes
+# into `--changed -` by hand and what every hand-written case in the suite uses:
+# whatever follows the last NUL - the whole input, when there is none - is split
+# on newlines instead. Those records are normalised leniently (trimmed, with a
+# leading `git diff --name-status` status column dropped); NUL records are taken
+# exactly as they are, since that format is unambiguous and a path may legally
+# contain a tab or a leading space.
 violations=()
 violation_count=0
-while IFS= read -r path || [ -n "$path" ]; do
-  # tolerate `git diff --name-status` input: drop a leading status column
-  path="${path#*$'\t'}"
-  path="${path#"${path%%[![:space:]]*}"}"
-  path="${path%"${path##*[![:space:]]}"}"
-  [ -n "$path" ] || continue
+
+match_path() {
+  local path="$1" pattern
+  [ -n "$path" ] || return 0
   for pattern in "${patterns[@]}"; do
     # shellcheck disable=SC2053 # intentional glob match against the entry
     if [ "$path" = "$pattern" ] || [[ $path == $pattern ]]; then
       violations+=("$path -> $pattern")
       violation_count=$((violation_count + 1))
-      break
+      return 0
     fi
   done
-done <<< "$changed_input"
+}
+
+# Reads the changed paths from stdin. Not a subshell: a redirect on a function
+# call is not one, so the arrays above are the ones being appended to.
+read_changed() {
+  local rec="" line
+  while IFS= read -r -d '' rec; do
+    match_path "$rec"
+  done
+  # `read` leaves what it consumed before EOF in $rec, so this is the tail after
+  # the last NUL - i.e. all of a newline-delimited input.
+  [ -n "$rec" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    # tolerate `git diff --name-status` input: drop a leading status column
+    line="${line#*$'\t'}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    match_path "$line"
+  done <<< "$rec"
+}
+
+if [ "$CHANGED_FILE" = "-" ]; then
+  read_changed
+else
+  [ -f "$CHANGED_FILE" ] || die "changed-paths file not found: $CHANGED_FILE"
+  read_changed < "$CHANGED_FILE"
+fi
 
 if [ "$violation_count" -gt 0 ]; then
   echo "blast-radius violation: issue #${GUARD_ISSUE} is open and this PR touches"

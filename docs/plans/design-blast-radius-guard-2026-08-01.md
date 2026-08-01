@@ -30,7 +30,19 @@ mechanical guard that blocks uplift PRs from touching sync-owned paths while #43
       `--no-renames` decomposes the rename into a delete plus an add so the reserved
       source is collected too, and putting it on the command line rather than in config
       keeps the verdict independent of the runner's git setup;
-   d. fail if any changed path matches a blast-radius entry; added-only files pass.
+   d. collect them **NUL-terminated (`git diff -z`)**. Without `-z`, `core.quotePath` —
+      which defaults to *true* — C-quotes any path holding a non-ASCII or control byte,
+      so `models/auth/héllo.go` arrives as `"models/auth/h\303\251llo.go"`; the matcher
+      compares the record verbatim against each entry and the leading `"` makes every
+      pattern fail, so a file added under a reserved glob subtree with a non-ASCII name
+      was reported PASSED. This is the identical failure shape as the rename hole,
+      including the runner-config dependency (exit 0 on a default box, exit 1 on one with
+      `core.quotePath=false`). `-z` rather than `-c core.quotePath=false`: the latter
+      unquotes non-ASCII bytes but still quotes control characters, which would close the
+      hole for `é` and leave it open for a newline. `check-blast-radius.sh` reads NUL
+      records verbatim and still accepts newline-delimited input (what `--changed -` is
+      fed by hand) for anything after the last NUL;
+   e. fail if any changed path matches a blast-radius entry; added-only files pass.
 3. No Go/TS source changes. No changes to existing workflows.
 4. The guard's own surface (`.terraphim/*`, `.github/workflows/check-blast-radius.yml`) is
    itself on the reserved-path list. Base-ref pinning already stops an edit from taking
@@ -134,7 +146,13 @@ mechanical guard that blocks uplift PRs from touching sync-owned paths while #43
   stub and asserts the verdict does not move. `eval` is still barred in both scripts;
   `blast-radius-diff.sh` hardcodes `origin` as its fetch remote for the same reason, and the
   fetch-diagnostic case configures a dead `origin` in its throwaway repo instead of
-  injecting one through the environment.
+  injecting one through the environment. The boundary of that claim is stated where it is
+  made, in both the matcher's header and the scanner's: `curl` and `jq` are still resolved
+  through `PATH`, which is an environment variable and is precisely how the suite
+  substitutes them. The guard assumes a trusted `PATH` on the runner — implied already by
+  its ability to execute the pinned scripts — and under `pull_request_target` no PR-authored
+  file is ever placed there. The scanner reads `$VAR` expansions in the script text, so
+  `PATH`/`IFS` are outside it by construction, not overlooked.
 - Renames: a throwaway repo with `diff.renames=true` set explicitly (so the case does not
   pass for free on a box that has it off) moves a reserved file out of its reserved path —
   an exact entry (`services/lfs/server.go`), a glob-covered one (`models/auth/*`) and the
@@ -142,6 +160,18 @@ mechanical guard that blocks uplift PRs from touching sync-owned paths while #43
   exits 1 naming it. Each case first asserts that plain `--name-only` *does* drop the
   source, so it cannot pass vacuously. Deletion is pinned alongside, since it was never
   affected and a future change to the collector must not trade one hole for the other.
+- Quoted paths: a second throwaway repo with `core.quotePath=true` set explicitly adds a
+  non-ASCII path and a newline-bearing path under `models/auth/*`, on two branches off the
+  same base so neither inherits the other's violation. Each case asserts that plain
+  `--name-only` quotes the path **and that the guard, fed that quoted record, exits 0** —
+  the hole is reproduced before `-z` is credited with closing it — then that the collector
+  emits it unquoted and NUL-terminated and the guard exits 1 naming the reserved glob. One
+  further case pins that `-c core.quotePath=false` alone would *not* have closed the
+  newline variant, i.e. records why `-z` is the fix. Verdicts and quote-presence are
+  asserted, never the exact bytes of the path, so a normalising filesystem (macOS) cannot
+  fail the case for an unrelated reason. The NUL-delimited reader keeps the
+  newline-delimited input path, which is what `--changed -` is fed by hand, and mixed input
+  exercises both halves in one run.
 - Repo layout: the suite asserts the guard is in `.github/workflows`, that `.gitea/workflows`
   does not exist, that the trigger is `pull_request_target`, and that the exempt-label
   literal agrees with both `if:` conditions. These must *run in CI*, not only locally — the

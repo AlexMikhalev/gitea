@@ -216,8 +216,12 @@ jobs:
             --base "$BASE_SHA" \
             --head "$HEAD_SHA" \
             --output changed-paths.txt
+          # The collector emits NUL-terminated records (git diff -z), so that a
+          # non-ASCII or control byte in a path cannot be C-quoted into
+          # something no list entry matches. Render them one per line for the
+          # log only - the enforcement step reads the file, not this output.
           echo "changed paths:"
-          cat changed-paths.txt
+          tr '\0' '\n' < changed-paths.txt
 
       - name: Blast radius exemption
         if: ${{ contains(github.event.pull_request.labels.*.name, 'sync-owner') }}
