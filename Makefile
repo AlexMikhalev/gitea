@@ -356,10 +356,17 @@ lint-editorconfig:
 .PHONY: lint-actions
 lint-actions: ## lint action workflow files
 	# actionlint only auto-discovers .github/workflows, so pass every workflow
-	# dir explicitly. One invocation: the exit status then covers all of them
-	# (make aborts a recipe at the first failing line) and the pinned package is
-	# only built once. The wildcard function drops non-existent patterns, so an
-	# empty or .yaml-only directory never hands actionlint a literal glob.
+	# dir gitea knows about explicitly. One invocation: the exit status then
+	# covers all of them (make aborts a recipe at the first failing line) and
+	# the pinned package is only built once. The wildcard function drops
+	# non-existent patterns, so an empty or .yaml-only directory never hands
+	# actionlint a literal glob.
+	#
+	# The .gitea/workflows patterns are defensive, NOT an invitation to put a
+	# workflow there: ListWorkflows (modules/actions/workflows.go:53) breaks on
+	# the first WorkflowDirs entry that resolves, so creating .gitea/workflows/
+	# would hide every workflow this repo has in .github/workflows/. They are
+	# listed only so that such a mistake is at least linted.
 	$(GO) run $(ACTIONLINT_PACKAGE) $(wildcard .github/workflows/*.yml .github/workflows/*.yaml .gitea/workflows/*.yml .gitea/workflows/*.yaml)
 
 .PHONY: lint-templates

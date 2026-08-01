@@ -11,7 +11,7 @@
 # are dead lines that invite someone to narrow the glob while assuming the
 # exact path still covers the pick.
 #
-# Enforced by .gitea/workflows/check-blast-radius.yml via
+# Enforced by .github/workflows/check-blast-radius.yml via
 # .terraphim/check-blast-radius.sh while issue #43 is open. The sync PRs
 # themselves are expected to touch these paths: label them `sync-owner` and
 # the workflow skips enforcement (and logs the exemption).
@@ -26,9 +26,17 @@
 tests/integration/oauth_test.go
 
 # --- B3: #43.B3 / upstream ef801bb661 (#37588) avatar UA + link-account sync ---
-# research-43 did not enumerate the auth source files this pick touches, so the
-# whole documented auth surface is reserved (research-43: "touches many of the
-# same paths, especially models/auth/, routers/web/auth/, services/lfs/").
+# DELIBERATE OVER-RESERVATION, recorded in the design doc's decision record
+# (docs/plans/design-blast-radius-guard-2026-08-01.md, "Decision - exact
+# touchpoints" item 1). Every other entry in this file is derived from a diff;
+# these two are not. research-43 did not enumerate the auth source files this
+# pick touches ("touches many of the same paths, especially models/auth/,
+# routers/web/auth/, services/lfs/"), so the whole documented auth surface is
+# reserved until the B3 diff is available and these can be narrowed.
+# Cost, stated plainly: `*` spans `/`, so these reserve the entire subtrees and
+# will block unrelated auth work for as long as #43 is open. That is the
+# accepted trade - a missed conflict in the OAuth picks is more expensive than
+# a `sync-owner` label on an auth PR.
 # These two globs also cover B1 and B2's source files.
 tests/integration/oauth_avatar_test.go
 models/auth/*
@@ -57,3 +65,13 @@ tests/integration/api_actions_run_test.go
 # --- in-flight sync artefacts (PR #44, issues #43/#51) ---
 .docs/research-43.md
 .docs/design-43.md
+
+# --- the guard itself: changes must be deliberate and labelled ---
+# Base-ref pinning already means an edit here cannot affect the run that
+# carries it. Reserving the files additionally makes the edit *visible*:
+# without these entries, a PR that deletes three lines from this file reports
+# "PASSED - no reserved paths touched" and the next PR silently inherits the
+# weakened list. With them, narrowing the guard costs a `sync-owner` label,
+# which is the review checkpoint.
+.terraphim/*
+.github/workflows/check-blast-radius.yml

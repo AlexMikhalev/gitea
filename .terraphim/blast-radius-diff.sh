@@ -60,7 +60,9 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     -h | --help)
-      sed -n '4,30p' "$0"
+      # print the header block, i.e. from line 4 to the first blank line - a
+      # fixed line range silently truncates the help every time it is edited
+      sed -n '4,/^$/p' "$0"
       exit 0
       ;;
     *)
@@ -76,12 +78,17 @@ have_commit() {
 }
 
 if ! have_commit "$BASE_REV"; then
+  fetch_err=""
   if [ -n "$FETCH_REMOTE" ]; then
     echo "${SCRIPT_NAME}: base rev ${BASE_REV} is not local, fetching from ${FETCH_REMOTE}" >&2
-    git fetch --no-tags --quiet "$FETCH_REMOTE" "$BASE_REV" 2> /dev/null || true
+    # Keep the reason. Fetching a bare SHA needs uploadpack.allowReachableSHA1InWant
+    # (or allowAnySHA1InWant) on the server; where that is off, git says so
+    # precisely, and swallowing it sends the operator to inspect a fetch-depth
+    # that is already 0.
+    fetch_err=$(git fetch --no-tags --quiet "$FETCH_REMOTE" "$BASE_REV" 2>&1) || true
   fi
   have_commit "$BASE_REV" ||
-    die "cannot resolve base revision '${BASE_REV}' - the checkout needs the base branch history (fetch-depth: 0)"
+    die "cannot resolve base revision '${BASE_REV}' - the checkout needs the base branch history (fetch-depth: 0), or the server must allow fetching a bare SHA. git fetch said: ${fetch_err:-<not attempted>}"
 fi
 
 have_commit "$HEAD_REV" || die "cannot resolve head revision '${HEAD_REV}'"

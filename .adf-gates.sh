@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
 # ADF gate override for the terraphim/gitea fork.
 #
-# Gates = tagged build + vet + the repo's own unit-test target (make
-# test-backend). A plain `go test ./...` cannot work here: the fork needs the
-# sqlite build tags, and without the Makefile's test env the migration tests
-# refuse to run.
+# This is the gate contract for ALL uplift work on this fork, not for any one
+# issue: every ADF task runs `./.adf-gates.sh` and it must exit 0 before the
+# task's PR is opened. It is documented as such in
+# docs/plans/design-blast-radius-guard-2026-08-01.md ("Gates (repo toolchain)"),
+# which is where its exclusions are argued.
+#
+# Gates = the shell guards' own suites + tagged build + vet + the repo's own
+# unit-test target (make test-backend). A plain `go test ./...` cannot work
+# here: the fork needs the sqlite build tags, and without the Makefile's test
+# env the migration tests refuse to run.
 #
 # INTENTIONAL EXCLUSION - tests/
 # `tests/` holds the live-server harnesses (tests/integration, tests/e2e), not
@@ -23,6 +29,16 @@
 # git gets that coverage locally. It is self-clearing: upgrade the box's git and
 # the packages come back with no edit to this file.
 set -euo pipefail
+
+# The upstream-sync blast-radius guard is shell, so `make test-backend` never
+# reaches it and neither does any lint target. Its suite is the only thing that
+# pins the issue-state parser (jq and awk paths), the three-dot diff range, the
+# list-subsumption invariant and the workflow's placement in .github/workflows;
+# unrun, all of them regress silently. It needs no network and takes under a
+# second, so it runs first - a broken guard should not cost a full build.
+if [ -x .terraphim/check-blast-radius_test.sh ] || [ -f .terraphim/check-blast-radius_test.sh ]; then
+  bash .terraphim/check-blast-radius_test.sh
+fi
 
 go build -tags 'sqlite sqlite_unlock_notify' ./...
 go vet ./...

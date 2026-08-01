@@ -1,0 +1,208 @@
+# Upstream-sync blast-radius guard (issue #58, epic #53).
+#
+# Fails a pull request that touches a path reserved by the in-flight upstream
+# sync cherry-picks (#43-#51) while tracker issue #43 is open.
+#
+# Directory: this file MUST live in .github/workflows/, not .gitea/workflows/.
+# modules/actions/workflows.go:53 (ListWorkflows) walks
+# setting.Actions.WorkflowDirs - default [".gitea/workflows", ".github/workflows"]
+# - and `break`s on the FIRST directory that resolves; it does not union them.
+# This fork ships all of its CI in .github/workflows/, so creating a
+# .gitea/workflows/ directory would silently stop every other workflow in the
+# repository from being discovered.
+#
+# Exemption: a PR that IS part of the sync (the B1-B5 picks, the #43/#51
+# artefact PRs, and maintenance of the guard itself) is expected to touch the
+# reserved paths. Label it `sync-owner` and the enforcement step is skipped,
+# with the exemption logged on the run so it is distinguishable from a pass.
+#
+# Enforcement strength: the guard is a mechanical CI check, not branch
+# protection (explicitly out of scope for #58). Two things have to be immune to
+# the PR under test for that check to mean anything:
+#
+#   1. The workflow file itself. `on: pull_request` detects workflows from the
+#      PR's own head commit (services/actions/notifier_helper.go:203-212), so a
+#      PR could delete this file and no job would ever be created. Only
+#      `pull_request_target` workflows are read from the base branch
+#      (notifier_helper.go:214-234), which is why that is the trigger here.
+#   2. The scripts and the reserved-path list. The `Pin guard sources` step
+#      reads .terraphim/* out of the base ref, so editing them in the PR tree
+#      has no effect on that PR's own run.
+#
+# `pull_request_target` normally carries a privilege-escalation hazard because
+# it runs in the base-branch context with access to secrets. It does not here:
+# every step reads only *paths* (`git diff --name-only`, `git show BASE:...`)
+# and never checks out, sources, or executes anything authored by the PR. The
+# job's permissions are read-only and the head commit is fetched but never
+# checked out.
+#
+# Consequence of (1): this workflow does not run on the PR that introduces it -
+# it is not on the base branch yet. Its first real run is the PR after it
+# merges. That is the same property that makes it un-neuterable.
+name: Blast radius guard
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+concurrency:
+  group: blast-radius-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  # The two `if:` conditions below hardcode this literal, because the env
+  # context is not reliably available to step conditions on act_runner. The
+  # `Assert the exempt label literal` step is what keeps the copies honest - it
+  # is a plain shell comparison, so it cannot itself be defeated by the same
+  # expression-context gap that forced the duplication.
+  GUARD_EXEMPT_LABEL: sync-owner
+
+jobs:
+  check-blast-radius:
+    name: Upstream-sync blast radius
+    runs-on: terraphim-native
+    timeout-minutes: 5
+    steps:
+      - name: Assert the exempt label literal is in sync
+        run: |
+          set -eu
+          if [ "$GUARD_EXEMPT_LABEL" != "sync-owner" ]; then
+            echo "::error::GUARD_EXEMPT_LABEL is '${GUARD_EXEMPT_LABEL}' but the two \`if:\` conditions in this file test 'sync-owner'. Update both, or the failure message will name a label that exempts nothing." >&2
+            exit 1
+          fi
+
+      # pull_request_target checks out the BASE branch: services/actions/context.go:43
+      # rewrites github.ref/github.sha to the base. That is deliberate - the
+      # PR's tree is never placed on disk.
+      - name: Checkout base
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Fetch the pull request head
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -eu
+          if [ -z "$HEAD_SHA" ]; then
+            echo "::error::pull_request.head.sha missing from the event payload" >&2
+            exit 1
+          fi
+          if git cat-file -e "${HEAD_SHA}^{commit}" 2> /dev/null; then
+            echo "head ${HEAD_SHA} is already present"
+            exit 0
+          fi
+          # Gitea publishes the head of every PR (fork PRs included) in the base
+          # repository as refs/pull/<index>/head - modules/git/ref.go:17.
+          fetch_err=$(git fetch --no-tags --quiet origin \
+            "+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/${PR_NUMBER}/head" 2>&1) || true
+          if ! git cat-file -e "${HEAD_SHA}^{commit}" 2> /dev/null; then
+            echo "::error::cannot resolve the pull request head ${HEAD_SHA} after fetching refs/pull/${PR_NUMBER}/head: ${fetch_err:-<no git output>}" >&2
+            exit 1
+          fi
+
+      - name: Pin guard sources to the base ref
+        id: pin
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -eu
+          if [ -z "$BASE_SHA" ]; then
+            echo "::error::pull_request.base.sha missing from the event payload" >&2
+            exit 1
+          fi
+          if ! git cat-file -e "${BASE_SHA}^{commit}" 2> /dev/null; then
+            git fetch --no-tags --quiet origin "$BASE_SHA" 2> /dev/null || true
+          fi
+          if ! git cat-file -e "${BASE_SHA}^{commit}" 2> /dev/null; then
+            echo "::error::cannot resolve base rev ${BASE_SHA}; the checkout needs the base history" >&2
+            exit 1
+          fi
+
+          # Does .terraphim/ exist on the base ref at all? If it does, every
+          # guard file is expected to be there, and a missing one is tampering
+          # rather than bootstrapping. `git cat-file -e <sha>:<dir>` succeeds
+          # for a tree object.
+          if git cat-file -e "${BASE_SHA}:.terraphim" 2> /dev/null; then
+            base_has_guard_dir=1
+          else
+            base_has_guard_dir=0
+          fi
+
+          guard_dir="${RUNNER_TEMP}/blast-radius-guard"
+          mkdir -p "$guard_dir"
+          for f in check-blast-radius.sh blast-radius-diff.sh sync-blast-radius.txt check-blast-radius_test.sh; do
+            if git show "${BASE_SHA}:.terraphim/${f}" > "${guard_dir}/${f}" 2> /dev/null; then
+              echo "pinned .terraphim/${f} from base ${BASE_SHA}"
+            elif [ "$base_has_guard_dir" = "1" ]; then
+              # .terraphim/ is on the base ref but this file is not: the guard
+              # has been partially removed. Never fall back to the local copy.
+              echo "::error::.terraphim/${f} is missing from base ${BASE_SHA} although .terraphim/ exists there - the guard has been tampered with or partially removed" >&2
+              exit 1
+            elif [ -f ".terraphim/${f}" ]; then
+              # .terraphim/ does not exist on the base ref at all, so the guard
+              # is genuinely being introduced. Under pull_request_target the
+              # checkout IS the base branch, so this is a bootstrap-only path in
+              # practice; it is kept for a manual or base-less re-run.
+              cp ".terraphim/${f}" "${guard_dir}/${f}"
+              echo "::warning::introducing the guard; .terraphim/ does not exist on base ${BASE_SHA}, using the checked-out copy of ${f}"
+            else
+              echo "::error::.terraphim/${f} is missing from base ${BASE_SHA} and from the checkout" >&2
+              exit 1
+            fi
+          done
+          echo "guard-dir=${guard_dir}" >> "$GITHUB_OUTPUT"
+
+      # Smoke-tests the pinned guard on the runner before it is trusted to fail
+      # a PR: this is the only check that the runner has a usable bash/awk/git,
+      # and that the pinned list still parses and still matches. The suite is
+      # the base ref's copy, deliberately - running the PR's copy would execute
+      # PR-authored shell, which is the one thing pull_request_target must not
+      # do. Changes to the guard are gated instead by .terraphim/* being on the
+      # reserved-path list, and by .adf-gates.sh running the suite locally.
+      - name: Guard self-test (pinned sources)
+        env:
+          GUARD_DIR: ${{ steps.pin.outputs.guard-dir }}
+        run: bash "${GUARD_DIR}/check-blast-radius_test.sh"
+
+      - name: Collect changed paths
+        id: diff
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GUARD_DIR: ${{ steps.pin.outputs.guard-dir }}
+        run: |
+          set -eu
+          # three-dot semantics: diff against the merge base, not the base tip
+          bash "${GUARD_DIR}/blast-radius-diff.sh" \
+            --base "$BASE_SHA" \
+            --head "$HEAD_SHA" \
+            --output changed-paths.txt
+          echo "changed paths:"
+          cat changed-paths.txt
+
+      - name: Blast radius exemption
+        if: ${{ contains(github.event.pull_request.labels.*.name, 'sync-owner') }}
+        run: |
+          echo "::warning::blast-radius guard EXEMPTED - this PR carries the '${GUARD_EXEMPT_LABEL}' label"
+          echo "The guard was not enforced. This is the documented escape hatch for"
+          echo "the upstream-sync PRs themselves (#43-#51) and for maintenance of the"
+          echo "guard; the label on the PR is the audit record."
+
+      - name: Enforce blast radius
+        if: ${{ !contains(github.event.pull_request.labels.*.name, 'sync-owner') }}
+        env:
+          GITEA_API_URL: ${{ github.server_url }}/api/v1
+          GITEA_REPO: ${{ github.repository }}
+          GITEA_API_TOKEN: ${{ github.token }}
+          GUARD_ISSUE: "43"
+          GUARD_DIR: ${{ steps.pin.outputs.guard-dir }}
+        run: |
+          bash "${GUARD_DIR}/check-blast-radius.sh" \
+            --list "${GUARD_DIR}/sync-blast-radius.txt" \
+            --changed changed-paths.txt

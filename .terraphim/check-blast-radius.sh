@@ -19,16 +19,17 @@
 #                     name of the PR label that exempts a PR from the guard.
 #                     Only used to make the failure message actionable; the
 #                     exemption itself is applied by the workflow.
-#   GITEA_API_URL     API base, e.g. https://host/api/v1 (required unless
-#                     BLAST_RADIUS_ISSUE_FETCH is set)
-#   GITEA_REPO        owner/repo (required unless BLAST_RADIUS_ISSUE_FETCH is set)
+#   GITEA_API_URL     API base, e.g. https://host/api/v1 (required)
+#   GITEA_REPO        owner/repo (required)
 #   GITEA_API_TOKEN   token for the issue lookup (optional for public repos)
-#   BLAST_RADIUS_ISSUE_FETCH
-#                     command printing the issue JSON; overrides the HTTP call
-#                     (used by the unit tests to stub the API)
-#   BLAST_RADIUS_NO_JQ
-#                     when set, skip jq and use the awk state parser (used by
-#                     the unit tests to exercise the dependency-free path)
+#
+# There are deliberately NO test seams here: no environment variable can
+# substitute the issue lookup or select the state parser. This script decides
+# whether a PR is allowed to land, and an env-controlled override of the API
+# call is an env-controlled override of the verdict - on a self-hosted runner
+# anything that can write to the job environment could then declare #43 closed.
+# check-blast-radius_test.sh stubs `curl` and hides `jq` by running the script
+# with a PATH of its own instead.
 #
 # Exit codes: 0 = pass or skipped, 1 = blast-radius violation, 2 = usage/error.
 
@@ -58,7 +59,9 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     -h | --help)
-      sed -n '4,31p' "$0"
+      # print the header block, i.e. from line 4 to the first blank line - a
+      # fixed line range silently truncates the help every time it is edited
+      sed -n '4,/^$/p' "$0"
       exit 0
       ;;
     *)
@@ -72,10 +75,6 @@ done
 
 # --- 1. gate on the tracker issue state ------------------------------------
 fetch_issue() {
-  if [ -n "${BLAST_RADIUS_ISSUE_FETCH:-}" ]; then
-    eval "$BLAST_RADIUS_ISSUE_FETCH"
-    return
-  fi
   [ -n "${GITEA_API_URL:-}" ] || die "GITEA_API_URL is not set"
   [ -n "${GITEA_REPO:-}" ] || die "GITEA_REPO is not set"
   local url="${GITEA_API_URL%/}/repos/${GITEA_REPO}/issues/${GUARD_ISSUE}"
@@ -95,12 +94,14 @@ fetch_issue() {
 # first-textual-match parse silently returns the milestone's state and the
 # guard disables itself whenever #43 is attached to a closed milestone.
 #
-# jq is used when present; the awk fallback keeps the script dependency-free by
-# discarding everything nested inside sub-objects/arrays (string contents are
-# tracked, so braces inside the issue body do not confuse it) and then
-# requiring exactly one surviving top-level "state" key.
+# jq is used when it is on PATH; the awk fallback keeps the script
+# dependency-free by discarding everything nested inside sub-objects/arrays
+# (string contents are tracked, so braces inside the issue body do not confuse
+# it) and then requiring exactly one surviving top-level "state" key. The
+# branch is chosen only by whether jq exists - the tests exercise the fallback
+# by running with a PATH that has no jq on it, not by an override variable.
 extract_top_level_state() {
-  if [ -z "${BLAST_RADIUS_NO_JQ:-}" ] && command -v jq > /dev/null 2>&1; then
+  if command -v jq > /dev/null 2>&1; then
     jq -er 'if type == "object" and has("state") then .state else empty end'
     return
   fi
