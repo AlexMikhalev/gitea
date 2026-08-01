@@ -5,6 +5,9 @@ self-hosted-runner:
     - nscloud
     - namespace-profile-gitea-release-docker
     - namespace-profile-gitea-release-binary
-    # fork runners
-    - terraphim-native
+    # fork runners. `bigbox` is the label this fork's self-hosted act_runner
+    # answers to (sentrux-quality-gate.yml, check-blast-radius.yml). Do not add
+    # speculative labels here: the allowlist only silences actionlint, it does
+    # not make a runner exist, and a job targeting an unserved label queues
+    # forever instead of failing.
     - bigbox

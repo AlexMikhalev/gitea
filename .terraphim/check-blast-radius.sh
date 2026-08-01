@@ -31,6 +31,11 @@
 # check-blast-radius_test.sh stubs `curl` and hides `jq` by running the script
 # with a PATH of its own instead.
 #
+# The rule is guard-wide, not file-wide: blast-radius-diff.sh runs in the same
+# job on the same runner, so it reads no environment variable either (its fetch
+# remote is hardcoded to `origin`). The suite asserts "no eval" and "no
+# BLAST_RADIUS_* read" against both files.
+#
 # Exit codes: 0 = pass or skipped, 1 = blast-radius violation, 2 = usage/error.
 
 set -euo pipefail
@@ -217,8 +222,11 @@ if [ "$violation_count" -gt 0 ]; then
   echo
   echo "Rebase the uplift work off these paths, or wait for #${GUARD_ISSUE} to close."
   if [ -n "$GUARD_EXEMPT_LABEL" ]; then
-    echo "If this PR *is* part of the sync itself, add the '${GUARD_EXEMPT_LABEL}'"
-    echo "label - the exemption is then recorded on the PR and logged by the job."
+    echo "If this PR *is* part of the sync itself, or maintains the guard, ask a"
+    echo "maintainer to apply the '${GUARD_EXEMPT_LABEL}' label - the exemption is then"
+    echo "recorded on the PR and logged by the job. Applying it needs repository"
+    echo "write access; if the label does not exist yet, the maintainer creates it"
+    echo "(see docs/plans/design-blast-radius-guard-2026-08-01.md, \"Setup\")."
   fi
   echo "List: ${LIST_FILE}"
   exit 1

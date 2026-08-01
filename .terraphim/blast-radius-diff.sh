@@ -21,9 +21,11 @@
 #   --head    head revision (default: HEAD)
 #   --output  write the paths here (default: stdout)
 #
-# Environment:
-#   BLAST_RADIUS_FETCH_REMOTE  remote to fetch a missing base rev from
-#                              (default: origin; empty disables the fetch)
+# Environment: none, deliberately - see check-blast-radius.sh's header. This
+# script runs in the same job, on the same self-hosted runner, under the same
+# threat model as the verdict script, so it reads no environment variable
+# either; the fetch remote is hardcoded to `origin`. check-blast-radius_test.sh
+# asserts that for both files.
 #
 # Exit codes: 0 = ok, 2 = usage/error. Failures are loud: an unresolvable base
 # or merge base aborts with a diagnosable message instead of an opaque
@@ -35,7 +37,7 @@ SCRIPT_NAME=$(basename "$0")
 BASE_REV=""
 HEAD_REV="HEAD"
 OUTPUT=""
-FETCH_REMOTE="${BLAST_RADIUS_FETCH_REMOTE-origin}"
+FETCH_REMOTE="origin"
 
 die() {
   echo "${SCRIPT_NAME}: $*" >&2
@@ -78,17 +80,14 @@ have_commit() {
 }
 
 if ! have_commit "$BASE_REV"; then
-  fetch_err=""
-  if [ -n "$FETCH_REMOTE" ]; then
-    echo "${SCRIPT_NAME}: base rev ${BASE_REV} is not local, fetching from ${FETCH_REMOTE}" >&2
-    # Keep the reason. Fetching a bare SHA needs uploadpack.allowReachableSHA1InWant
-    # (or allowAnySHA1InWant) on the server; where that is off, git says so
-    # precisely, and swallowing it sends the operator to inspect a fetch-depth
-    # that is already 0.
-    fetch_err=$(git fetch --no-tags --quiet "$FETCH_REMOTE" "$BASE_REV" 2>&1) || true
-  fi
+  echo "${SCRIPT_NAME}: base rev ${BASE_REV} is not local, fetching from ${FETCH_REMOTE}" >&2
+  # Keep the reason. Fetching a bare SHA needs uploadpack.allowReachableSHA1InWant
+  # (or allowAnySHA1InWant) on the server; where that is off, git says so
+  # precisely, and swallowing it sends the operator to inspect a fetch-depth
+  # that is already 0. A missing `origin` reports itself just as precisely.
+  fetch_err=$(git fetch --no-tags --quiet "$FETCH_REMOTE" "$BASE_REV" 2>&1) || true
   have_commit "$BASE_REV" ||
-    die "cannot resolve base revision '${BASE_REV}' - the checkout needs the base branch history (fetch-depth: 0), or the server must allow fetching a bare SHA. git fetch said: ${fetch_err:-<not attempted>}"
+    die "cannot resolve base revision '${BASE_REV}' - the checkout needs the base branch history (fetch-depth: 0), or the server must allow fetching a bare SHA. git fetch said: ${fetch_err:-<no git output>}"
 fi
 
 have_commit "$HEAD_REV" || die "cannot resolve head revision '${HEAD_REV}'"

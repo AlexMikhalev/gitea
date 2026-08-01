@@ -60,6 +60,18 @@ mechanical guard that blocks uplift PRs from touching sync-owned paths while #43
   and the `sync-owner` exemption takes effect without a push.
   Consequence: the guard does not run on the PR that introduces it — that PR is not on the
   base branch yet. The first real run is the PR after this one merges.
+- **Runner label — RESOLVED.** The job runs on `[self-hosted, bigbox]`, the only label this
+  fork has a demonstrated runner behind: `.github/workflows/sentrux-quality-gate.yml:20` has
+  been dispatching to it since `05fe156a51`, and that job does `actions/checkout`, `curl`
+  and `awk` in `run:` blocks, i.e. the toolchain this guard needs. Every other `runs-on` in
+  `.github/workflows/` is `ubuntu-latest` or a `namespace-profile-gitea-release-*` label.
+  This matters because an unserved label is *silent*: Gitea creates the run and leaves the
+  job unassigned, and `timeout-minutes` bounds step execution, not queue time, so the check
+  would sit "waiting" forever — on a PR status list, indistinguishable from "not started".
+  That is the same failure class as the `.gitea/workflows` mistake and it is unobservable
+  from the introducing PR, since `pull_request_target` means the guard cannot run on itself.
+  For the same reason `.github/actionlint.yaml` lists only labels this fork actually uses:
+  the allowlist silences the linter, it does not make a runner exist.
 - `actionlint` (`make lint-actions`, pinned `v1.7.10` at Makefile:24) defaults to
   `.github/workflows`, so it reaches the guard with no change. The target still passes both
   workflow dirs explicitly via `$(wildcard …)` for future-proofing; non-existent patterns
@@ -98,11 +110,51 @@ mechanical guard that blocks uplift PRs from touching sync-owned paths while #43
   payloads and a failing lookup; assert fail, skip and fail-closed respectively. No network.
   The stubbing is done from *outside* the script — a PATH holding a stub `curl` and, for the
   fallback cases, no `jq` — because an environment variable that can replace the issue
-  lookup is an environment variable that can replace the verdict. The suite asserts the
-  script contains no `eval` and no such override.
+  lookup is an environment variable that can replace the verdict. The suite asserts that
+  *both* guard scripts contain no `eval` and read no `BLAST_RADIUS_*` variable;
+  `blast-radius-diff.sh` hardcodes `origin` as its fetch remote for that reason, and the
+  fetch-diagnostic case configures a dead `origin` in its throwaway repo instead of
+  injecting one through the environment.
+- Repo layout: the suite asserts the guard is in `.github/workflows`, that `.gitea/workflows`
+  does not exist, that the trigger is `pull_request_target`, and that the exempt-label
+  literal agrees with both `if:` conditions. These must *run in CI*, not only locally — the
+  pinned suite executes from `$RUNNER_TEMP`, so it resolves the repo from the runner's
+  `$GITHUB_WORKSPACE` (the base checkout under `pull_request_target`), falling back to the
+  toplevel of the working directory, and **fails** rather than skips when CI markers are set
+  but no checkout is reachable. A skipped invariant reports green. The
+  `${{ github.workspace }}` expression is deliberately *not* used to pass this:
+  `services/actions/context.go:84` leaves the server-side `workspace` value empty, so it
+  would clobber the runner's own correct value.
 - Live: throwaway PR touching a listed file → CI red; second PR adding a new file → CI green
   (the verification step named in issue #58). This must be done after the guard merges,
   since `pull_request_target` workflows only run once they are on the base branch.
+
+## Setup — the `sync-owner` label (one-time, required before this lands on `main`)
+Reserving `.terraphim/*` and the workflow file (Decision item 4) makes `sync-owner`
+load-bearing: once #43 is open and the guard is on `main`, *every* change to the guard
+itself fails the check until the PR carries that label. The label is not a repository
+artefact — Gitea labels live in the database, not in the tree — so nothing in this PR can
+create it, and the guard's failure message would otherwise instruct an author to apply a
+label that does not exist.
+
+- **Owner: the terraphim/gitea maintainer driving the #43–#51 sync** (the `terraphim` org
+  owner). Creating and applying the label both require repository *write* access, which is
+  deliberate: an outside contributor cannot self-exempt, so applying `sync-owner` is the
+  review checkpoint. The same maintainer is expected to apply it to the #43–#51 sync PRs
+  and to any guard-maintenance PR.
+- **Provision it before merging this PR**, either in the repo's Issues → Labels UI or with:
+
+  ```bash
+  curl -sSf -X POST "https://git.terraphim.cloud/api/v1/repos/terraphim/gitea/labels" \
+    -H "Authorization: token $GITEA_TOKEN" -H 'Content-Type: application/json' \
+    -d '{"name":"sync-owner","color":"#b60205",
+         "description":"Exempt from the upstream-sync blast-radius guard (#58); the PR is part of the #43-#51 sync or maintains the guard itself"}'
+  ```
+
+- This is not a deadlock if it is forgotten: the verdict is computed from the base ref, so a
+  maintainer can create and apply the label on the failing PR without a new commit. It is
+  an undocumented prerequisite on the only exit from a self-imposed block, which is why it
+  is recorded here rather than left implicit.
 
 ## Gates (repo toolchain)
 - `./.adf-gates.sh` — the fork-wide ADF gate contract, and the entry point that owns

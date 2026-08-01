@@ -15,6 +15,12 @@
 # artefact PRs, and maintenance of the guard itself) is expected to touch the
 # reserved paths. Label it `sync-owner` and the enforcement step is skipped,
 # with the exemption logged on the run so it is distinguishable from a pass.
+# That label is a database object, not a repository artefact, so it is
+# provisioned once by hand before this workflow lands; owner, rationale and the
+# exact command are in docs/plans/design-blast-radius-guard-2026-08-01.md
+# ("Setup - the `sync-owner` label"). Applying it needs repository write
+# access, which is what makes it a review checkpoint rather than a self-serve
+# opt-out.
 #
 # Enforcement strength: the guard is a mechanical CI check, not branch
 # protection (explicitly out of scope for #58). Two things have to be immune to
@@ -64,7 +70,17 @@ env:
 jobs:
   check-blast-radius:
     name: Upstream-sync blast radius
-    runs-on: terraphim-native
+    # The only self-hosted runner label this fork is known to serve:
+    # .github/workflows/sentrux-quality-gate.yml:20 has been dispatching to
+    # `[self-hosted, bigbox]` since 05fe156a51. A label that no runner
+    # advertises does not fail the job - Gitea creates the run and leaves it
+    # unassigned, and `timeout-minutes` bounds step execution, not queue time,
+    # so the guard would sit "waiting" forever and report nothing. That is the
+    # same silent-non-enforcement failure this whole workflow exists to avoid,
+    # so it reuses a label with a demonstrated runner behind it rather than
+    # introducing a new one. The `Guard self-test` step below is what checks
+    # that whichever box answers actually has a usable bash/git/awk.
+    runs-on: [self-hosted, bigbox]
     timeout-minutes: 5
     steps:
       - name: Assert the exempt label literal is in sync
@@ -165,6 +181,23 @@ jobs:
       # PR-authored shell, which is the one thing pull_request_target must not
       # do. Changes to the guard are gated instead by .terraphim/* being on the
       # reserved-path list, and by .adf-gates.sh running the suite locally.
+      #
+      # The suite's repo-layout assertions (guard is in .github/workflows,
+      # .gitea/workflows absent, trigger is pull_request_target, exempt-label
+      # literals agree) need a checkout, and the pinned copy runs from
+      # $RUNNER_TEMP - resolving the repo from the suite's own directory lands
+      # on $RUNNER_TEMP and used to make all four skip silently on every CI run.
+      # It resolves $GITHUB_WORKSPACE (or, failing that, the toplevel of the
+      # working directory) instead, and FAILS rather than skips when CI markers
+      # are set but neither is reachable. Under pull_request_target the
+      # workspace is the base branch, so this asserts the layout of the tree
+      # that will enforce the next PR.
+      #
+      # Deliberately NOT passed as `GITHUB_WORKSPACE: ${{ github.workspace }}`:
+      # services/actions/context.go:84 sets the server-side `workspace` context
+      # value to the empty string, so that expression would overwrite the
+      # runner's own correct GITHUB_WORKSPACE with "". The step's working
+      # directory is the checkout, which is the fallback the suite uses.
       - name: Guard self-test (pinned sources)
         env:
           GUARD_DIR: ${{ steps.pin.outputs.guard-dir }}
@@ -197,7 +230,12 @@ jobs:
       - name: Enforce blast radius
         if: ${{ !contains(github.event.pull_request.labels.*.name, 'sync-owner') }}
         env:
-          GITEA_API_URL: ${{ github.server_url }}/api/v1
+          # `github.api_url`, not `github.server_url`/api/v1: Gitea normalises
+          # AppURL to always end in "/" (modules/setting/server.go:305), so the
+          # GitHub idiom of appending would build "https://host//api/v1" here.
+          # api_url is assembled by the same code that guarantees the trailing
+          # slash - services/actions/context.go:58 sets it to AppURL+"api/v1".
+          GITEA_API_URL: ${{ github.api_url }}
           GITEA_REPO: ${{ github.repository }}
           GITEA_API_TOKEN: ${{ github.token }}
           GUARD_ISSUE: "43"

@@ -34,7 +34,10 @@ set -euo pipefail
 # reaches it and neither does any lint target. Its suite is the only thing that
 # pins the issue-state parser (jq and awk paths), the three-dot diff range, the
 # list-subsumption invariant and the workflow's placement in .github/workflows;
-# unrun, all of them regress silently. It needs no network and takes under a
+# unrun, all of them regress silently. The workflow's own self-test step runs
+# the same suite against the base checkout, so this is a second line rather
+# than the only one - but it is the line that catches a regression before it
+# reaches a PR. It needs no network and takes under a
 # second, so it runs first - a broken guard should not cost a full build.
 if [ -x .terraphim/check-blast-radius_test.sh ] || [ -f .terraphim/check-blast-radius_test.sh ]; then
   bash .terraphim/check-blast-radius_test.sh

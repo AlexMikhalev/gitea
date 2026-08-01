@@ -14,12 +14,18 @@
 # contains a `jq` symlink, which is exactly the `command -v jq` decision the
 # script makes in production.
 #
+# The same rule covers blast-radius-diff.sh, which runs in the same job: it
+# reads no environment variable at all, and the "no eval / no BLAST_RADIUS_*"
+# assertions below are applied to both files.
+#
 # The diff-range cases build a throwaway git repository under $TMPDIR.
 #
 # Run: .terraphim/check-blast-radius_test.sh
 #   - locally via ./.adf-gates.sh (the fork's ADF gate contract)
 #   - in CI via the "Guard self-test" step of
 #     .github/workflows/check-blast-radius.yml, which runs the base-ref copy
+#     out of $RUNNER_TEMP - the repo-layout assertions still run there, against
+#     the base checkout, rather than skipping
 
 set -uo pipefail
 
@@ -27,10 +33,45 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 SCRIPT="${HERE}/check-blast-radius.sh"
 DIFF_SCRIPT="${HERE}/blast-radius-diff.sh"
 REAL_LIST="${HERE}/sync-blast-radius.txt"
-# The repository root when the suite runs from a checkout. In CI the guard is
-# copied to $RUNNER_TEMP first, so the repo-layout assertions below detect that
-# and report a skip rather than a spurious failure.
-REPO_ROOT=$(dirname "$HERE")
+
+# The repository root the repo-layout assertions run against.
+#
+# Locally (./.adf-gates.sh) that is the parent of this script's directory. In
+# CI it is NOT: the workflow pins the guard into $RUNNER_TEMP/blast-radius-guard
+# and runs the copy from there, so $(dirname "$HERE") is $RUNNER_TEMP and the
+# layout assertions used to skip on every CI run - i.e. the `.gitea/workflows`
+# invariant, the single highest-blast-radius mistake this change exists to
+# prevent, was pinned only by whoever remembered to run the gates locally.
+# $GITHUB_WORKSPACE - exported by the runner, and under pull_request_target the
+# base-branch checkout - is on disk during that same job, and is exactly the
+# tree these assertions are about. The toplevel of the working directory is the
+# backstop: the `${{ github.workspace }}` *expression* is not usable here,
+# because services/actions/context.go:84 leaves the server-side value empty.
+#
+# Resolution never falls through to a silent skip: if a checkout is *expected*
+# (any CI marker in the environment) but none is found, that is a failure, not
+# a skip - see the "repo layout" block near the end of this file.
+resolve_repo_root() {
+  local candidate
+  for candidate in "${GITHUB_WORKSPACE:-}" "$(dirname "$HERE")" \
+    "$(git rev-parse --show-toplevel 2> /dev/null || true)"; do
+    [ -n "$candidate" ] || continue
+    [ -d "${candidate}/.github/workflows" ] || continue
+    printf '%s' "$candidate"
+    return 0
+  done
+  return 1
+}
+REPO_ROOT=$(resolve_repo_root) || REPO_ROOT=""
+
+# Is a checkout expected to be reachable? True in any CI run; act_runner and
+# GitHub Actions both export GITHUB_WORKSPACE and CI.
+if [ -n "${GITHUB_WORKSPACE:-}" ] || [ -n "${GITHUB_ACTIONS:-}" ] || [ -n "${CI:-}" ]; then
+  REPO_LAYOUT_REQUIRED=1
+else
+  REPO_LAYOUT_REQUIRED=0
+fi
+
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -274,15 +315,32 @@ run_awk_case 'awk fallback: missing state errors' 2 '{"number":43}'
 run_awk_case 'awk fallback: malformed json errors' 2 'not json at all'
 
 # --- no test seams may creep back into the production path ------------------
-# The suite stubs from outside the script on purpose. If someone reintroduces
-# an env-controlled fetch or parser override, the guard becomes disable-able by
-# anything that can write to the job environment on a self-hosted runner.
+# The suite stubs from outside the scripts on purpose. If someone reintroduces
+# an env-controlled fetch, parser or remote override, the guard becomes
+# disable-able by anything that can write to the job environment on a
+# self-hosted runner. Both scripts are covered: they run in the same job, on
+# the same runner, under the same threat model, so a seam in either one is a
+# seam in the guard.
 {
-  if grep -nE '(^|[^_[:alnum:]])eval[[:space:]]' "$SCRIPT" > /dev/null 2>&1; then
-    no 'check-blast-radius.sh contains no eval' "$(grep -nE '(^|[^_[:alnum:]])eval[[:space:]]' "$SCRIPT")"
-  else
-    ok 'check-blast-radius.sh contains no eval'
-  fi
+  for guard_script in "$SCRIPT" "$DIFF_SCRIPT"; do
+    guard_name=$(basename "$guard_script")
+
+    if grep -nE '(^|[^_[:alnum:]])eval[[:space:]]' "$guard_script" > /dev/null 2>&1; then
+      no "${guard_name} contains no eval" "$(grep -nE '(^|[^_[:alnum:]])eval[[:space:]]' "$guard_script")"
+    else
+      ok "${guard_name} contains no eval"
+    fi
+
+    # Any BLAST_RADIUS_* read is a seam by construction: nothing in production
+    # sets one, so its only purpose would be to redirect the guard from
+    # outside. Matches both `$BLAST_RADIUS_X` and `${BLAST_RADIUS_X...}`.
+    if grep -nE '\$\{?BLAST_RADIUS_' "$guard_script" > /dev/null 2>&1; then
+      no "${guard_name} reads no BLAST_RADIUS_* env var" \
+        "$(grep -nE '\$\{?BLAST_RADIUS_' "$guard_script")"
+    else
+      ok "${guard_name} reads no BLAST_RADIUS_* env var"
+    fi
+  done
 
   if grep -n 'BLAST_RADIUS_ISSUE_FETCH\|BLAST_RADIUS_NO_JQ' "$SCRIPT" > /dev/null 2>&1; then
     no 'no env override of the fetch or the parser' \
@@ -384,9 +442,17 @@ ${out}"
 # .github/workflows/, so a .gitea/workflows/ directory would hide every one of
 # those workflows. Pin that, since the mistake is silent.
 {
-  if [ ! -d "${REPO_ROOT}/.github/workflows" ]; then
+  if [ -z "$REPO_ROOT" ] && [ "$REPO_LAYOUT_REQUIRED" = "1" ]; then
+    # A skip here would be indistinguishable from a pass, which is the exact
+    # failure class the guard exists to eliminate. In CI the base checkout is
+    # on disk, so not finding it is a broken harness, not "nothing to check".
+    no 'repo-layout assertions ran' \
+      "(CI markers are set but no checkout containing .github/workflows was found; tried GITHUB_WORKSPACE='${GITHUB_WORKSPACE:-<unset>}', $(dirname "$HERE") and git rev-parse --show-toplevel)"
+  elif [ -z "$REPO_ROOT" ]; then
     skipped 'workflow placement' '(not running from a checkout)'
   else
+    printf '     repo layout asserted against %s\n' "$REPO_ROOT"
+
     if [ -f "${REPO_ROOT}/.github/workflows/check-blast-radius.yml" ]; then
       ok 'guard workflow lives in .github/workflows'
     else
@@ -459,7 +525,9 @@ ${out}"
   base_sha=$(git -C "$repo" rev-parse main)
   head_sha=$(git -C "$repo" rev-parse feature)
 
-  out=$(cd "$repo" && BLAST_RADIUS_FETCH_REMOTE= bash "$DIFF_SCRIPT" --base "$base_sha" --head "$head_sha" 2> /dev/null)
+  # No remote is configured in this throwaway repo and none is needed: both
+  # revisions are local, so blast-radius-diff.sh never reaches its fetch.
+  out=$(cd "$repo" && bash "$DIFF_SCRIPT" --base "$base_sha" --head "$head_sha" 2> /dev/null)
   got=$?
   if [ "$got" -eq 0 ] && [ "$out" = "unrelated.md" ]; then
     ok 'diff range excludes base-branch drift'
@@ -477,7 +545,7 @@ ${out}"
 
   # the guard must pass on this diff, and the range is what makes it pass
   changed_file="${TMP}/range-changed.txt"
-  (cd "$repo" && BLAST_RADIUS_FETCH_REMOTE= bash "$DIFF_SCRIPT" --base "$base_sha" --head "$head_sha" --output "$changed_file") > /dev/null 2>&1
+  (cd "$repo" && bash "$DIFF_SCRIPT" --base "$base_sha" --head "$head_sha" --output "$changed_file") > /dev/null 2>&1
   out=$(run_guard "$SHIM_JQ" "$OPEN_JSON" 0 --list "$REAL_LIST" --changed "$changed_file")
   got=$?
   if [ "$got" -eq 0 ]; then
@@ -496,7 +564,7 @@ ${out}"
     git commit --quiet -m 'pr touches a reserved path'
   ) > /dev/null 2>&1
   head_sha=$(git -C "$repo" rev-parse feature)
-  (cd "$repo" && BLAST_RADIUS_FETCH_REMOTE= bash "$DIFF_SCRIPT" --base "$base_sha" --head "$head_sha" --output "$changed_file") > /dev/null 2>&1
+  (cd "$repo" && bash "$DIFF_SCRIPT" --base "$base_sha" --head "$head_sha" --output "$changed_file") > /dev/null 2>&1
   out=$(run_guard "$SHIM_JQ" "$OPEN_JSON" 0 --list "$REAL_LIST" --changed "$changed_file")
   got=$?
   if [ "$got" -eq 1 ]; then
@@ -506,8 +574,10 @@ ${out}"
 ${out}"
   fi
 
-  # an unresolvable base must fail loudly, not silently diff against nothing
-  out=$(cd "$repo" && BLAST_RADIUS_FETCH_REMOTE= bash "$DIFF_SCRIPT" --base 0000000000000000000000000000000000000000 2>&1)
+  # An unresolvable base must fail loudly, not silently diff against nothing.
+  # There is still no `origin` here, so the hardcoded fetch fails immediately
+  # and offline - git resolves the remote name before it touches the network.
+  out=$(cd "$repo" && bash "$DIFF_SCRIPT" --base 0000000000000000000000000000000000000000 2>&1)
   got=$?
   if [ "$got" -eq 2 ] && printf '%s' "$out" | grep -q 'cannot resolve base revision'; then
     ok 'unresolvable base fails loudly'
@@ -515,8 +585,13 @@ ${out}"
     no 'unresolvable base fails loudly' "(exit ${got}: ${out})"
   fi
 
-  # and the diagnostic must carry git's own reason, not just a fetch-depth guess
-  out=$(cd "$repo" && BLAST_RADIUS_FETCH_REMOTE=no-such-remote bash "$DIFF_SCRIPT" \
+  # And the diagnostic must carry git's own reason, not just a fetch-depth
+  # guess. `origin` now exists but points nowhere, which is the shape of the
+  # real failure (a server that refuses to serve a bare SHA); the remote is
+  # configured in the repo rather than injected through the environment,
+  # because blast-radius-diff.sh deliberately reads no environment at all.
+  git -C "$repo" remote add origin "${TMP}/no-such-remote.git"
+  out=$(cd "$repo" && bash "$DIFF_SCRIPT" \
     --base 0000000000000000000000000000000000000000 2>&1)
   got=$?
   if [ "$got" -eq 2 ] && printf '%s' "$out" | grep -q 'git fetch said:.*no-such-remote'; then

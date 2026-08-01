@@ -73,5 +73,12 @@ tests/integration/api_actions_run_test.go
 # "PASSED - no reserved paths touched" and the next PR silently inherits the
 # weakened list. With them, narrowing the guard costs a `sync-owner` label,
 # which is the review checkpoint.
+# That makes `sync-owner` load-bearing for guard maintenance itself. The label
+# is a database object, not a repository artefact, so it has to be provisioned
+# once by hand: the terraphim/gitea maintainer driving the #43-#51 sync owns
+# creating it and applying it, and the exact step is recorded in
+# docs/plans/design-blast-radius-guard-2026-08-01.md ("Setup - the `sync-owner`
+# label"). Creating and applying it both need repository write access, so an
+# outside contributor cannot self-exempt.
 .terraphim/*
 .github/workflows/check-blast-radius.yml
