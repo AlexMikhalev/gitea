@@ -5,30 +5,41 @@
 # .docs/design-43.md). Entries are exact paths or globs; `*` also spans `/`.
 # One entry per line, `#` starts a comment.
 #
+# Because `*` spans `/`, a broader glob subsumes any exact path under it: keep
+# each surface listed exactly once, at the narrowest entry that covers it, and
+# note in the owning pick's block where the covering entry lives. Duplicates
+# are dead lines that invite someone to narrow the glob while assuming the
+# exact path still covers the pick.
+#
 # Enforced by .gitea/workflows/check-blast-radius.yml via
-# .terraphim/check-blast-radius.sh while issue #43 is open.
+# .terraphim/check-blast-radius.sh while issue #43 is open. The sync PRs
+# themselves are expected to touch these paths: label them `sync-owner` and
+# the workflow skips enforcement (and logs the exemption).
 
 # --- B1: #43.B1 / upstream ae69aec295 (#37706) OAuth PKCE + refresh replay ---
-models/auth/oauth2.go
-models/auth/oauth2_test.go
+# models/auth/oauth2.go and models/auth/oauth2_test.go are covered by the
+# `models/auth/*` entry in the B3 block below.
 
 # --- B2: #43.B2 / upstream 7e54514316 (#37704) OAuth token-exchange bind ---
-routers/web/auth/oauth2_provider.go
+# routers/web/auth/oauth2_provider.go is covered by the `routers/web/auth/*`
+# entry in the B3 block below.
 tests/integration/oauth_test.go
 
 # --- B3: #43.B3 / upstream ef801bb661 (#37588) avatar UA + link-account sync ---
 # research-43 did not enumerate the auth source files this pick touches, so the
 # whole documented auth surface is reserved (research-43: "touches many of the
 # same paths, especially models/auth/, routers/web/auth/, services/lfs/").
+# These two globs also cover B1 and B2's source files.
 tests/integration/oauth_avatar_test.go
 models/auth/*
 routers/web/auth/*
 
 # --- B4: #43.B4 / upstream f9b7b65371 (#37695) wiki + LFS request-time tokens ---
 # Highest conflict risk of B1-B5 (148-line churn in wiki_test.go).
+# Listed exactly rather than as `services/lfs/server*.go`: that glob spans `/`
+# and would also reserve unrelated paths such as services/lfs/serverfoo/bar.go.
 services/lfs/server.go
 services/lfs/server_test.go
-services/lfs/server*.go
 tests/integration/wiki_test.go
 routers/web/repo/wiki.go
 
