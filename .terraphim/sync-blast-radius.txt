@@ -1,0 +1,48 @@
+# uplift PRs must not modify these files until #43 closes
+#
+# Source of truth: the file surfaces recorded in issues #43-#51 and in the
+# research/design artefacts carried by PR #44 (.docs/research-43.md,
+# .docs/design-43.md). Entries are exact paths or globs; `*` also spans `/`.
+# One entry per line, `#` starts a comment.
+#
+# Enforced by .gitea/workflows/check-blast-radius.yml via
+# .terraphim/check-blast-radius.sh while issue #43 is open.
+
+# --- B1: #43.B1 / upstream ae69aec295 (#37706) OAuth PKCE + refresh replay ---
+models/auth/oauth2.go
+models/auth/oauth2_test.go
+
+# --- B2: #43.B2 / upstream 7e54514316 (#37704) OAuth token-exchange bind ---
+routers/web/auth/oauth2_provider.go
+tests/integration/oauth_test.go
+
+# --- B3: #43.B3 / upstream ef801bb661 (#37588) avatar UA + link-account sync ---
+# research-43 did not enumerate the auth source files this pick touches, so the
+# whole documented auth surface is reserved (research-43: "touches many of the
+# same paths, especially models/auth/, routers/web/auth/, services/lfs/").
+tests/integration/oauth_avatar_test.go
+models/auth/*
+routers/web/auth/*
+
+# --- B4: #43.B4 / upstream f9b7b65371 (#37695) wiki + LFS request-time tokens ---
+# Highest conflict risk of B1-B5 (148-line churn in wiki_test.go).
+services/lfs/server.go
+services/lfs/server_test.go
+services/lfs/server*.go
+tests/integration/wiki_test.go
+routers/web/repo/wiki.go
+
+# --- B5: #43.B5 / upstream 6a27066269 (#37662) mermaid 11.15.0 [security] ---
+pnpm-lock.yaml
+package.json
+tests/e2e/mermaid.test.ts
+
+# --- F1-F8 triage (#50): locations research-43 flags as most-likely-to-conflict ---
+# repo-actions.ts is touched by F1, F5 and F8 simultaneously; router.go by F4/F7.
+web_src/js/features/repo-actions.ts
+routers/api/v1/router.go
+tests/integration/api_actions_run_test.go
+
+# --- in-flight sync artefacts (PR #44, issues #43/#51) ---
+.docs/research-43.md
+.docs/design-43.md

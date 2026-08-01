@@ -356,6 +356,8 @@ lint-editorconfig:
 .PHONY: lint-actions
 lint-actions: ## lint action workflow files
 	$(GO) run $(ACTIONLINT_PACKAGE)
+	# actionlint only auto-discovers .github/workflows, so pass the Gitea Actions dir explicitly
+	$(GO) run $(ACTIONLINT_PACKAGE) .gitea/workflows/*.yml
 
 .PHONY: lint-templates
 lint-templates: .venv node_modules ## lint template files

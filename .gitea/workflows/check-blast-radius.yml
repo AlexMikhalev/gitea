@@ -1,0 +1,55 @@
+name: Blast radius guard
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+concurrency:
+  group: blast-radius-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check-blast-radius:
+    name: Upstream-sync blast radius
+    runs-on: terraphim-native
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Collect changed paths
+        id: diff
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -eu
+          if [ -z "$BASE_SHA" ]; then
+            echo "pull_request.base.sha missing from the event payload" >&2
+            exit 1
+          fi
+          git fetch --no-tags --quiet origin "$BASE_SHA" 2>/dev/null || true
+          head_rev="HEAD"
+          if [ -n "$HEAD_SHA" ] && git cat-file -e "${HEAD_SHA}^{commit}" 2>/dev/null; then
+            head_rev="$HEAD_SHA"
+          fi
+          git diff --name-only "$BASE_SHA" "$head_rev" > changed-paths.txt
+          echo "changed paths:"
+          cat changed-paths.txt
+
+      - name: Enforce blast radius
+        env:
+          GITEA_API_URL: ${{ github.server_url }}/api/v1
+          GITEA_REPO: ${{ github.repository }}
+          GITEA_API_TOKEN: ${{ github.token }}
+          GUARD_ISSUE: "43"
+        run: |
+          bash .terraphim/check-blast-radius.sh \
+            --list .terraphim/sync-blast-radius.txt \
+            --changed changed-paths.txt
