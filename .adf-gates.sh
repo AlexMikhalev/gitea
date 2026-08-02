@@ -21,6 +21,15 @@
 # the only place they are meaningful. Excluding them here is deliberate and is
 # not a coverage gap - if you change anything under tests/, rely on CI.
 #
+# INTENTIONAL EXCLUSION - models/migrations/...
+# Upstream's default GO_TEST_PACKAGES (Makefile:120) filters these ~30 packages
+# out of `make test-backend` on purpose: they are driven by the migration-test
+# harness (`make migrations.sqlite.test`), which builds a binary against a
+# provisioned database rather than running them as plain unit tests. Passing an
+# unfiltered `go list ./...` would silently put them back in, so the exclusion
+# is restated below. Not a coverage gap - the migration targets are where they
+# run, and fork CI runs them.
+#
 # CONDITIONAL EXCLUSION - git < 2.38
 # modules/git, modules/gitrepo, services/gitdiff and services/pull need
 # `git merge-tree --write-tree`, which landed in git 2.38; on an older git they
@@ -58,7 +67,7 @@ GIT_MINOR=${GIT_REST%%.*}
 [ "$GIT_MAJOR" -eq "$GIT_MAJOR" ] 2> /dev/null || GIT_MAJOR=0
 [ "$GIT_MINOR" -eq "$GIT_MINOR" ] 2> /dev/null || GIT_MINOR=0
 
-EXCLUDE_RE='/tests/'
+EXCLUDE_RE='/tests/|code.gitea.io/gitea/models/migrations'
 if [ "$((GIT_MAJOR * 1000 + GIT_MINOR))" -lt 2038 ]; then
   echo ".adf-gates: git ${GIT_VERSION} < 2.38, excluding the merge-tree-dependent packages" >&2
   EXCLUDE_RE="${EXCLUDE_RE}|/(modules/git|modules/gitrepo|services/gitdiff|services/pull)\$"

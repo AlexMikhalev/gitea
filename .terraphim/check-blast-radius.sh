@@ -35,9 +35,12 @@
 # under test cannot influence. Those two are the ones worth spelling out,
 # because either one left in the environment is an env-settable verdict.
 # Pointing the guard at any already-closed issue produces SKIPPED and exit 0 -
-# and so does pointing it at any *repository* whose issue #43 is closed, which
-# is every repository that does not have one. On a self-hosted runner anything
-# able to write to the job environment would then be able to do exactly that.
+# and so does pointing it at any *repository* that holds a closed issue #43,
+# which is a repository anyone can create and populate in seconds. (A
+# repository with no #43 at all is not the seam: the lookup 404s, `curl -sSf`
+# fails, and a failed lookup is exit 2 - fail-closed.) On a self-hosted runner
+# anything able to write to the job environment would then be able to do
+# exactly that.
 # The answer is scope-checked as well as parsed: its top-level "number" must be
 # the index that was requested, so an endpoint replying about some other issue
 # is exit 2 rather than a verdict.

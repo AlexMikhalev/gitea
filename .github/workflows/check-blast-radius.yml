@@ -276,9 +276,11 @@ jobs:
         # `--issue 43` and `--repo`, not GUARD_ISSUE/GITEA_REPO env vars. The
         # tracker issue's state is the verdict, and *which* issue that is comes
         # from two inputs: the index and the repository it lives in. Pointing
-        # the guard at any already-closed issue - or at any repository whose
-        # #43 is closed, which is every repository that has no such issue -
-        # yields SKIPPED and exit 0. As arguments both are fixed by this file,
+        # the guard at any already-closed issue - or at any repository that
+        # holds a closed #43, which anyone can create in a repo of their own -
+        # yields SKIPPED and exit 0. A repository with no #43 is not the seam:
+        # that lookup 404s and the script exits 2, fail-closed. As arguments
+        # both are fixed by this file,
         # which pull_request_target reads from the base branch, whereas an env
         # read would be settable by anything able to write to the job
         # environment on a self-hosted runner.

@@ -511,15 +511,18 @@ run_awk_case 'awk fallback: nested number does not satisfy it' 2 \
 # --- the lookup target is an argument, and the environment cannot move it ----
 # WHICH issue gates the check IS the verdict, and that target has two halves:
 # the index, and the repository the issue lives in. Point the guard at any
-# already-closed issue - or at any repository whose #43 is closed, which is
-# every repository that has no such issue - and it reports SKIPPED, exit 0.
-# The header claims the environment cannot do either; these cases are what
-# makes the claim testable instead of a name-pattern grep.
+# already-closed issue - or at any repository that holds a closed #43, which
+# anyone can create in a repository of their own - and it reports SKIPPED,
+# exit 0. A repository with no #43 is not the seam: that lookup 404s, `curl
+# -sSf` fails and the script exits 2, fail-closed. The header claims the
+# environment cannot move either half; these cases are what makes the claim
+# testable instead of a name-pattern grep.
 #
 # The stub curl here answers by repository AND index - open only for
 # terraphim/gitea#43, closed for anything else - so "the environment did not
 # redirect the lookup" and "the argument does redirect it" are distinguishable
-# rather than both trivially passing, on both halves.
+# rather than both trivially passing, on both halves. Its "closed" branch
+# models the reachable case, a repository that *has* a closed #43, not a 404.
 {
   SHIM_IDX="${TMP}/bin-idx"
   make_shim_dir "$SHIM_IDX" with-jq
@@ -535,6 +538,10 @@ repo=${rest##*/repos/}
 if [ "$repo" = "terraphim/gitea" ] && [ "$idx" = "43" ]; then
   printf '{"number":%s,"title":"tracker","state":"open"}' "$idx"
 else
+  # Every other repo/index here is a repository that HAS a closed issue at
+  # that index - the reachable redirect. A repository missing the issue would
+  # 404 instead, `curl -sSf` would fail and the script would exit 2, so that
+  # case cannot produce a verdict and is not what this stub models.
   printf '{"number":%s,"title":"other","state":"closed"}' "$idx"
 fi
 exit 0
@@ -695,6 +702,8 @@ ${out}"
   # directory is absent from the tree; this pins that the guard would fail the PR
   # introducing it, which is the only check that runs on the PR itself.
   expect_real 'shipped list blocks a new .gitea/workflows file' 1 '.gitea/workflows/anything.yml'
+  # ... and only that directory - the reservation must not spread over .gitea/
+  expect_real 'shipped list does not over-reserve .gitea' 0 '.gitea/issue_template.md'
 
   if head -n 1 "$REAL_LIST" | grep -qx "$HEADER"; then
     ok 'shipped list carries the required header'

@@ -173,9 +173,10 @@ in-repo; the other cannot be, and is closed at the instance level.
   index is now an argument (`--issue 43`, passed by the workflow, which
   `pull_request_target` reads from the base branch), not an env read. So is the repository
   (`--repo`, validated as exactly one `owner/name` pair): *which* issue gates the check is
-  two inputs, not one, and pointing the guard at any repository whose #43 is closed — which
-  is every repository that has no such issue — yields SKIPPED and exit 0 just as surely as
-  pointing it at a closed index. `GITEA_REPO` is **not read by any script**; the workflow
+  two inputs, not one, and pointing the guard at any repository that *has* a closed #43 —
+  which anyone can create in a repository of their own — yields SKIPPED and exit 0 just as
+  surely as pointing it at a closed index. (A repository with no #43 is not the seam: that
+  lookup 404s, `curl -sSf` fails and the script exits 2, fail-closed.) `GITEA_REPO` is **not read by any script**; the workflow
   passes `github.repository` through a step `env:` block into `--repo`. And the suite (a)
   enumerates every environment variable each script actually reads and checks it against a
   documented allowlist — exactly `GITEA_API_TOKEN`, `GITEA_API_URL` and `GUARD_EXEMPT_LABEL`
