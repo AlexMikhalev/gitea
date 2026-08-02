@@ -115,7 +115,10 @@ in-repo; the other cannot be, and is closed at the instance level.
   `services/actions/notifier_helper.go:180` calls `skipWorkflows()` and returns on true
   **before** the `pull_request_target` detection block at `:214`. `skipWorkflows()`
   (`notifier_helper.go:245-264`) fires on `HookEventPush`, `HookEventPullRequest` and
-  `HookEventPullRequestSync` — i.e. on `opened` and `synchronize` — and substring-matches
+  `HookEventPullRequestSync`. Note that `HookEventPullRequest` is the event for `opened`,
+  `reopened`, title/body `edited`, AND the base retarget (`services/actions/notifier.go:85,132,727`),
+  so on a default instance 4 of the 6 declared `types:` are author-suppressible — including the
+  `edited` retarget trigger added to catch stale-base passes — not just `opened`/`synchronize`. It substring-matches
   every entry of `setting.Actions.SkipWorkflowStrings` against `PullRequest.Issue.Title`
   and against the head `commit.CommitMessage`. Both are controlled by the PR author, and
   the default list (`modules/setting/actions.go:33`) is `[skip ci]`, `[ci skip]`, `[no ci]`,

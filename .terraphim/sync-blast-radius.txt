@@ -82,6 +82,9 @@ tests/integration/api_actions_run_test.go
 # outside contributor cannot self-exempt.
 .terraphim/*
 .github/workflows/check-blast-radius.yml
+# .adf-gates.sh is the only thing that runs the guard's test suite locally;
+# removing that invocation would otherwise be invisible to this guard.
+.adf-gates.sh
 
 # --- the workflow directory that would shadow the guard ---------------------
 # modules/actions/workflows.go ListWorkflows() (see the loop over

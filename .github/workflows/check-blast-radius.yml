@@ -62,7 +62,12 @@
 # pull_request_target detection at :214, and skipWorkflows()
 # (notifier_helper.go:245-264) substring-matches every
 # setting.Actions.SkipWorkflowStrings against the PR title and head commit
-# message on the `opened`/`synchronize` events. The default list
+# message. skipWorkflowEvents (notifier_helper.go:248-252) contains
+# HookEventPullRequest AND HookEventPullRequestSync, and HookEventPullRequest
+# is the event for `opened`, `reopened`, title/body `edited` AND the base
+# retarget (notifier.go:85,132,727) — so on a default instance 4 of the 6
+# declared types are author-suppressible, including the `edited` retarget
+# trigger this workflow added to catch stale-base passes. The default list
 # (modules/setting/actions.go:33) is [skip ci], [ci skip], [no ci],
 # [skip actions], [actions skip]. Both inputs are PR-author-controlled, so on a
 # default instance a PR titled "fix auth [skip ci]" creates no run at all and
