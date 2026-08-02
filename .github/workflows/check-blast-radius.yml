@@ -46,6 +46,15 @@
 # it is not on the base branch yet. Its first real run is the PR after it
 # merges. That is the same property that makes it un-neuterable.
 #
+# Trigger types: `edited` is on the list for retargeting. Changing a PR's base
+# branch fires `edited`, not `synchronize` - PullRequestChangeTargetBranch
+# (services/actions/notifier.go:713-726) sends action `edited` with no new head
+# commit behind it - and retargeting moves the merge base, so the three-dot
+# diff, and with it the set of reserved paths the PR touches,
+# changes underneath a verdict that was reached against the old base. Without
+# `edited` no run is created and the previous base's green status stays on the
+# PR, which is the silent-non-enforcement class again.
+#
 # INSTANCE DEPENDENCY - requires SKIP_WORKFLOW_STRINGS to be neutralised on the
 # instance; otherwise PR titles suppress this check silently. Nothing in this
 # repository can close that hole, so it is stated here rather than assumed:
@@ -72,7 +81,7 @@
 name: Blast radius guard
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
 
 permissions:
   contents: read

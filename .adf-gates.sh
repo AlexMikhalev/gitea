@@ -20,6 +20,11 @@
 # CI (the pull-e2e-tests / db-tests workflows) against a real server, which is
 # the only place they are meaningful. Excluding them here is deliberate and is
 # not a coverage gap - if you change anything under tests/, rely on CI.
+# The root package `code.gitea.io/gitea/tests` is named on its own below: it is
+# the harness itself (test_utils.go), it needs the same live server, and the
+# `/tests/` fragment does not reach it - there is no trailing slash after the
+# final path element. Upstream's GO_TEST_PACKAGES lists it explicitly for the
+# same reason.
 #
 # INTENTIONAL EXCLUSION - models/migrations/...
 # Upstream's default GO_TEST_PACKAGES (Makefile:120) filters these ~30 packages
@@ -67,7 +72,7 @@ GIT_MINOR=${GIT_REST%%.*}
 [ "$GIT_MAJOR" -eq "$GIT_MAJOR" ] 2> /dev/null || GIT_MAJOR=0
 [ "$GIT_MINOR" -eq "$GIT_MINOR" ] 2> /dev/null || GIT_MINOR=0
 
-EXCLUDE_RE='/tests/|code.gitea.io/gitea/models/migrations'
+EXCLUDE_RE='/tests/|code\.gitea\.io/gitea/tests$|code.gitea.io/gitea/models/migrations'
 if [ "$((GIT_MAJOR * 1000 + GIT_MINOR))" -lt 2038 ]; then
   echo ".adf-gates: git ${GIT_VERSION} < 2.38, excluding the merge-tree-dependent packages" >&2
   EXCLUDE_RE="${EXCLUDE_RE}|/(modules/git|modules/gitrepo|services/gitdiff|services/pull)\$"

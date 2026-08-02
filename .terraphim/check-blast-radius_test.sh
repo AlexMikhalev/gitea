@@ -782,16 +782,49 @@ ${out}"
         "(env='${env_label}', matching if: conditions=${if_labels}, want 2)"
     fi
 
-    # The tracker issue must be pinned as an ARGUMENT. As a `GUARD_ISSUE:` env
-    # key it would be one more thing on a self-hosted runner's job environment,
-    # and the script no longer reads it at all - so a workflow that only set
-    # the env var would silently fall back to the built-in default instead of
-    # failing, which is the wrong direction for a guard to drift.
-    if grep -q -- '--issue 43' "$wf"; then
+    # The tracker issue and the repository holding it must both be pinned as
+    # ARGUMENTS. As `GUARD_ISSUE:`/`GITEA_REPO:` env keys they would be two more
+    # things on a self-hosted runner's job environment, and the script no longer
+    # reads either - so a workflow that only set the env vars would silently
+    # fall back to the built-in defaults instead of failing, which is the wrong
+    # direction for a guard to drift.
+    #
+    # Both assertions below match the *invocation*, not the file: the enforcing
+    # step's own header comment spells out "`--issue 43` and `--repo`" in prose,
+    # so a grep for the bare flag was satisfied by the comment that documents it
+    # and stayed green with the flag deleted from the command line - the
+    # assertion could not fail for the reason it exists. Every
+    # `bash .../check-blast-radius.sh` line is collected and each one must carry
+    # both flags, so a second invocation cannot hide behind the first. Lines are
+    # joined across `\` continuations and squeezed to a single space first,
+    # which is what makes the flags matchable at all: the workflow writes each
+    # one on its own continuation line.
+    guard_cmds=$(
+      sed -e ':a' -e '/\\$/{N;s/\\\n/ /;ba' -e '}' "$wf" |
+        grep -E '^[[:space:]]*bash [^[:space:]]*check-blast-radius\.sh"?([[:space:]]|$)' |
+        sed -e 's/[[:space:]][[:space:]]*/ /g' -e 's/^ //' -e 's/$/ /'
+    )
+    guard_cmds_total=$(printf '%s\n' "$guard_cmds" | grep -c '[^[:space:]]')
+
+    if [ "$guard_cmds_total" -gt 0 ] &&
+      [ "$(printf '%s\n' "$guard_cmds" | grep -cF -- ' --issue 43 ')" -eq "$guard_cmds_total" ]; then
       ok 'workflow pins the tracker issue via --issue'
     else
       no 'workflow pins the tracker issue via --issue' \
-        '(check-blast-radius.sh takes the index as an argument, not from GUARD_ISSUE)'
+        "(check-blast-radius.sh takes the index as an argument, not from GUARD_ISSUE; ${guard_cmds_total} invocation(s) found)
+${guard_cmds}"
+    fi
+
+    # Same reasoning for the repository: an unpinned lookup resolves against
+    # whatever GITEA_REPO the job environment holds, and any repository with a
+    # closed #43 yields SKIPPED, exit 0.
+    if [ "$guard_cmds_total" -gt 0 ] &&
+      [ "$(printf '%s\n' "$guard_cmds" | grep -cF -- ' --repo ')" -eq "$guard_cmds_total" ]; then
+      ok 'workflow pins the gating repository via --repo'
+    else
+      no 'workflow pins the gating repository via --repo' \
+        "(check-blast-radius.sh takes owner/name as an argument, not from GITEA_REPO; ${guard_cmds_total} invocation(s) found)
+${guard_cmds}"
     fi
 
     if grep -qE '^[[:space:]]*GUARD_ISSUE:' "$wf"; then

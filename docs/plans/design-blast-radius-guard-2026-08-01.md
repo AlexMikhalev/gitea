@@ -296,9 +296,11 @@ label that does not exist.
 ## Gates (repo toolchain)
 - `./.adf-gates.sh` — the fork-wide ADF gate contract, and the entry point that owns
   `.adf-gates.sh`. It runs the blast-radius guard's suite, then a sqlite-tagged
-  `go build`, `go vet` and `make test-backend`. Two exclusions are argued in the file's
-  header: `tests/` (live-server harnesses, exercised by CI instead) and, only when the
-  detected git is older than 2.38, the `merge-tree --write-tree` dependent packages.
+  `go build`, `go vet` and `make test-backend`. Three exclusions are argued in the file's
+  header: `tests/` (live-server harnesses, exercised by CI instead), `models/migrations/...`
+  (upstream's own `GO_TEST_PACKAGES` filters them out — they belong to the
+  `make migrations.sqlite.test` harness), and, only when the detected git is older than
+  2.38, the `merge-tree --write-tree` dependent packages.
 - `make lint-yaml`, `make lint-actions` — required for this change (see the caveat above).
 - `make fmt`, `make lint-go`, `make test-backend` — only if any `.go` file ends up touched.
 - `make lint-js` — only if any `.ts` file ends up touched.
