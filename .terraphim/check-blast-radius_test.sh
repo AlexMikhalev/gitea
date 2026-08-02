@@ -428,9 +428,15 @@ run_awk_case 'awk fallback: nested number does not satisfy it' 2 \
   # env_reads <file> - every name the file expands but never binds itself.
   #
   # Scope, stated rather than implied: this sees `$VAR` / `${VAR}` expansions in
-  # the script text. Variables the *shell* consults without the script naming
-  # them - PATH above all, plus IFS and BASHOPTS - are structurally invisible to
-  # it, and PATH is exactly how this suite substitutes `curl` and `jq`. That is
+  # the script text, plus the three read forms that carry NO `$` sigil and were
+  # therefore invisible to the sigil pass alone - arithmetic contexts
+  # (`if (( GUARD_SKIP ))`), the `-v` existence test (`[[ -v GUARD_SKIP ]]`) and
+  # indirect expansion (`${!name}`, which reads `name`). Each of those is a
+  # complete seam on its own: `if (( GUARD_SKIP )); then exit 0; fi` is four
+  # words and no dollar sign. Variables the *shell* consults without the script
+  # naming them - PATH above all, plus IFS and BASHOPTS - are structurally
+  # invisible to it, and PATH is exactly how this suite substitutes `curl` and
+  # `jq`. That is
   # not a gap in the allowlist but its boundary: the guard assumes a trusted
   # PATH on the runner, which its ability to execute the pinned scripts at all
   # already assumes. check-blast-radius.sh's header says so in the same terms.
@@ -441,7 +447,20 @@ run_awk_case 'awk fallback: nested number does not satisfy it' 2 \
   # variables, `read` targets and bare `local` declarations are bindings too.
   env_reads() {
     local f="$1" refs bound
-    refs=$(grep -oE '\$\{?[A-Za-z_][A-Za-z0-9_]*' "$f" | sed 's/^\$[{]\?//' | sort -u)
+    refs=$( {
+      grep -oE '\$\{?[A-Za-z_][A-Za-z0-9_]*' "$f" | sed 's/^\$[{]\?//'
+      # arithmetic context: `(( VAR ))` and `$(( VAR + 1 ))` both read VAR
+      grep -oE '\(\([[:space:]]*[A-Za-z_][A-Za-z0-9_]*' "$f" |
+        sed -e 's/^((//' -e 's/^[[:space:]]*//'
+      # `[[ -v VAR ]]` / `[ -v VAR ]`, optionally negated. Anchored to the test
+      # bracket on purpose: a bare `-v` also introduces `command -v jq` and
+      # `awk -v key=...`, neither of which reads an environment variable.
+      grep -oE '\[\[?[[:space:]]+(![[:space:]]*)?-v[[:space:]]+[A-Za-z_][A-Za-z0-9_]*' "$f" |
+        awk '{print $NF}'
+      # indirect expansion: `${!name}` reads `name` (and, through it, whatever
+      # name holds - so the name itself has to be accounted for)
+      grep -oE '\$\{![A-Za-z_][A-Za-z0-9_]*' "$f" | sed 's/^\$[{]!//'
+    } | grep -v '^$' | sort -u)
     bound=$( {
       grep -oE '(^|[[:space:];(])(local[[:space:]]+|export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=.*' "$f" |
         while IFS= read -r line; do
@@ -472,6 +491,20 @@ run_awk_case 'awk fallback: nested number does not satisfy it' 2 \
       ok 'env-read scanner detects a reintroduced seam'
       ;;
     *) no 'env-read scanner detects a reintroduced seam' "(reported: ${seamy})" ;;
+  esac
+
+  # ... and the same for a seam with no `$` anywhere in it. An arithmetic test
+  # is the cheapest complete kill switch there is - one line, no sigil - so the
+  # scanner has to be shown catching it rather than assumed to.
+  printf '%s\n' '#!/usr/bin/env bash' 'if (( GUARD_SKIP )); then exit 0; fi' \
+    > "${TMP}/seamy-arith.sh"
+  seamy_arith=$(env_reads "${TMP}/seamy-arith.sh" | tr '\n' ' ')
+  case "$seamy_arith" in
+    *GUARD_SKIP*) ok 'env-read scanner detects a sigil-free arithmetic seam' ;;
+    *)
+      no 'env-read scanner detects a sigil-free arithmetic seam' \
+        "(reported: ${seamy_arith})"
+      ;;
   esac
 
   # The allowlist, and what each entry can and cannot do:
@@ -715,21 +748,43 @@ ${out}"
   fi
 
   # every entry must be reachable: no entry may be subsumed by another
-  dead=""
+  #
+  # Pairs are excluded by INDEX, not by string equality. Skipping equal strings
+  # made the one case the check is cheapest at catching - a verbatim duplicate -
+  # structurally invisible: the two copies subsume each other, `[ "$a" = "$b" ]`
+  # dropped the pair, and the dead second line stayed in the list unreported.
   entries=$(sed 's/#.*//' "$REAL_LIST" | sed 's/[[:space:]]*$//' | grep -v '^[[:space:]]*$')
-  while IFS= read -r a; do
-    while IFS= read -r b; do
-      [ "$a" = "$b" ] && continue
+  entry_list=()
+  while IFS= read -r line; do
+    entry_list+=("$line")
+  done <<< "$entries"
+
+  dead=""
+  for i in "${!entry_list[@]}"; do
+    for j in "${!entry_list[@]}"; do
+      [ "$i" = "$j" ] && continue
+      a=${entry_list[i]}
+      b=${entry_list[j]}
       # shellcheck disable=SC2053 # intentional glob match against the entry
       if [[ $a == $b ]]; then
         dead="${dead}${a} subsumed by ${b}; "
       fi
-    done <<< "$entries"
-  done <<< "$entries"
+    done
+  done
   if [ -z "$dead" ]; then
     ok 'shipped list has no subsumed entries'
   else
     no 'shipped list has no subsumed entries' "$dead"
+  fi
+
+  # ... and duplicates named as duplicates rather than as self-subsumption, so
+  # the report says what the fix is: delete the second copy.
+  dupes=$(printf '%s\n' "$entries" | sort | uniq -d | tr '\n' ' ')
+  dupes=${dupes%% }
+  if [ -z "$dupes" ]; then
+    ok 'shipped list has no duplicate entries'
+  else
+    no 'shipped list has no duplicate entries' "(repeated: ${dupes})"
   fi
 }
 
@@ -759,12 +814,26 @@ ${out}"
 
     # reserving .adf-gates.sh (above) only buys anything while the gate still
     # runs this suite: drop the invocation and every assertion here goes quiet
-    # locally, with only the workflow's self-test step left to catch it
-    if grep -q check-blast-radius_test.sh "${REPO_ROOT}/.adf-gates.sh"; then
+    # locally, with only the workflow's self-test step left to catch it.
+    #
+    # Anchored on the INVOCATION, not on the filename - same reasoning as the
+    # --issue/--repo assertions below. The gate names this suite twice, once in
+    # an `[ -f ... ]` existence test and once in the command that runs it, so a
+    # grep for the bare string was satisfied by the existence test and would
+    # have stayed green with the `bash ...` line deleted: the assertion could
+    # not fail for the reason it exists. Only lines that put the script in
+    # COMMAND position count. Continuations are joined and whitespace squeezed
+    # first, so the gate may spell the invocation across lines.
+    gate_runs=$(
+      sed -e ':a' -e '/\\$/{N;s/\\\n/ /;ba' -e '}' "${REPO_ROOT}/.adf-gates.sh" |
+        sed -e 's/[[:space:]][[:space:]]*/ /g' -e 's/^ //' |
+        grep -cE '(^|[;&|]|(^|[[:space:]])(then|do|else)[[:space:]])[[:space:]]*((bash|sh)[[:space:]]+[^[:space:]]*|\.?/[^[:space:]]*)check-blast-radius_test\.sh("|[[:space:]]|$)'
+    )
+    if [ "$gate_runs" -gt 0 ]; then
       ok 'the ADF gate still invokes this suite'
     else
       no 'the ADF gate still invokes this suite' \
-        '(nothing else runs it locally; the shell guards are outside make test-backend)'
+        '(no line RUNS it - an `[ -f ... ]` test that merely names the file is not an invocation; nothing else runs it locally, and the shell guards are outside make test-backend)'
     fi
 
     if [ -e "${REPO_ROOT}/.gitea/workflows" ]; then
