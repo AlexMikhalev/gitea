@@ -89,9 +89,12 @@ tests/integration/api_actions_run_test.go
 # breaks on the FIRST directory that resolves - it does not union them. This
 # fork ships its CI in .github/workflows/, so a PR that adds any file under
 # .gitea/workflows/ hides every .github/workflows/* workflow, this guard
-# included, from the moment it merges. Reserving the whole `.gitea` subtree
-# rather than just `.gitea/workflows/*` is deliberate: the shadowing is a
-# property of the directory existing at all, and `*` spans `/`, so one entry
-# covers any depth. The cost is that legitimate .gitea/ work needs a
-# `sync-owner` label, which is the review checkpoint this is asking for.
-.gitea/*
+# included, from the moment it merges.
+# Scope: `.gitea/workflows/*`, not `.gitea/*`. The shadowing is a property of
+# the `.gitea/workflows` directory resolving, not of `.gitea` existing -
+# ListWorkflows stats each WorkflowDirs entry, and `.gitea` alone is not one of
+# them. `.gitea/issue_template.md` is already tracked and is unrelated to
+# workflow discovery, so reserving the whole subtree taxed legitimate .gitea/
+# work for nothing. `*` spans `/`, so this entry still covers any depth
+# underneath .gitea/workflows/.
+.gitea/workflows/*

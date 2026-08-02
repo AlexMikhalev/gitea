@@ -45,6 +45,30 @@
 # Consequence of (1): this workflow does not run on the PR that introduces it -
 # it is not on the base branch yet. Its first real run is the PR after it
 # merges. That is the same property that makes it un-neuterable.
+#
+# INSTANCE DEPENDENCY - requires SKIP_WORKFLOW_STRINGS to be neutralised on the
+# instance; otherwise PR titles suppress this check silently. Nothing in this
+# repository can close that hole, so it is stated here rather than assumed:
+# services/actions/notifier_helper.go:180 calls skipWorkflows() BEFORE the
+# pull_request_target detection at :214, and skipWorkflows()
+# (notifier_helper.go:245-264) substring-matches every
+# setting.Actions.SkipWorkflowStrings against the PR title and head commit
+# message on the `opened`/`synchronize` events. The default list
+# (modules/setting/actions.go:33) is [skip ci], [ci skip], [no ci],
+# [skip actions], [actions skip]. Both inputs are PR-author-controlled, so on a
+# default instance a PR titled "fix auth [skip ci]" creates no run at all and
+# the guard reports nothing - indistinguishable from "not started" on the PR's
+# status list, which is the exact silent-non-enforcement class this file exists
+# to eliminate.
+# Note that `SKIP_WORKFLOW_STRINGS =` (empty) does NOT do it: go-ini skips
+# zero-element values and the compiled-in default survives. The required
+# app.ini setting, and why an empty value and a bare comma are both wrong, are
+# in docs/plans/design-blast-radius-guard-2026-08-01.md ("Setup -
+# SKIP_WORKFLOW_STRINGS"), alongside the `sync-owner` label provisioning.
+# Partial recovery, not a substitute: label changes emit
+# HookEventPullRequestLabel (services/actions/notifier.go:199-204), which is not
+# in skipWorkflowEvents, so a maintainer adding or removing any label on a
+# suppressed PR re-triggers this workflow. That needs someone to notice first.
 name: Blast radius guard
 on:
   pull_request_target:

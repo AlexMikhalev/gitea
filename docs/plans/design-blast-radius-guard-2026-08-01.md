@@ -102,6 +102,41 @@ mechanical guard that blocks uplift PRs from touching sync-owned paths while #43
   never checked out.
 - `.yamllint.yaml` (`extends: default`) applies repo-wide — the new YAML must satisfy it.
 
+## Threat model — what can still suppress the guard
+The guard is a CI check, so the question that matters is not "does the matcher work" but
+"what stops the job from ever being created". Two suppression vectors exist. One is closed
+in-repo; the other cannot be, and is closed at the instance level.
+
+- **Workflow-file removal and guard-source edits — closed in-repo.** `pull_request_target`
+  reads the workflow from the base branch and the `Pin guard sources` step reads
+  `.terraphim/*` out of the base ref, so neither the workflow nor the scripts nor the path
+  list can be weakened by the PR under test. See Decision item 4 and the trigger item above.
+- **`[skip ci]` in a PR title or head commit message — NOT closable in-repo.**
+  `services/actions/notifier_helper.go:180` calls `skipWorkflows()` and returns on true
+  **before** the `pull_request_target` detection block at `:214`. `skipWorkflows()`
+  (`notifier_helper.go:245-264`) fires on `HookEventPush`, `HookEventPullRequest` and
+  `HookEventPullRequestSync` — i.e. on `opened` and `synchronize` — and substring-matches
+  every entry of `setting.Actions.SkipWorkflowStrings` against `PullRequest.Issue.Title`
+  and against the head `commit.CommitMessage`. Both are controlled by the PR author, and
+  the default list (`modules/setting/actions.go:33`) is `[skip ci]`, `[ci skip]`, `[no ci]`,
+  `[skip actions]`, `[actions skip]`. On a default instance, a PR titled
+  `fix auth [skip ci]` that also touches `models/auth/*` creates **no run at all**: not a
+  failure, not a skip — nothing. On the PR's status list that is indistinguishable from
+  "not started", which is the same silent-non-enforcement failure class as the
+  `.gitea/workflows` shadowing and the unserved-runner-label hazard recorded above.
+  Base-ref pinning does not help, because the base-ref copy is never consulted; the
+  detection code never runs.
+  This vector is **out of reach of any file in this repository** — the setting is
+  instance-scoped, and the check happens before workflow discovery. It is therefore closed
+  in the fork instance's `app.ini` (see "Setup — `SKIP_WORKFLOW_STRINGS`"), and the workflow
+  header states the dependency so that an operator who copies the guard into another
+  instance inherits the requirement rather than the hole.
+  Partial recovery, recorded because it is what makes the exposure survivable rather than
+  fatal: label changes emit `HookEventPullRequestLabel`
+  (`services/actions/notifier.go:199-204`), which is *not* in `skipWorkflowEvents`, so
+  adding or removing any label on a suppressed PR re-triggers the guard. That requires a
+  human to notice the missing check first, so it is a recovery path, not a defence.
+
 ## Acceptance criteria
 - `.terraphim/sync-blast-radius.txt` exists, has the required header, and lists every path
   touched by #43–#51 cherry-picks (plus the recorded B3 over-reservation above).
@@ -136,14 +171,22 @@ mechanical guard that blocks uplift PRs from touching sync-owned paths while #43
   sat in the matcher, and *which* issue gates the check is the verdict — point it at any
   already-closed issue and the guard reports SKIPPED, exit 0. Two things replace it. The
   index is now an argument (`--issue 43`, passed by the workflow, which
-  `pull_request_target` reads from the base branch), not an env read. And the suite (a)
+  `pull_request_target` reads from the base branch), not an env read. So is the repository
+  (`--repo`, validated as exactly one `owner/name` pair): *which* issue gates the check is
+  two inputs, not one, and pointing the guard at any repository whose #43 is closed — which
+  is every repository that has no such issue — yields SKIPPED and exit 0 just as surely as
+  pointing it at a closed index. `GITEA_REPO` is **not read by any script**; the workflow
+  passes `github.repository` through a step `env:` block into `--repo`. And the suite (a)
   enumerates every environment variable each script actually reads and checks it against a
-  documented allowlist — `GITEA_API_URL`/`GITEA_REPO`/`GITEA_API_TOKEN` (connection details;
-  misdirecting them fails the lookup, which fails closed) and `GUARD_EXEMPT_LABEL` (message
-  text, compared against nothing) for the matcher, nothing at all for the collector — with a
-  self-test proving the scanner detects a reintroduced seam, and (b) runs the guard with
-  `GUARD_ISSUE` and `GUARD_EXEMPT_LABEL` set to hostile values against an index-sensitive
-  stub and asserts the verdict does not move. `eval` is still barred in both scripts;
+  documented allowlist — exactly `GITEA_API_TOKEN`, `GITEA_API_URL` and `GUARD_EXEMPT_LABEL`
+  for the matcher (the first two are connection details: misdirecting them fails the lookup,
+  which fails closed; the third is message text, compared against nothing), and nothing at
+  all for the collector — with a self-test proving the scanner detects a reintroduced seam,
+  and (b) runs the guard with `GUARD_ISSUE`, `GITEA_REPO` and `GUARD_EXEMPT_LABEL` set to
+  hostile values against a stub that is sensitive to **both** the index and the repository —
+  it answers "open" only for `terraphim/gitea#43` and "closed" for anything else — and
+  asserts the verdict does not move. A stub keyed on the index alone would have passed while
+  `GITEA_REPO` still steered the lookup. `eval` is still barred in both scripts;
   `blast-radius-diff.sh` hardcodes `origin` as its fetch remote for the same reason, and the
   fetch-diagnostic case configures a dead `origin` in its throwaway repo instead of
   injecting one through the environment. The boundary of that claim is stated where it is
@@ -186,7 +229,43 @@ mechanical guard that blocks uplift PRs from touching sync-owned paths while #43
   (the verification step named in issue #58). This must be done after the guard merges,
   since `pull_request_target` workflows only run once they are on the base branch.
 
-## Setup — the `sync-owner` label (one-time, required before this lands on `main`)
+## Setup — instance prerequisites (one-time, required before this lands on `main`)
+Two things must be provisioned on the fork instance before the guard is meaningful. Neither
+can be created by this PR: one is a database object, the other is instance configuration.
+
+### Setup — `SKIP_WORKFLOW_STRINGS` (required — without it the guard is bypassable by PR title)
+Per the threat model above, `skipWorkflows()` runs before `pull_request_target` detection
+and matches PR-author-controlled text, so the default `[skip ci]` family silently suppresses
+this check. Neutralise it in the fork instance's `app.ini`, alongside the `sync-owner` label
+provisioning below:
+
+```ini
+[actions]
+; Neutralised for the blast-radius guard (#58): skipWorkflows() runs before
+; pull_request_target detection, so any author-settable skip string is a bypass.
+; This value is a sentinel that no PR title or commit message will contain.
+SKIP_WORKFLOW_STRINGS = [never-skip-ci-a9f1c2e4]
+```
+
+Two spellings that look correct and are not — both verified against
+`gopkg.in/ini.v1@v1.67.1`, the version this fork pins, by loading each through
+`Section("actions").MapTo(&struct{ ... }{defaults})`:
+
+- **`SKIP_WORKFLOW_STRINGS =` (empty) is a silent no-op.** `setSliceWithProperType`
+  (`struct.go:89-92`) returns early when the value parses to zero elements, leaving the
+  target field — i.e. the compiled-in default list — untouched. The config reads as if the
+  hole were closed while `[skip ci]` still works. This is worth stating explicitly because
+  an empty assignment is the obvious thing to reach for.
+- **`SKIP_WORKFLOW_STRINGS = ,` is actively dangerous.** It parses to `[]string{""}`, and
+  `strings.Contains(s, "")` is true for every `s`, so *every* push and pull request on the
+  instance skips *all* workflows. Do not use it.
+
+A sentinel string is the working form: it is a non-empty one-element list, so it replaces
+the default, and no real title or commit message contains it. Verify after restart with
+`grep -A2 '^\[actions\]' app.ini` and by opening a throwaway PR titled `test [skip ci]` and
+confirming a run is created.
+
+### Setup — the `sync-owner` label (one-time, required before this lands on `main`)
 Reserving `.terraphim/*` and the workflow file (Decision item 4) makes `sync-owner`
 load-bearing: once #43 is open and the guard is on `main`, *every* change to the guard
 itself fails the check until the PR carries that label. The label is not a repository
