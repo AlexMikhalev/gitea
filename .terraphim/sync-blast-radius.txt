@@ -1,0 +1,103 @@
+# uplift PRs must not modify these files until #43 closes
+#
+# Source of truth: the file surfaces recorded in issues #43-#51 and in the
+# research/design artefacts carried by PR #44 (.docs/research-43.md,
+# .docs/design-43.md). Entries are exact paths or globs; `*` also spans `/`.
+# One entry per line, `#` starts a comment.
+#
+# Because `*` spans `/`, a broader glob subsumes any exact path under it: keep
+# each surface listed exactly once, at the narrowest entry that covers it, and
+# note in the owning pick's block where the covering entry lives. Duplicates
+# are dead lines that invite someone to narrow the glob while assuming the
+# exact path still covers the pick.
+#
+# Enforced by .github/workflows/check-blast-radius.yml via
+# .terraphim/check-blast-radius.sh while issue #43 is open. The sync PRs
+# themselves are expected to touch these paths: label them `sync-owner` and
+# the workflow skips enforcement (and logs the exemption).
+
+# --- B1: #43.B1 / upstream ae69aec295 (#37706) OAuth PKCE + refresh replay ---
+# models/auth/oauth2.go and models/auth/oauth2_test.go are covered by the
+# `models/auth/*` entry in the B3 block below.
+
+# --- B2: #43.B2 / upstream 7e54514316 (#37704) OAuth token-exchange bind ---
+# routers/web/auth/oauth2_provider.go is covered by the `routers/web/auth/*`
+# entry in the B3 block below.
+tests/integration/oauth_test.go
+
+# --- B3: #43.B3 / upstream ef801bb661 (#37588) avatar UA + link-account sync ---
+# DELIBERATE OVER-RESERVATION, recorded in the design doc's decision record
+# (docs/plans/design-blast-radius-guard-2026-08-01.md, "Decision - exact
+# touchpoints" item 1). Every other entry in this file is derived from a diff;
+# these two are not. research-43 did not enumerate the auth source files this
+# pick touches ("touches many of the same paths, especially models/auth/,
+# routers/web/auth/, services/lfs/"), so the whole documented auth surface is
+# reserved until the B3 diff is available and these can be narrowed.
+# Cost, stated plainly: `*` spans `/`, so these reserve the entire subtrees and
+# will block unrelated auth work for as long as #43 is open. That is the
+# accepted trade - a missed conflict in the OAuth picks is more expensive than
+# a `sync-owner` label on an auth PR.
+# These two globs also cover B1 and B2's source files.
+tests/integration/oauth_avatar_test.go
+models/auth/*
+routers/web/auth/*
+
+# --- B4: #43.B4 / upstream f9b7b65371 (#37695) wiki + LFS request-time tokens ---
+# Highest conflict risk of B1-B5 (148-line churn in wiki_test.go).
+# Listed exactly rather than as `services/lfs/server*.go`: that glob spans `/`
+# and would also reserve unrelated paths such as services/lfs/serverfoo/bar.go.
+services/lfs/server.go
+services/lfs/server_test.go
+tests/integration/wiki_test.go
+routers/web/repo/wiki.go
+
+# --- B5: #43.B5 / upstream 6a27066269 (#37662) mermaid 11.15.0 [security] ---
+pnpm-lock.yaml
+package.json
+tests/e2e/mermaid.test.ts
+
+# --- F1-F8 triage (#50): locations research-43 flags as most-likely-to-conflict ---
+# repo-actions.ts is touched by F1, F5 and F8 simultaneously; router.go by F4/F7.
+web_src/js/features/repo-actions.ts
+routers/api/v1/router.go
+tests/integration/api_actions_run_test.go
+
+# --- in-flight sync artefacts (PR #44, issues #43/#51) ---
+.docs/research-43.md
+.docs/design-43.md
+
+# --- the guard itself: changes must be deliberate and labelled ---
+# Base-ref pinning already means an edit here cannot affect the run that
+# carries it. Reserving the files additionally makes the edit *visible*:
+# without these entries, a PR that deletes three lines from this file reports
+# "PASSED - no reserved paths touched" and the next PR silently inherits the
+# weakened list. With them, narrowing the guard costs a `sync-owner` label,
+# which is the review checkpoint.
+# That makes `sync-owner` load-bearing for guard maintenance itself. The label
+# is a database object, not a repository artefact, so it has to be provisioned
+# once by hand: the terraphim/gitea maintainer driving the #43-#51 sync owns
+# creating it and applying it, and the exact step is recorded in
+# docs/plans/design-blast-radius-guard-2026-08-01.md ("Setup - the `sync-owner`
+# label"). Creating and applying it both need repository write access, so an
+# outside contributor cannot self-exempt.
+.terraphim/*
+.github/workflows/check-blast-radius.yml
+# .adf-gates.sh is the only thing that runs the guard's test suite locally;
+# removing that invocation would otherwise be invisible to this guard.
+.adf-gates.sh
+
+# --- the workflow directory that would shadow the guard ---------------------
+# modules/actions/workflows.go ListWorkflows() (see the loop over
+# setting.Actions.WorkflowDirs, default [".gitea/workflows", ".github/workflows"])
+# breaks on the FIRST directory that resolves - it does not union them. This
+# fork ships its CI in .github/workflows/, so a PR that adds any file under
+# .gitea/workflows/ hides every .github/workflows/* workflow, this guard
+# included, from the moment it merges.
+# Scope: `.gitea/workflows/*`, not `.gitea/*`. The shadowing is a property of
+# the `.gitea/workflows` directory resolving, not of `.gitea` existing -
+# ListWorkflows stats each WorkflowDirs entry, and `.gitea` alone is not one of
+# them. `.gitea/issue_template.md` is already tracked and is unrelated to
+# workflow discovery, so reserving the whole subtree taxed legitimate .gitea/
+# work for nothing. `*` spans `/`, so this entry still covers any depth
+# underneath .gitea/workflows/.
+.gitea/workflows/*
