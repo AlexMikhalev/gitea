@@ -852,6 +852,84 @@ ${out}"
         '(on: pull_request reads the workflow from the PR head, so it is removable by the PR)'
     fi
 
+    wf="${REPO_ROOT}/.github/workflows/check-blast-radius.yml"
+
+    # wf_key <file> <block> <key> - the value of `<key>:` written at four-space
+    # indentation inside the two-space-indented `<block>:` mapping, with all
+    # whitespace squeezed out. One line per occurrence, so a duplicated key is
+    # visible as two lines rather than silently collapsing to the first.
+    #
+    # Four spaces is the job-level/on-target-level column in this file: step
+    # keys sit at eight and block-scalar bodies deeper still, so nothing inside
+    # a `run:` script can be mistaken for one. A key written as a block
+    # sequence (`runs-on:` with the items on following `- ` lines) yields an
+    # empty value here and therefore FAILS the assertions below. That is
+    # deliberate and fail-closed: these are pins on an exact spelling, and a
+    # rewrite this parser cannot read must be re-reviewed rather than assumed
+    # equivalent.
+    wf_key() {
+      awk -v want="$2" -v key="$3" '
+        /^  [A-Za-z_][A-Za-z0-9_-]*:[[:space:]]*$/ {
+          blk = $0
+          sub(/^[[:space:]]*/, "", blk)
+          sub(/:[[:space:]]*$/, "", blk)
+          next
+        }
+        blk == want && index($0, "    " key ":") == 1 {
+          v = $0
+          sub(/^[[:space:]]*[A-Za-z_][A-Za-z0-9_-]*:[[:space:]]*/, "", v)
+          gsub(/[[:space:]]/, "", v)
+          print v
+        }
+      ' "$1"
+    }
+
+    # The runner label set is load-bearing in the same silent way the trigger
+    # is: Gitea creates the run for a label no runner advertises and simply
+    # leaves it unassigned - `timeout-minutes` bounds step execution, not queue
+    # time - so the job waits forever and the PR's status list shows the guard
+    # as "not started", indistinguishable from a pass that never happened. A
+    # one-character typo (`bigbo`, `self-hosted-`) and a swap to a hosted label
+    # like `ubuntu-latest` both land there, and neither is visible in a diff
+    # review as an outage. `[self-hosted, bigbox]` is the only label pair this
+    # fork is known to serve - see the comment on `runs-on:` in the workflow -
+    # so it is pinned exactly, whitespace aside, rather than merely required to
+    # be non-empty.
+    wf_runs_on=$(wf_key "$wf" check-blast-radius runs-on)
+    wf_runs_on_n=$(printf '%s\n' "$wf_runs_on" | grep -c '[^[:space:]]')
+    if [ "$wf_runs_on_n" -eq 1 ] && [ "$wf_runs_on" = '[self-hosted,bigbox]' ]; then
+      ok 'guard job pins runs-on to [self-hosted, bigbox]'
+    else
+      no 'guard job pins runs-on to [self-hosted, bigbox]' \
+        "(want exactly one job-level runs-on squeezing to '[self-hosted,bigbox]'; found ${wf_runs_on_n}: '$(printf '%s\n' "$wf_runs_on" | tr '\n' ' ' | sed 's/ $//')'. A label no runner advertises leaves the run unassigned forever and reports nothing.)"
+    fi
+
+    # The declared trigger types are the other half of "a run is created at
+    # all". Each of the six is load-bearing and none is inferable from the
+    # others: `opened`/`reopened`/`synchronize` are the obvious ones; `edited`
+    # catches a base-branch retarget, which moves the merge base - and with it
+    # the three-dot diff - without any new head commit
+    # (PullRequestChangeTargetBranch sends `edited`, notifier.go:713-726), so
+    # dropping it leaves the previous base's green status standing on a PR
+    # whose reserved-path set has changed; `labeled`/`unlabeled` are what make
+    # adding or removing the exempt label re-run the guard, so dropping
+    # `unlabeled` means a PR keeps its EXEMPTED pass after the label is taken
+    # away. All six are silent-non-enforcement holes, so the set is pinned
+    # exactly - order-insensitively, since YAML sequence order carries no
+    # meaning here, but neither a removal nor an addition passes.
+    wf_types_raw=$(wf_key "$wf" pull_request_target types)
+    wf_types_n=$(printf '%s\n' "$wf_types_raw" | grep -c '[^[:space:]]')
+    wf_types=$(printf '%s\n' "$wf_types_raw" | tr -d '[]' | tr ',' '\n' |
+      grep -v '^$' | LC_ALL=C sort | tr '\n' ' ')
+    wf_types=${wf_types% }
+    want_types='edited labeled opened reopened synchronize unlabeled'
+    if [ "$wf_types_n" -eq 1 ] && [ "$wf_types" = "$want_types" ]; then
+      ok 'pull_request_target declares exactly the six trigger types'
+    else
+      no 'pull_request_target declares exactly the six trigger types' \
+        "(want one types: list holding exactly '${want_types}', got '${wf_types}' from ${wf_types_n} types: key(s))"
+    fi
+
     # The env default and the hardcoded literals in the `if:` conditions must
     # agree; the workflow asserts that much at run time too. Agreement on the
     # LITERAL is only half of it, though: the two conditions are OPPOSITES -
@@ -862,25 +940,34 @@ ${out}"
     # nothing and every PR would come back green. The count could not fail for
     # the reason it exists.
     #
-    # So each occurrence is attributed to the step it sits in, and its polarity
-    # is checked against what that step DOES: exactly one negated occurrence,
-    # on a step that runs check-blast-radius.sh, and exactly one plain
-    # occurrence, on a step that does not. Swapping the two, duplicating either,
-    # or dropping the `!` all fail here.
-    wf="${REPO_ROOT}/.github/workflows/check-blast-radius.yml"
+    # So each step's `if:` is attributed to the step it sits in and compared
+    # against what that step DOES: exactly one step whose condition is the
+    # negated form and which runs check-blast-radius.sh, and exactly one whose
+    # condition is the plain form and which does not. Swapping the two,
+    # duplicating either, or dropping the `!` all fail here.
+    #
+    # The comparison is EXACT equality on the whole squeezed `if:` value, not a
+    # substring search for the label expression. Substring matching constrained
+    # only the `contains()` call and left the rest of the condition free: `if:
+    # ${{ !contains(...) && false }}`, or a `&& !github.event.pull_request.draft`
+    # clause bolted on, kept the polarity tally at one-negated/one-plain while
+    # the enforcement step skipped on every PR - the same "cannot fail for the
+    # reason it exists" shape as the bare count it replaced.
     env_label=$(sed -n 's/^  GUARD_EXEMPT_LABEL: *//p' "$wf" | head -n 1)
-    label_expr="contains(github.event.pull_request.labels.*.name, '${env_label}')"
-    # All whitespace is squeezed out of both the line and the expression before
-    # matching, so `! contains(...)` reads as negated and the expression may be
-    # re-spaced; the match is index(), not a regex, because the expression is
-    # made of `*`, `.` and parentheses. Only `if:` lines are scanned - the same
-    # words in a comment are prose, not a condition. The enforcement step is
-    # identified by the same COMMAND-position anchor used for the gate and the
-    # --issue/--repo assertions, not by its name.
+    label_cond="contains(github.event.pull_request.labels.*.name,'${env_label}')"
+    want_enforce_if='if:${{!'"${label_cond}"'}}'
+    want_exempt_if='if:${{'"${label_cond}"'}}'
+    # All whitespace is squeezed out of the `if:` line and the expected forms
+    # are written squeezed, so the condition may be re-spaced (`! contains(...)`
+    # included) but nothing may be added to or removed from it. Only `if:` lines
+    # are scanned - the same words in a comment are prose, not a condition - and
+    # only after a step's `- name:` has been seen, so a job-level condition
+    # cannot masquerade as a step's; that one is pinned separately below. The
+    # enforcement step is identified by the same COMMAND-position anchor used
+    # for the gate and the --issue/--repo assertions, not by its name.
     wf_conds=$(
-      awk -v expr="$label_expr" '
+      awk '
         function squeeze(s) { gsub(/[[:space:]]/, "", s); return s }
-        BEGIN { needle = squeeze(expr) }
         /^[[:space:]]*-[[:space:]]*name:/ {
           step = $0
           sub(/^[[:space:]]*-[[:space:]]*name:[[:space:]]*/, "", step)
@@ -889,34 +976,48 @@ ${out}"
         {
           bare = $0
           sub(/^[[:space:]]+/, "", bare)
-          if (needle != "" && bare ~ /^if:/) {
-            hay = squeeze($0)
-            at = 1
-            while ((found = index(substr(hay, at), needle)) > 0) {
-              abs = at + found - 1
-              printf "COND %s %s\n", \
-                (abs > 1 && substr(hay, abs - 1, 1) == "!") ? "negated" : "plain", step
-              at = abs + length(needle)
-            }
-          }
+          if (step != "" && bare ~ /^if:/)
+            printf "IF %s %s\n", squeeze(bare), step
           if ($0 ~ /(^|[;&|]|(^|[[:space:]])(then|do|else)[[:space:]])[[:space:]]*((bash|sh)[[:space:]]+[^[:space:]]*|\.?\/[^[:space:]]*)check-blast-radius\.sh("|[[:space:]]|$)/)
             printf "RUNS %s\n", step
         }
       ' "$wf"
     )
-    negated_n=$(printf '%s\n' "$wf_conds" | grep -c '^COND negated ')
-    plain_n=$(printf '%s\n' "$wf_conds" | grep -c '^COND plain ')
-    negated_step=$(printf '%s\n' "$wf_conds" | sed -n 's/^COND negated //p' | head -n 1)
-    plain_step=$(printf '%s\n' "$wf_conds" | sed -n 's/^COND plain //p' | head -n 1)
+    # steps_with_if <squeezed-condition> - the steps whose WHOLE `if:` value is
+    # exactly that. A squeezed value holds no whitespace, so it is a single
+    # field and the step name is everything after it.
+    steps_with_if() {
+      printf '%s\n' "$wf_conds" |
+        awk -v want="$1" '$1 == "IF" && $2 == want { s = $0; sub(/^IF [^ ]+ /, "", s); print s }'
+    }
+    enforce_steps=$(steps_with_if "$want_enforce_if")
+    exempt_steps=$(steps_with_if "$want_exempt_if")
+    enforce_n=$(printf '%s\n' "$enforce_steps" | grep -c '[^[:space:]]')
+    exempt_n=$(printf '%s\n' "$exempt_steps" | grep -c '[^[:space:]]')
     enforcing_steps=$(printf '%s\n' "$wf_conds" | sed -n 's/^RUNS //p' | sort -u)
 
-    if [ -n "$env_label" ] && [ "$negated_n" -eq 1 ] && [ "$plain_n" -eq 1 ] &&
-      printf '%s\n' "$enforcing_steps" | grep -qxF -- "$negated_step" &&
-      ! printf '%s\n' "$enforcing_steps" | grep -qxF -- "$plain_step"; then
+    if [ -n "$env_label" ] && [ "$enforce_n" -eq 1 ] && [ "$exempt_n" -eq 1 ] &&
+      printf '%s\n' "$enforcing_steps" | grep -qxF -- "$enforce_steps" &&
+      ! printf '%s\n' "$enforcing_steps" | grep -qxF -- "$exempt_steps"; then
       ok 'exempt label gates enforcement and exemption oppositely'
     else
       no 'exempt label gates enforcement and exemption oppositely' \
-        "(env='${env_label}'; want exactly one !contains() on the step that runs check-blast-radius.sh and exactly one contains() on the exemption step; negated=${negated_n} on '${negated_step}', plain=${plain_n} on '${plain_step}', steps running the guard: $(printf '%s\n' "$enforcing_steps" | tr '\n' ',' | sed 's/,$//'))"
+        "(env='${env_label}'; want exactly one step whose whole condition is '${want_enforce_if}' and which runs check-blast-radius.sh, and exactly one whose whole condition is '${want_exempt_if}' and which does not; enforce=${enforce_n} on '$(printf '%s\n' "$enforce_steps" | tr '\n' ',' | sed 's/,$//')', exempt=${exempt_n} on '$(printf '%s\n' "$exempt_steps" | tr '\n' ',' | sed 's/,$//')', steps running the guard: $(printf '%s\n' "$enforcing_steps" | tr '\n' ',' | sed 's/,$//'), conditions seen: $(printf '%s\n' "$wf_conds" | sed -n 's/^IF //p' | tr '\n' ',' | sed 's/,$//'))"
+    fi
+
+    # ... and nothing may gate the JOB. A job-level `if:` sits above both step
+    # conditions and above the pinned invocation: `if: ${{ !github.event.pull_request.draft }}`
+    # or any expression that is false for some PRs takes the whole guard out of
+    # the run, which the step-level checks above cannot see because their steps
+    # were never reached. The job is unconditional by design, so its absence is
+    # what is pinned; a deliberate job condition has to be spelled out here
+    # before it can land.
+    wf_job_if=$(wf_key "$wf" check-blast-radius if)
+    if [ -z "$wf_job_if" ]; then
+      ok 'the guard job carries no job-level if:'
+    else
+      no 'the guard job carries no job-level if:' \
+        "(found '$(printf '%s\n' "$wf_job_if" | tr '\n' ' ' | sed 's/ $//')'; a job condition skips the guard entirely, and the step-level polarity check above cannot see it. If this is intentional, pin its exact value here.)"
     fi
 
     # The workflow must RUN this suite, not merely carry its filename: the
