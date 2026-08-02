@@ -693,6 +693,9 @@ ${out}"
   expect_real 'shipped list reserves the diff collector' 1 '.terraphim/blast-radius-diff.sh'
   expect_real 'shipped list reserves this test suite' 1 '.terraphim/check-blast-radius_test.sh'
   expect_real 'shipped list reserves the workflow' 1 '.github/workflows/check-blast-radius.yml'
+  # the ADF gate is the only thing that runs this suite locally, so editing it
+  # out is a way to disable the guard's own tests without touching .terraphim/*
+  expect_real 'shipped list reserves the ADF gate' 1 '.adf-gates.sh'
   # ... but not the rest of CI
   expect_real 'shipped list leaves other workflows alone' 0 '.github/workflows/pull-compliance.yml'
 
@@ -752,6 +755,16 @@ ${out}"
       ok 'guard workflow lives in .github/workflows'
     else
       no 'guard workflow lives in .github/workflows'
+    fi
+
+    # reserving .adf-gates.sh (above) only buys anything while the gate still
+    # runs this suite: drop the invocation and every assertion here goes quiet
+    # locally, with only the workflow's self-test step left to catch it
+    if grep -q check-blast-radius_test.sh "${REPO_ROOT}/.adf-gates.sh"; then
+      ok 'the ADF gate still invokes this suite'
+    else
+      no 'the ADF gate still invokes this suite' \
+        '(nothing else runs it locally; the shell guards are outside make test-backend)'
     fi
 
     if [ -e "${REPO_ROOT}/.gitea/workflows" ]; then
@@ -1050,18 +1063,33 @@ ${out}"
     '.terraphim/check-blast-radius.sh' 'ci/check-blast-radius.sh'
 
   # plain deletion was never affected by this - keep it pinned so a future
-  # change to the collector cannot trade one hole for the other
+  # change to the collector cannot trade one hole for the other.
+  #
+  # On its OWN branch off the same base, for the reason the quoting block below
+  # spells out: `feature` now carries three renamed reserved paths, so a
+  # deletion committed on top of it would fail the guard whether or not the
+  # deletion itself was ever reported - the case could not fail for the reason
+  # it exists. The pre-assertion pins the same thing from the other side: the
+  # collected records must actually name the deleted path.
   (
     cd "$rrepo" || exit 1
+    git checkout --quiet main
+    git checkout --quiet -b deletion
     git rm --quiet pnpm-lock.yaml
     git commit --quiet -m 'delete a reserved path'
   ) > /dev/null 2>&1
-  rhead=$(git -C "$rrepo" rev-parse feature)
+  rhead=$(git -C "$rrepo" rev-parse deletion)
   changed_file="${TMP}/delete-changed.txt"
   (cd "$rrepo" && bash "$DIFF_SCRIPT" --base "$rbase" --head "$rhead" --output "$changed_file") > /dev/null 2>&1
+  if tr '\0' '\n' < "$changed_file" | grep -qxF pnpm-lock.yaml; then
+    ok 'deleted path is reported by the collector (case is not vacuous)'
+  else
+    no 'deleted path is reported by the collector (case is not vacuous)' \
+      "(collected: $(tr '\0' ' ' < "$changed_file"))"
+  fi
   out=$(run_guard "$SHIM_JQ" "$OPEN_JSON" 0 --list "$REAL_LIST" --changed "$changed_file")
   got=$?
-  if [ "$got" -eq 1 ]; then
+  if [ "$got" -eq 1 ] && printf '%s' "$out" | grep -q 'pnpm-lock.yaml'; then
     ok 'deleting a reserved path still fails'
   else
     no 'deleting a reserved path still fails' "(want exit 1, got ${got})

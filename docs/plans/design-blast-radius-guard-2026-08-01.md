@@ -44,10 +44,12 @@ mechanical guard that blocks uplift PRs from touching sync-owned paths while #43
       fed by hand) for anything after the last NUL;
    e. fail if any changed path matches a blast-radius entry; added-only files pass.
 3. No Go/TS source changes. No changes to existing workflows.
-4. The guard's own surface (`.terraphim/*`, `.github/workflows/check-blast-radius.yml`) is
-   itself on the reserved-path list. Base-ref pinning already stops an edit from taking
-   effect in the PR that carries it; the list entries are what make the edit *visible*
-   rather than silently inherited by the next PR.
+4. The guard's own surface — `.terraphim/*`, `.github/workflows/check-blast-radius.yml`,
+   `.adf-gates.sh` (the only thing that runs the guard's suite locally) and
+   `.gitea/workflows/*` (whose mere existence would hide `.github/workflows/*` from
+   `ListWorkflows`, this guard included) — is itself on the reserved-path list. Base-ref
+   pinning already stops an edit from taking effect in the PR that carries it; the list
+   entries are what make the edit *visible* rather than silently inherited by the next PR.
 
 ## Schema / enum ground truth (verified — resolved)
 - Issue state enum: `GET /api/v1/repos/{owner}/{repo}/issues/{index}` → `.state` is
@@ -270,7 +272,8 @@ the default, and no real title or commit message contains it. Verify after resta
 confirming a run is created.
 
 ### Setup — the `sync-owner` label (one-time, required before this lands on `main`)
-Reserving `.terraphim/*` and the workflow file (Decision item 4) makes `sync-owner`
+Reserving the guard's own surface — `.terraphim/*`, `.github/workflows/check-blast-radius.yml`,
+`.adf-gates.sh` and `.gitea/workflows/*` (Decision item 4) — makes `sync-owner`
 load-bearing: once #43 is open and the guard is on `main`, *every* change to the guard
 itself fails the check until the PR carries that label. The label is not a repository
 artefact — Gitea labels live in the database, not in the tree — so nothing in this PR can
