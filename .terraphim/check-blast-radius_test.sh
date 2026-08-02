@@ -852,16 +852,92 @@ ${out}"
         '(on: pull_request reads the workflow from the PR head, so it is removable by the PR)'
     fi
 
-    # the env default and the hardcoded literals in the `if:` conditions
-    # must agree; the workflow asserts this at run time too
+    # The env default and the hardcoded literals in the `if:` conditions must
+    # agree; the workflow asserts that much at run time too. Agreement on the
+    # LITERAL is only half of it, though: the two conditions are OPPOSITES -
+    # the exemption step runs when the label is present, the enforcement step
+    # when it is absent. A bare count of the expression cannot see polarity, so
+    # deleting the `!` from the enforcement step's `if:` left the count at 2
+    # while both steps now skip on every unlabelled PR: the guard would enforce
+    # nothing and every PR would come back green. The count could not fail for
+    # the reason it exists.
+    #
+    # So each occurrence is attributed to the step it sits in, and its polarity
+    # is checked against what that step DOES: exactly one negated occurrence,
+    # on a step that runs check-blast-radius.sh, and exactly one plain
+    # occurrence, on a step that does not. Swapping the two, duplicating either,
+    # or dropping the `!` all fail here.
     wf="${REPO_ROOT}/.github/workflows/check-blast-radius.yml"
     env_label=$(sed -n 's/^  GUARD_EXEMPT_LABEL: *//p' "$wf" | head -n 1)
-    if_labels=$(grep -c "contains(github.event.pull_request.labels.\*.name, '${env_label}')" "$wf")
-    if [ -n "$env_label" ] && [ "$if_labels" -eq 2 ]; then
-      ok 'exempt label literal matches both if: conditions'
+    label_expr="contains(github.event.pull_request.labels.*.name, '${env_label}')"
+    # All whitespace is squeezed out of both the line and the expression before
+    # matching, so `! contains(...)` reads as negated and the expression may be
+    # re-spaced; the match is index(), not a regex, because the expression is
+    # made of `*`, `.` and parentheses. Only `if:` lines are scanned - the same
+    # words in a comment are prose, not a condition. The enforcement step is
+    # identified by the same COMMAND-position anchor used for the gate and the
+    # --issue/--repo assertions, not by its name.
+    wf_conds=$(
+      awk -v expr="$label_expr" '
+        function squeeze(s) { gsub(/[[:space:]]/, "", s); return s }
+        BEGIN { needle = squeeze(expr) }
+        /^[[:space:]]*-[[:space:]]*name:/ {
+          step = $0
+          sub(/^[[:space:]]*-[[:space:]]*name:[[:space:]]*/, "", step)
+          next
+        }
+        {
+          bare = $0
+          sub(/^[[:space:]]+/, "", bare)
+          if (needle != "" && bare ~ /^if:/) {
+            hay = squeeze($0)
+            at = 1
+            while ((found = index(substr(hay, at), needle)) > 0) {
+              abs = at + found - 1
+              printf "COND %s %s\n", \
+                (abs > 1 && substr(hay, abs - 1, 1) == "!") ? "negated" : "plain", step
+              at = abs + length(needle)
+            }
+          }
+          if ($0 ~ /(^|[;&|]|(^|[[:space:]])(then|do|else)[[:space:]])[[:space:]]*((bash|sh)[[:space:]]+[^[:space:]]*|\.?\/[^[:space:]]*)check-blast-radius\.sh("|[[:space:]]|$)/)
+            printf "RUNS %s\n", step
+        }
+      ' "$wf"
+    )
+    negated_n=$(printf '%s\n' "$wf_conds" | grep -c '^COND negated ')
+    plain_n=$(printf '%s\n' "$wf_conds" | grep -c '^COND plain ')
+    negated_step=$(printf '%s\n' "$wf_conds" | sed -n 's/^COND negated //p' | head -n 1)
+    plain_step=$(printf '%s\n' "$wf_conds" | sed -n 's/^COND plain //p' | head -n 1)
+    enforcing_steps=$(printf '%s\n' "$wf_conds" | sed -n 's/^RUNS //p' | sort -u)
+
+    if [ -n "$env_label" ] && [ "$negated_n" -eq 1 ] && [ "$plain_n" -eq 1 ] &&
+      printf '%s\n' "$enforcing_steps" | grep -qxF -- "$negated_step" &&
+      ! printf '%s\n' "$enforcing_steps" | grep -qxF -- "$plain_step"; then
+      ok 'exempt label gates enforcement and exemption oppositely'
     else
-      no 'exempt label literal matches both if: conditions' \
-        "(env='${env_label}', matching if: conditions=${if_labels}, want 2)"
+      no 'exempt label gates enforcement and exemption oppositely' \
+        "(env='${env_label}'; want exactly one !contains() on the step that runs check-blast-radius.sh and exactly one contains() on the exemption step; negated=${negated_n} on '${negated_step}', plain=${plain_n} on '${plain_step}', steps running the guard: $(printf '%s\n' "$enforcing_steps" | tr '\n' ',' | sed 's/,$//'))"
+    fi
+
+    # The workflow must RUN this suite, not merely carry its filename: the
+    # self-test step is what executes every assertion in this file against the
+    # base checkout in CI, and the repo-layout block above is only as good as
+    # that step. Anchored on the INVOCATION for the same reason as the gate and
+    # --issue/--repo assertions: the pin loop names check-blast-radius_test.sh
+    # in its `for f in ...` list, so a grep for the bare filename stayed green
+    # with the self-test step deleted. Only lines that put the script in COMMAND
+    # position count - including directly after `run:`. Continuations are joined
+    # and whitespace squeezed first, so the step may spell it across lines.
+    wf_self_test=$(
+      sed -e ':a' -e '/\\$/{N;s/\\\n/ /;ba' -e '}' "$wf" |
+        sed -e 's/[[:space:]][[:space:]]*/ /g' -e 's/^ //' |
+        grep -cE '(^|[;&|]|(^|[[:space:]])(then|do|else|run:)[[:space:]])[[:space:]]*((bash|sh)[[:space:]]+[^[:space:]]*|\.?/[^[:space:]]*)check-blast-radius_test\.sh("|[[:space:]]|$)'
+    )
+    if [ "$wf_self_test" -gt 0 ]; then
+      ok 'workflow runs this suite as a self-test'
+    else
+      no 'workflow runs this suite as a self-test' \
+        '(no line RUNS it - naming the file in the pin loop is not an invocation; without that step CI never executes these assertions and the guard ships untested on the runner)'
     fi
 
     # The tracker issue and the repository holding it must both be pinned as
