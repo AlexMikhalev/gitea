@@ -223,7 +223,17 @@ in-repo; the other cannot be, and is closed at the instance level.
   exercises both halves in one run.
 - Repo layout: the suite asserts the guard is in `.github/workflows`, that `.gitea/workflows`
   does not exist, that the trigger is `pull_request_target`, and that the exempt-label
-  literal agrees with both `if:` conditions. These must *run in CI*, not only locally — the
+  literal agrees with both `if:` conditions. Rounds 13-17 extended this into a full
+  workflow-invariant pin set, each assertion anchored to the invocation it guards so a
+  comment cannot satisfy it: the `types:` list as an exact set (incl. `edited` and
+  `unlabeled`), `runs-on` exactly `[self-hosted, bigbox]`, both label `if:` conditions by
+  exact equality (polarity included, no job-level `if:`), the suite's own invocation on
+  both sides (local gate and the workflow's Guard self-test step), `--issue 43` /
+  `--repo "$REPO_FULL_NAME"` / `--list` / `--changed` argument-exact, `BASE_SHA`
+  provenance (`pull_request.base.sha`, `HEAD_SHA` confined to the fetch and collect steps,
+  guard-dir writes confined to the pin step), `GITEA_API_URL` = `${{ github.api_url }}`,
+  and exit-status propagation (enforcement invocation is the run-block tail;
+  `continue-on-error` absent at step and job level). These must *run in CI*, not only locally — the
   pinned suite executes from `$RUNNER_TEMP`, so it resolves the repo from the runner's
   `$GITHUB_WORKSPACE` (the base checkout under `pull_request_target`), falling back to the
   toplevel of the working directory, and **fails** rather than skips when CI markers are set
