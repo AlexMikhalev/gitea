@@ -9,14 +9,15 @@
 #
 # Usage:
 #   check-blast-radius.sh --changed <file|-> [--list <file>] [--issue <index>]
+#                         [--repo <owner/name>]
 #
 #   --changed  changed paths, NUL-terminated or one per line ("-" reads stdin)
 #   --list     blast-radius list (default: .terraphim/sync-blast-radius.txt)
 #   --issue    tracker issue index that gates the check (default: 43)
+#   --repo     owner/name the tracker issue lives in (default: terraphim/gitea)
 #
 # Environment:
 #   GITEA_API_URL     API base, e.g. https://host/api/v1 (required)
-#   GITEA_REPO        owner/repo (required)
 #   GITEA_API_TOKEN   token for the issue lookup (optional for public repos)
 #   GUARD_EXEMPT_LABEL
 #                     name of the PR label that exempts a PR from the guard.
@@ -25,19 +26,33 @@
 #                     verdict. The exemption itself is applied by the workflow.
 #
 # No environment variable *that this script reads* can change the verdict, and
-# each of the three ways one could is closed separately. The API call is a
-# literal curl with no command variable, so the lookup has no override. The
-# parser branch is chosen only by `command -v jq`, so it has no override
-# either. And *which* issue gates the check is an argument (--issue), not an
-# env read - the workflow passes it, so the value lives in a file on the base
-# branch that the PR under test cannot influence. That last one is the one
-# worth spelling out: an env-settable issue index is an env-settable verdict,
-# because pointing the guard at any already-closed issue produces SKIPPED and
-# exit 0. On a self-hosted runner anything able to write to the job environment
-# would then be able to do exactly that. The three GITEA_* variables are
-# runner-supplied connection details and are the exception that proves the
-# rule - misdirecting them breaks the lookup, and a broken lookup fails closed
-# (exit 2) rather than passing.
+# each of the ways one could is closed separately. The API call is a literal
+# curl with no command variable, so the lookup has no override. The parser
+# branch is chosen only by `command -v jq`, so it has no override either. And
+# the two inputs that decide *what* is looked up - which issue, and in which
+# repository - are arguments (--issue, --repo), not env reads: the workflow
+# passes both, so their values live in a file on the base branch that the PR
+# under test cannot influence. Those two are the ones worth spelling out,
+# because either one left in the environment is an env-settable verdict.
+# Pointing the guard at any already-closed issue produces SKIPPED and exit 0 -
+# and so does pointing it at any *repository* whose issue #43 is closed, which
+# is every repository that does not have one. On a self-hosted runner anything
+# able to write to the job environment would then be able to do exactly that.
+# The answer is scope-checked as well as parsed: its top-level "number" must be
+# the index that was requested, so an endpoint replying about some other issue
+# is exit 2 rather than a verdict.
+#
+# The two remaining GITEA_* variables are runner-supplied connection details,
+# and they are NOT immune - stated rather than claimed away. GITEA_API_TOKEN
+# cannot flip the verdict by itself: a wrong token makes `curl -sSf` fail, and
+# a failed lookup is exit 2. GITEA_API_URL can - point it at any reachable host
+# that answers this repo path with a closed issue #43 and the result is
+# SKIPPED, exit 0. No parse of the reply closes that, because the endpoint
+# writes the reply. It falls under the same trusted-runner assumption as PATH
+# below: the workflow sets it from a base-branch expression (github.api_url),
+# and anything able to rewrite it in the job environment could rewrite PATH
+# instead. What is closed is every seam a PR could reach, and both of the
+# inputs that select the issue whose state is the verdict.
 #
 # The excluded assumption, stated rather than hidden: both `curl` and `jq` are
 # still resolved through PATH, and PATH is an environment variable. Placing an
@@ -49,9 +64,12 @@
 #
 # check-blast-radius_test.sh therefore stubs `curl` and hides `jq` by running
 # the script with a PATH of its own, and pins the property above by running the
-# script with GUARD_ISSUE and GUARD_EXEMPT_LABEL set to hostile values and
-# asserting the verdict does not move - a behavioural check, not a grep for a
-# name pattern that any future seam could simply avoid matching.
+# script with GUARD_ISSUE, GITEA_REPO, GUARD_REPO and GUARD_EXEMPT_LABEL set to
+# hostile values and asserting the verdict does not move - a behavioural check,
+# not a grep for a name pattern that any future seam could simply avoid
+# matching. Its stub answers by repository *and* index, so "the argument
+# redirects the lookup" and "the environment does not" are distinguishable
+# rather than both passing for free.
 #
 # The rule is guard-wide, not file-wide: blast-radius-diff.sh runs in the same
 # job on the same runner, so it reads no environment variable at all (its fetch
@@ -65,10 +83,16 @@ set -euo pipefail
 SCRIPT_NAME=$(basename "$0")
 LIST_FILE=".terraphim/sync-blast-radius.txt"
 CHANGED_FILE=""
-# Deliberately NOT `${GUARD_ISSUE:-43}`: see the header. The index selects the
-# issue whose state decides the verdict, so reading it from the environment
-# would hand the verdict to anything that can write to the job environment.
+# Deliberately NOT read from the environment - no `GUARD_ISSUE:-43` fallback
+# and no GITEA_REPO one: see the header. (Spelled without the expansion syntax
+# on purpose - the suite's env-read scanner reads this file as text, and a name
+# written as an expansion in a comment is indistinguishable from a real seam.)
+# Together these two select the issue whose state decides the verdict, so
+# reading either from the environment would hand the verdict to anything that
+# can write to the job environment. The defaults are what a manual run uses;
+# the workflow passes both explicitly from base-branch expressions.
 GUARD_ISSUE="43"
+GUARD_REPO="terraphim/gitea"
 # Message text only; it is never compared against anything.
 GUARD_EXEMPT_LABEL="${GUARD_EXEMPT_LABEL:-}"
 
@@ -100,6 +124,26 @@ while [ $# -gt 0 ]; do
       GUARD_ISSUE="$2"
       shift 2
       ;;
+    --repo)
+      [ $# -ge 2 ] || die "--repo needs a value"
+      # The value goes into a URL path, and it selects *which* repository's
+      # issue decides the verdict. Constrain it to exactly one owner/name pair
+      # over the characters Gitea allows in either, so that neither a traversal
+      # nor an extra path segment can turn the lookup into a different endpoint.
+      case "$2" in
+        */*/*) die "--repo needs one owner/name pair, got '$2'" ;;
+        */*) ;;
+        *) die "--repo needs one owner/name pair, got '$2'" ;;
+      esac
+      case "${2%%/*}" in
+        '' | . | .. | *[!A-Za-z0-9._-]*) die "--repo has an invalid owner: '$2'" ;;
+      esac
+      case "${2#*/}" in
+        '' | . | .. | *[!A-Za-z0-9._-]*) die "--repo has an invalid repository name: '$2'" ;;
+      esac
+      GUARD_REPO="$2"
+      shift 2
+      ;;
     -h | --help)
       # print the header block, i.e. from line 4 to the first blank line - a
       # fixed line range silently truncates the help every time it is edited
@@ -118,8 +162,7 @@ done
 # --- 1. gate on the tracker issue state ------------------------------------
 fetch_issue() {
   [ -n "${GITEA_API_URL:-}" ] || die "GITEA_API_URL is not set"
-  [ -n "${GITEA_REPO:-}" ] || die "GITEA_REPO is not set"
-  local url="${GITEA_API_URL%/}/repos/${GITEA_REPO}/issues/${GUARD_ISSUE}"
+  local url="${GITEA_API_URL%/}/repos/${GUARD_REPO}/issues/${GUARD_ISSUE}"
   if [ -n "${GITEA_API_TOKEN:-}" ]; then
     curl -sSf -m 30 -H "Authorization: token ${GITEA_API_TOKEN}" "$url"
   else
@@ -127,27 +170,52 @@ fetch_issue() {
   fi
 }
 
-# `.state` is the documented "open" | "closed" enum on
-# GET /api/v1/repos/{owner}/{repo}/issues/{index}.
+# Reads one scalar from the TOP LEVEL of the payload:
 #
-# It MUST be read from the top level of the payload. An issue carries nested
-# objects that have a "state" of their own - `milestone` (serialised before
-# `state` in modules/structs/issue.go), `pull_request`, `repository` - so a
+#   extract_top_level state  string  -> the documented "open" | "closed" enum
+#   extract_top_level number number  -> the issue index the answer is about
+#
+# on GET /api/v1/repos/{owner}/{repo}/issues/{index}.
+#
+# Top level is load-bearing for both. An issue carries nested objects that have
+# a "state" of their own - `milestone` (serialised before `state` in
+# modules/structs/issue.go), `pull_request`, `repository` - so a
 # first-textual-match parse silently returns the milestone's state and the
-# guard disables itself whenever #43 is attached to a closed milestone.
+# guard disables itself whenever #43 is attached to a closed milestone. The
+# same holds for "number", which `pull_request` and `milestone` payloads also
+# carry.
 #
 # jq is used when it is on PATH; the awk fallback keeps the script
 # dependency-free by discarding everything nested inside sub-objects/arrays
 # (string contents are tracked, so braces inside the issue body do not confuse
-# it) and then requiring exactly one surviving top-level "state" key. The
-# branch is chosen only by whether jq exists - the tests exercise the fallback
-# by running with a PATH that has no jq on it, not by an override variable.
-extract_top_level_state() {
+# it) and then requiring exactly one surviving top-level key of the wanted
+# name. The branch is chosen only by whether jq exists - the tests exercise the
+# fallback by running with a PATH that has no jq on it, not by an override
+# variable. Both branches also require the value to have the wanted JSON type,
+# so a `"number":"43"` string does not satisfy the index scope check below.
+extract_top_level() {
+  local key="$1"
+  local kind="$2"
   if command -v jq > /dev/null 2>&1; then
-    jq -er 'if type == "object" and has("state") then .state else empty end'
+    # One literal filter per supported pair, rather than passing the key in
+    # with `--arg` and indexing by a jq variable: a jq program is just text to
+    # this script, so a jq variable inside one reads as an unbound shell
+    # expansion to the suite's env-read scanner - and the scanner is not the
+    # thing to loosen. (Same reason this comment names none of them.) An
+    # unrecognised pair is a programming error and fails closed like every
+    # other unreadable lookup.
+    case "${key} ${kind}" in
+      'state string')
+        jq -er 'if type == "object" and (.state | type) == "string" then .state else empty end'
+        ;;
+      'number number')
+        jq -er 'if type == "object" and (.number | type) == "number" then (.number | tostring) else empty end'
+        ;;
+      *) die "internal error: no jq filter for top-level ${key} (${kind})" ;;
+    esac
     return
   fi
-  awk '
+  awk -v key="$key" -v kind="$kind" '
     { buf = buf $0 "\n" }
     END {
       n = length(buf)
@@ -178,10 +246,17 @@ extract_top_level_state() {
       for (p = 1; p <= nparts; p++) top = top parts[p]
       top = top chunk
 
+      # A string value cannot contain an unescaped quote, so "[^\"]*" is the
+      # whole value; a number is matched as digits, which is also what makes a
+      # quoted "43" fail the number lookup rather than pass it.
+      head = "\"" key "\"[ \t\r\n]*:[ \t\r\n]*"
+      if (kind == "number") { pat = head "-?[0-9]+" } else { pat = head "\"[^\"]*\"" }
+
       count = 0; value = ""
-      while (match(top, /"state"[ \t\r\n]*:[ \t\r\n]*"[^"]*"/)) {
+      while (match(top, pat)) {
         m = substr(top, RSTART, RLENGTH)
-        sub(/^"state"[ \t\r\n]*:[ \t\r\n]*"/, "", m)
+        sub("^" head, "", m)
+        sub(/^"/, "", m)
         sub(/"$/, "", m)
         value = m; count++
         top = substr(top, RSTART + RLENGTH)
@@ -192,17 +267,28 @@ extract_top_level_state() {
   '
 }
 
-issue_json=$(fetch_issue) || die "failed to query issue #${GUARD_ISSUE}"
-issue_state=$(printf '%s' "$issue_json" | extract_top_level_state) || issue_state=""
+issue_json=$(fetch_issue) || die "failed to query issue ${GUARD_REPO}#${GUARD_ISSUE}"
+
+# Scope check before the answer is trusted: it must be *about* the issue that
+# was asked for. Only "closed" can turn into a pass, so an endpoint answering
+# with some unrelated issue would otherwise be a silent SKIPPED; here it is
+# exit 2. This does not make a hostile GITEA_API_URL safe - see the header -
+# but it does mean a redirected or path-rewriting one has to forge the index
+# rather than merely answer.
+issue_number=$(printf '%s' "$issue_json" | extract_top_level number number) || issue_number=""
+[ "$issue_number" = "$GUARD_ISSUE" ] ||
+  die "the lookup for ${GUARD_REPO}#${GUARD_ISSUE} answered about issue '${issue_number:-<none>}'"
+
+issue_state=$(printf '%s' "$issue_json" | extract_top_level state string) || issue_state=""
 
 case "$issue_state" in
   open) ;;
   closed)
-    echo "blast-radius guard: SKIPPED - tracker issue #${GUARD_ISSUE} is closed"
+    echo "blast-radius guard: SKIPPED - tracker issue ${GUARD_REPO}#${GUARD_ISSUE} is closed"
     exit 0
     ;;
   *)
-    die "could not read a single top-level state for issue #${GUARD_ISSUE}: '${issue_state:-<empty>}'"
+    die "could not read a single top-level state for issue ${GUARD_REPO}#${GUARD_ISSUE}: '${issue_state:-<empty>}'"
     ;;
 esac
 

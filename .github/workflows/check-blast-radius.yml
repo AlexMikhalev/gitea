@@ -240,17 +240,27 @@ jobs:
           # api_url is assembled by the same code that guarantees the trailing
           # slash - services/actions/context.go:58 sets it to AppURL+"api/v1".
           GITEA_API_URL: ${{ github.api_url }}
-          GITEA_REPO: ${{ github.repository }}
           GITEA_API_TOKEN: ${{ github.token }}
           GUARD_DIR: ${{ steps.pin.outputs.guard-dir }}
-        # `--issue 43`, not a GUARD_ISSUE env var. The tracker issue's state is
-        # the verdict: pointing the guard at any already-closed issue yields
-        # SKIPPED and exit 0. As an argument it is fixed by this file, which
-        # pull_request_target reads from the base branch, so the PR under test
-        # cannot reach it - whereas an env read would be settable by anything
-        # able to write to the job environment on a self-hosted runner.
+          # Passed on to `--repo`, not read from the environment by the script.
+          # Set here, in a step `env:` block this file owns, so it overrides
+          # whatever the job environment happened to hold - the expression is
+          # evaluated from the base-branch copy of this workflow, so the PR
+          # under test cannot reach it. An empty value fails closed: the script
+          # rejects anything that is not one owner/name pair.
+          REPO_FULL_NAME: ${{ github.repository }}
+        # `--issue 43` and `--repo`, not GUARD_ISSUE/GITEA_REPO env vars. The
+        # tracker issue's state is the verdict, and *which* issue that is comes
+        # from two inputs: the index and the repository it lives in. Pointing
+        # the guard at any already-closed issue - or at any repository whose
+        # #43 is closed, which is every repository that has no such issue -
+        # yields SKIPPED and exit 0. As arguments both are fixed by this file,
+        # which pull_request_target reads from the base branch, whereas an env
+        # read would be settable by anything able to write to the job
+        # environment on a self-hosted runner.
         run: |
           bash "${GUARD_DIR}/check-blast-radius.sh" \
             --list "${GUARD_DIR}/sync-blast-radius.txt" \
             --changed changed-paths.txt \
+            --repo "$REPO_FULL_NAME" \
             --issue 43

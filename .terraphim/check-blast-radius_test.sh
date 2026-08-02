@@ -88,6 +88,9 @@ trap 'rm -rf "$TMP"' EXIT
 
 STUB_API_URL="https://blast-radius.invalid/api/v1"
 STUB_REPO="terraphim/gitea"
+# A well-formed owner/name that is NOT the guarded repository: the shape a
+# misdirection attempt has, since anything malformed is rejected outright.
+HOSTILE_REPO="attacker/decoy"
 
 OPEN_JSON='{"number":43,"title":"tracker","state":"open","comments":1}'
 CLOSED_JSON='{"number":43,"title":"tracker","state":"closed","closed_at":"2026-08-01T00:00:00Z"}'
@@ -169,9 +172,15 @@ fi
 run_guard() {
   local bindir="$1" issue="$2" curl_exit="$3"
   shift 3
+  # GITEA_REPO is deliberately hostile in EVERY case in this file: the script
+  # stopped reading it when the repository became a `--repo` argument, so the
+  # verdicts asserted below are also an assertion that it is inert. That is a
+  # weak proof on its own - the stub curl here ignores the URL entirely - so
+  # the load-bearing version lives in the run_idx block, whose stub answers by
+  # repository.
   STUB_ISSUE_JSON="$issue" STUB_CURL_EXIT="$curl_exit" \
     PATH="$bindir" \
-    GITEA_API_URL="$STUB_API_URL" GITEA_REPO="$STUB_REPO" \
+    GITEA_API_URL="$STUB_API_URL" GITEA_REPO="$HOSTILE_REPO" \
     "$BASH" "$SCRIPT" "$@" 2>&1
 }
 
@@ -241,7 +250,7 @@ run_case 'issue open  -> enforced' 1 "$OPEN_JSON" \
 run_case 'issue closed -> skipped' 0 "$CLOSED_JSON" \
   "${HEADER}"$'\nmodels/auth/oauth2.go' 'models/auth/oauth2.go'
 
-run_case 'unknown state -> error' 2 '{"state":"draft"}' \
+run_case 'unknown state -> error' 2 '{"number":43,"state":"draft"}' \
   "${HEADER}"$'\nmodels/auth/oauth2.go' 'models/auth/oauth2.go'
 
 run_case 'missing state -> error' 2 '{"number":43}' \
@@ -252,6 +261,63 @@ run_case 'malformed json -> error' 2 'not json at all' \
 
 run_case 'empty list -> error' 2 "$OPEN_JSON" \
   '# only a comment' 'models/auth/oauth2.go'
+
+# --- the answer must be about the issue that was asked for ------------------
+# Only "closed" turns into a pass, so an endpoint that replies about some other
+# issue would otherwise be a silent SKIPPED. Each payload below therefore says
+# "closed": if the scope check were dropped, these cases would go to exit 0,
+# not to a different error.
+run_case 'answer about another issue -> error' 2 '{"number":44,"title":"other","state":"closed"}' \
+  "${HEADER}"$'\nmodels/auth/oauth2.go' 'models/auth/oauth2.go'
+
+run_case 'answer with no issue number -> error' 2 '{"title":"tracker","state":"closed"}' \
+  "${HEADER}"$'\nmodels/auth/oauth2.go' 'models/auth/oauth2.go'
+
+# a JSON string is not a JSON number: the index must be typed, or "43" from an
+# endpoint that stringifies everything would satisfy the check by accident
+run_case 'answer with a stringified number -> error' 2 '{"number":"43","state":"closed"}' \
+  "${HEADER}"$'\nmodels/auth/oauth2.go' 'models/auth/oauth2.go'
+
+# the number must be the issue's own, not a nested object's - `pull_request`
+# and `milestone` payloads carry one too
+run_case 'nested number does not satisfy the scope check' 2 \
+  '{"pull_request":{"number":43},"title":"other","state":"closed"}' \
+  "${HEADER}"$'\nmodels/auth/oauth2.go' 'models/auth/oauth2.go'
+
+# ... and it must accept the answer when the index asked for is not the default,
+# so the check tracks --issue rather than the literal 43. run_case always runs
+# with the default index, so this pair is spelled out: the SAME payload is a
+# pass under `--issue 51` and exit 2 without it, which is what makes the pass
+# evidence that the check followed the argument rather than evidence that it
+# stopped running.
+{
+  scope_list="${TMP}/scope-list.txt"
+  scope_changed="${TMP}/scope-changed.txt"
+  scope_json='{"number":51,"title":"other tracker","state":"closed"}'
+  printf '%s\n%s\n' "$HEADER" 'models/auth/oauth2.go' > "$scope_list"
+  printf '%s\n' 'models/auth/oauth2.go' > "$scope_changed"
+
+  out=$(run_guard "$SHIM_JQ" "$scope_json" 0 \
+    --list "$scope_list" --changed "$scope_changed" --issue 51)
+  got=$?
+  if [ "$got" -eq 0 ]; then
+    ok 'the scope check follows --issue'
+  else
+    no 'the scope check follows --issue' "(want exit 0, got ${got})
+${out}"
+  fi
+
+  out=$(run_guard "$SHIM_JQ" "$scope_json" 0 \
+    --list "$scope_list" --changed "$scope_changed")
+  got=$?
+  if [ "$got" -eq 2 ]; then
+    ok 'the same answer is out of scope for the default index'
+  else
+    no 'the same answer is out of scope for the default index' \
+      "(want exit 2, got ${got})
+${out}"
+  fi
+}
 
 # The issue lookup failing outright must fail closed (exit 2), never pass.
 {
@@ -324,6 +390,14 @@ run_awk_case 'awk fallback: flat open payload' 1 "$OPEN_JSON"
 run_awk_case 'awk fallback: flat closed payload' 0 "$CLOSED_JSON"
 run_awk_case 'awk fallback: missing state errors' 2 '{"number":43}'
 run_awk_case 'awk fallback: malformed json errors' 2 'not json at all'
+# the index scope check has to reject on this branch too - it is the branch a
+# runner without jq takes, and "closed" is the only answer that becomes a pass
+run_awk_case 'awk fallback: answer about another issue errors' 2 \
+  '{"number":44,"title":"other","state":"closed"}'
+run_awk_case 'awk fallback: stringified number errors' 2 \
+  '{"number":"43","state":"closed"}'
+run_awk_case 'awk fallback: nested number does not satisfy it' 2 \
+  '{"milestone":{"number":43},"state":"closed"}'
 
 # --- no test seams may creep back into the production path ------------------
 # The suite stubs from outside the scripts on purpose. If someone reintroduces
@@ -400,11 +474,23 @@ run_awk_case 'awk fallback: malformed json errors' 2 'not json at all'
     *) no 'env-read scanner detects a reintroduced seam' "(reported: ${seamy})" ;;
   esac
 
-  # The allowlist, and why each entry cannot move the verdict:
-  #   GITEA_API_URL / GITEA_REPO / GITEA_API_TOKEN - runner-supplied connection
-  #     details; misdirecting them breaks the lookup, which fails closed.
+  # The allowlist, and what each entry can and cannot do:
+  #   GITEA_API_TOKEN - a wrong token makes `curl -sSf` fail, and a failed
+  #     lookup is exit 2, so it cannot flip the verdict on its own.
+  #   GITEA_API_URL - runner-supplied connection detail, and NOT immune: an
+  #     endpoint that answers this repo path with a closed #43 yields SKIPPED.
+  #     No parse of the reply closes that, because the endpoint writes the
+  #     reply; it is the same trusted-runner assumption as PATH, stated in the
+  #     matcher's header. What the script does check is that the answer is
+  #     about the index it asked for.
   #   GUARD_EXEMPT_LABEL - interpolated into the failure message and compared
   #     against nothing.
+  # Note what is NOT on this list any more: GITEA_REPO. The repository holding
+  # the tracker issue selects the verdict exactly as the issue index does -
+  # point the guard at a repository whose #43 is closed (i.e. any repository
+  # without one) and it reports SKIPPED, exit 0 - so it became a `--repo`
+  # argument and the script no longer names it at all. The run_idx cases below
+  # pin that behaviourally against a repo-sensitive stub.
   # Anything else the script *names* is a seam. The collector's allowlist is
   # empty. PATH is out of this scanner's reach by construction - see above.
   check_env_allowlist() {
@@ -418,19 +504,22 @@ run_awk_case 'awk fallback: malformed json errors' 2 'not json at all'
         "(want '${want}', got '${got}')"
     fi
   }
-  check_env_allowlist "$SCRIPT" 'GITEA_API_TOKEN GITEA_API_URL GITEA_REPO GUARD_EXEMPT_LABEL'
+  check_env_allowlist "$SCRIPT" 'GITEA_API_TOKEN GITEA_API_URL GUARD_EXEMPT_LABEL'
   check_env_allowlist "$DIFF_SCRIPT" ''
 }
 
-# --- the issue index is an argument, and the environment cannot move it -----
-# Which issue gates the check IS the verdict: point the guard at any
-# already-closed issue and it reports SKIPPED, exit 0. The header claims the
-# environment cannot do that; these cases are what makes the claim testable
-# instead of a name-pattern grep.
+# --- the lookup target is an argument, and the environment cannot move it ----
+# WHICH issue gates the check IS the verdict, and that target has two halves:
+# the index, and the repository the issue lives in. Point the guard at any
+# already-closed issue - or at any repository whose #43 is closed, which is
+# every repository that has no such issue - and it reports SKIPPED, exit 0.
+# The header claims the environment cannot do either; these cases are what
+# makes the claim testable instead of a name-pattern grep.
 #
-# The stub curl here answers by issue index - open for #43, closed for anything
-# else - so "the environment did not redirect the lookup" and "the argument
-# does redirect it" are distinguishable rather than both trivially passing.
+# The stub curl here answers by repository AND index - open only for
+# terraphim/gitea#43, closed for anything else - so "the environment did not
+# redirect the lookup" and "the argument does redirect it" are distinguishable
+# rather than both trivially passing, on both halves.
 {
   SHIM_IDX="${TMP}/bin-idx"
   make_shim_dir "$SHIM_IDX" with-jq
@@ -441,7 +530,9 @@ for a in "$@"; do
   case "$a" in http*) url="$a" ;; esac
 done
 idx=${url##*/}
-if [ "$idx" = "43" ]; then
+rest=${url%/issues/*}
+repo=${rest##*/repos/}
+if [ "$repo" = "terraphim/gitea" ] && [ "$idx" = "43" ]; then
   printf '{"number":%s,"title":"tracker","state":"open"}' "$idx"
 else
   printf '{"number":%s,"title":"other","state":"closed"}' "$idx"
@@ -465,8 +556,11 @@ STUB
       shift
     done
     [ $# -eq 0 ] || shift
-    out=$(env "${envs[@]+"${envs[@]}"}" PATH="$SHIM_IDX" \
+    # The case's own assignments come LAST, so a case may override the honest
+    # defaults with a hostile value - `env` applies assignments left to right.
+    out=$(env PATH="$SHIM_IDX" \
       GITEA_API_URL="$STUB_API_URL" GITEA_REPO="$STUB_REPO" \
+      "${envs[@]+"${envs[@]}"}" \
       "$BASH" "$SCRIPT" --list "$idx_list" --changed "$idx_changed" "$@" 2>&1)
     got=$?
     if [ "$got" -eq "$want" ]; then
@@ -477,15 +571,39 @@ ${out}"
     fi
   }
 
-  # baseline: the default index is 43, the stub says open, the path is reserved
-  run_idx 1 'default issue index is 43 (enforced)' --
-  # the stub really is index-sensitive, so the next case cannot pass vacuously
+  # baseline: the defaults are terraphim/gitea#43, the stub says open, the path
+  # is reserved
+  run_idx 1 'default lookup target is terraphim/gitea#43' --
+  # the stub really is index- and repo-sensitive, so the env cases below cannot
+  # pass vacuously: the argument DOES move the verdict on both halves
   run_idx 0 '--issue selects the gating issue (closed -> skipped)' -- --issue 99
-  # the finding itself: GUARD_ISSUE in the environment must be inert
+  run_idx 0 '--repo selects the gating repository (closed -> skipped)' \
+    -- --repo attacker/decoy
+
+  # A case's own assignments really do reach the script and really do outrank
+  # the honest defaults set alongside them - otherwise every hostile-env case
+  # below would pass by never having been applied. GITEA_API_URL is a variable
+  # the script does read, so emptying it must turn into exit 2.
+  run_idx 2 'a case env assignment outranks the default' GITEA_API_URL= --
+
+  # the R5 finding: GUARD_ISSUE in the environment must be inert
   run_idx 1 'GUARD_ISSUE in the env cannot redirect the lookup' \
     GUARD_ISSUE=99 --
   run_idx 1 'GUARD_ISSUE in the env cannot override --issue' \
     GUARD_ISSUE=99 -- --issue 43
+
+  # the R6 finding: the same for the repository half of the target. A hostile
+  # GITEA_REPO used to produce SKIPPED, exit 0, on this very changed path.
+  run_idx 1 'GITEA_REPO in the env cannot redirect the lookup' \
+    GITEA_REPO="$HOSTILE_REPO" --
+  run_idx 1 'GITEA_REPO in the env cannot override --repo' \
+    GITEA_REPO="$HOSTILE_REPO" -- --repo terraphim/gitea
+  # and the script's internal name for it is not a seam either
+  run_idx 1 'GUARD_REPO in the env cannot redirect the lookup' \
+    GUARD_REPO="$HOSTILE_REPO" --
+  # both halves hostile at once, which is what an attacker would actually set
+  run_idx 1 'a wholly hostile environment cannot redirect the lookup' \
+    GUARD_ISSUE=99 GUARD_REPO="$HOSTILE_REPO" GITEA_REPO="$HOSTILE_REPO" --
 
   # GUARD_EXEMPT_LABEL is message text; it must not be able to exempt anything
   run_idx 1 'GUARD_EXEMPT_LABEL cannot exempt a violation' \
@@ -496,6 +614,19 @@ ${out}"
   run_idx 2 '--issue rejects a path traversal' -- --issue '43/../1'
   run_idx 2 '--issue rejects zero' -- --issue 0
   run_idx 2 '--issue needs a value' -- --issue
+
+  # nor is a bad --repo: the value goes into a URL path, so anything that is
+  # not exactly one owner/name pair must fail closed rather than resolve to
+  # some other endpoint
+  run_idx 2 '--repo rejects a bare owner' -- --repo terraphim
+  run_idx 2 '--repo rejects an extra path segment' -- --repo terraphim/gitea/issues
+  run_idx 2 '--repo rejects a traversal' -- --repo 'terraphim/..'
+  run_idx 2 '--repo rejects a traversal in the owner' -- --repo '../gitea'
+  run_idx 2 '--repo rejects an empty owner' -- --repo /gitea
+  run_idx 2 '--repo rejects an empty name' -- --repo terraphim/
+  run_idx 2 '--repo rejects a URL' -- --repo 'https://evil.invalid/a/b'
+  run_idx 2 '--repo rejects a shell metacharacter' -- --repo 'terraphim/gitea;id'
+  run_idx 2 '--repo needs a value' -- --repo
 }
 
 # --- stdin mode -------------------------------------------------------------
