@@ -82,3 +82,16 @@ tests/integration/api_actions_run_test.go
 # outside contributor cannot self-exempt.
 .terraphim/*
 .github/workflows/check-blast-radius.yml
+
+# --- the workflow directory that would shadow the guard ---------------------
+# modules/actions/workflows.go ListWorkflows() (see the loop over
+# setting.Actions.WorkflowDirs, default [".gitea/workflows", ".github/workflows"])
+# breaks on the FIRST directory that resolves - it does not union them. This
+# fork ships its CI in .github/workflows/, so a PR that adds any file under
+# .gitea/workflows/ hides every .github/workflows/* workflow, this guard
+# included, from the moment it merges. Reserving the whole `.gitea` subtree
+# rather than just `.gitea/workflows/*` is deliberate: the shadowing is a
+# property of the directory existing at all, and `*` spans `/`, so one entry
+# covers any depth. The cost is that legitimate .gitea/ work needs a
+# `sync-owner` label, which is the review checkpoint this is asking for.
+.gitea/*

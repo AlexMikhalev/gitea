@@ -689,6 +689,13 @@ ${out}"
   # ... but not the rest of CI
   expect_real 'shipped list leaves other workflows alone' 0 '.github/workflows/pull-compliance.yml'
 
+  # A PR adding *any* file under .gitea/workflows/ makes ListWorkflows resolve
+  # .gitea/workflows first and stop, hiding .github/workflows/* - this guard
+  # included - from the merge onwards. The repo-layout block below pins that the
+  # directory is absent from the tree; this pins that the guard would fail the PR
+  # introducing it, which is the only check that runs on the PR itself.
+  expect_real 'shipped list blocks a new .gitea/workflows file' 1 '.gitea/workflows/anything.yml'
+
   if head -n 1 "$REAL_LIST" | grep -qx "$HEADER"; then
     ok 'shipped list carries the required header'
   else
@@ -1019,23 +1026,43 @@ ${out}"
 ${out}"
   fi
 
+  # Both flag assertions below match the *invocation*, not the file: the
+  # collector's header explains `--no-renames` and `-z` in prose, so a grep for
+  # the bare flag was satisfied by the comment that documents it and stayed
+  # green with the flag deleted from the command line - the assertion could not
+  # fail for the reason it exists. Every `git diff` line is collected and each
+  # one must carry both flags, so a second invocation cannot hide behind the
+  # first. Lines are joined across `\` continuations and squeezed to a single
+  # space first, so moving the flags onto a continuation line does not break
+  # the match either.
+  diff_cmds=$(
+    sed -e ':a' -e '/\\$/{N;s/\\\n/ /;ba' -e '}' "$DIFF_SCRIPT" |
+      grep -E '^[[:space:]]*git diff([[:space:]]|$)' |
+      sed -e 's/[[:space:]][[:space:]]*/ /g' -e 's/^ //' -e 's/$/ /'
+  )
+  diff_cmds_total=$(printf '%s\n' "$diff_cmds" | grep -c '[^[:space:]]')
+
   # --no-renames must be on the command line, where it outranks every config
   # scope: a runner with diff.renames left at the default would otherwise get a
   # different verdict than one with it turned off, for the same PR.
-  if grep -q -- '--no-renames' "$DIFF_SCRIPT"; then
+  if [ "$diff_cmds_total" -gt 0 ] &&
+    [ "$(printf '%s\n' "$diff_cmds" | grep -c -- ' --no-renames ')" -eq "$diff_cmds_total" ]; then
     ok 'collector passes --no-renames explicitly'
   else
     no 'collector passes --no-renames explicitly' \
-      '(the verdict would then depend on the runner git config)'
+      "(the verdict would then depend on the runner git config; ${diff_cmds_total} invocation(s) found)
+${diff_cmds}"
   fi
 
   # -z is on the command line for exactly the same reason, against
   # core.quotePath rather than diff.renames - see the quoting block below.
-  if grep -qE 'git diff .*-z|git diff -z' "$DIFF_SCRIPT"; then
+  if [ "$diff_cmds_total" -gt 0 ] &&
+    [ "$(printf '%s\n' "$diff_cmds" | grep -c -- ' -z ')" -eq "$diff_cmds_total" ]; then
     ok 'collector passes -z explicitly'
   else
     no 'collector passes -z explicitly' \
-      '(without it core.quotePath C-quotes non-ASCII paths, which match no entry)'
+      "(without it core.quotePath C-quotes non-ASCII paths, which match no entry; ${diff_cmds_total} invocation(s) found)
+${diff_cmds}"
   fi
 }
 
