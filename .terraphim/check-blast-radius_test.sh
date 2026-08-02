@@ -1153,6 +1153,64 @@ ${pin_shows}"
 ${pin_head_refs}"
     fi
 
+    # (a)-(c) are STEP-scoped: they pin what the step named
+    # '${pin_step_name}' does and say nothing about the rest of the file. Both
+    # of their properties are defeatable from outside that step, so both are
+    # restated at FILE scope here.
+    #
+    # wf_step_attrs attributes each line to the step it sits in - the same
+    # attribution wf_step_body does, including the rule that a comment at step
+    # indentation documents the step that FOLLOWS it and therefore belongs to
+    # no step.
+    wf_step_attrs=$(
+      awk '
+        /^      -[[:space:]]*name:/ {
+          step = $0
+          sub(/^      -[[:space:]]*name:[[:space:]]*/, "", step)
+          sub(/[[:space:]]*$/, "", step)
+          next
+        }
+        /^      #/ { step = ""; next }
+        step == "" { next }
+        /HEAD_SHA|head\.sha/ { printf "HEAD %s\n", step }
+        /guard-dir=/ && /GITHUB_OUTPUT/ { printf "OUT %s\n", step }
+        /^        id:[[:space:]]*pin[[:space:]]*$/ { printf "IDPIN %s\n", step }
+      ' "$wf"
+    )
+
+    # (d) WHICH steps may name the head revision at all. (c) fails on a head
+    # reference inside the pin step; it cannot see a NEW step - added before or
+    # after it - that re-pins .terraphim/* out of the head into the same
+    # $GUARD_DIR, which the self-test step then executes. The head revision has
+    # exactly two legitimate consumers in this workflow: the step that resolves
+    # it and the step that diffs against it. Any third one is either a re-pin or
+    # a checkout of PR-authored content, so the set is pinned exactly rather
+    # than bounded.
+    head_steps=$(printf '%s\n' "$wf_step_attrs" | sed -n 's/^HEAD //p' |
+      LC_ALL=C sort -u | tr '\n' '|')
+    want_head_steps='Collect changed paths|Fetch the pull request head|'
+    if [ "$head_steps" = "$want_head_steps" ]; then
+      ok 'only the fetch and collect steps name the head revision'
+    else
+      no 'only the fetch and collect steps name the head revision' \
+        "(want exactly '${want_head_steps}', got '${head_steps}'; a third step naming the head can re-pin the guard from the PR's own tree into \$GUARD_DIR, which the assertions scoped to the pin step cannot see)"
+    fi
+
+    # (e) ...and WHO writes the pinned directory. Every consumer reads
+    # `steps.pin.outputs.guard-dir`, which resolves to whichever step carries
+    # `id: pin` - so a second step writing a guard-dir of its own, or `id: pin`
+    # moving onto it, redirects the self-test, the collector and the matcher at
+    # one stroke while '${pin_step_name}' stays intact and (a)-(c) all still
+    # pass. Both halves of that binding are pinned to the one step.
+    out_steps=$(printf '%s\n' "$wf_step_attrs" | sed -n 's/^OUT //p' | LC_ALL=C sort -u)
+    idpin_steps=$(printf '%s\n' "$wf_step_attrs" | sed -n 's/^IDPIN //p' | LC_ALL=C sort -u)
+    if [ "$out_steps" = "$pin_step_name" ] && [ "$idpin_steps" = "$pin_step_name" ]; then
+      ok 'only the pin step writes the guard-dir output'
+    else
+      no 'only the pin step writes the guard-dir output' \
+        "(want '${pin_step_name}' to be the only step writing guard-dir= to \$GITHUB_OUTPUT and the only one carrying \`id: pin\`; writers: '$(printf '%s' "$out_steps" | tr '\n' ',')', id:pin on: '$(printf '%s' "$idpin_steps" | tr '\n' ',')')"
+    fi
+
     # The tracker issue and the repository holding it must both be pinned as
     # ARGUMENTS. As `GUARD_ISSUE:`/`GITEA_REPO:` env keys they would be two more
     # things on a self-hosted runner's job environment, and the script no longer
@@ -1177,6 +1235,31 @@ ${pin_head_refs}"
     )
     guard_cmds_total=$(printf '%s\n' "$guard_cmds" | grep -c '[^[:space:]]')
 
+    # The enforcing step's own body, for the step-level pins below. It is
+    # identified by the step the polarity check above already resolved - the one
+    # whose whole `if:` is the negated label condition AND which runs the guard -
+    # rather than by a name written here, so renaming the step cannot silently
+    # move these assertions onto nothing.
+    enforce_body=$(wf_step_body "$enforce_steps")
+
+    # pin_step_env <body> <key> <squeezed value> <name> <why> - the value bound
+    # to `<key>:` in a step body, pinned exactly. Squeezed and counted the same
+    # way pin_base_env is: the expression may be re-spaced inside `${{ }}`, but a
+    # different context, a `||` fallback or an indirection through another key
+    # all fail, and a duplicated key - which YAML resolves to the last one - is
+    # visible as a count of two rather than collapsing to the first.
+    pin_step_env() {
+      local body="$1" key="$2" want="$3" name="$4" why="$5" got n
+      got=$(printf '%s\n' "$body" | sed -n "s/^[[:space:]]*${key}:[[:space:]]*//p" |
+        tr -d '[:space:]')
+      n=$(printf '%s\n' "$body" | grep -cE "^[[:space:]]*${key}:")
+      if [ -n "$body" ] && [ "$n" -eq 1 ] && [ "$got" = "$want" ]; then
+        ok "$name"
+      else
+        no "$name" "(want exactly one ${key}: key in the enforcing step squeezing to '${want}'; found ${n}: '${got}'. ${why})"
+      fi
+    }
+
     if [ "$guard_cmds_total" -gt 0 ] &&
       [ "$(printf '%s\n' "$guard_cmds" | grep -cF -- ' --issue 43 ')" -eq "$guard_cmds_total" ]; then
       ok 'workflow pins the tracker issue via --issue'
@@ -1189,14 +1272,28 @@ ${guard_cmds}"
     # Same reasoning for the repository: an unpinned lookup resolves against
     # whatever GITEA_REPO the job environment holds, and any repository with a
     # closed #43 yields SKIPPED, exit 0.
+    #
+    # Unlike `--issue`, whose value is the literal on the command line, `--repo`
+    # is spelled as a variable - so the flag's PRESENCE was all this used to pin.
+    # `--repo "$SOME_OTHER_VAR"`, or an unset one, satisfied a bare ` --repo `
+    # search: the first resolves to whatever that variable holds on a self-hosted
+    # runner's job environment, which is the seam the flag exists to close, and
+    # the second expands to the empty string. The exact argument is pinned here,
+    # and the key it reads from is pinned to `${{ github.repository }}` below;
+    # the two together are what make the guard's target the repository the run
+    # belongs to.
     if [ "$guard_cmds_total" -gt 0 ] &&
-      [ "$(printf '%s\n' "$guard_cmds" | grep -cF -- ' --repo ')" -eq "$guard_cmds_total" ]; then
+      [ "$(printf '%s\n' "$guard_cmds" | grep -cF -- ' --repo "$REPO_FULL_NAME" ')" -eq "$guard_cmds_total" ]; then
       ok 'workflow pins the gating repository via --repo'
     else
       no 'workflow pins the gating repository via --repo' \
-        "(check-blast-radius.sh takes owner/name as an argument, not from GITEA_REPO; ${guard_cmds_total} invocation(s) found)
+        "(want --repo \"\$REPO_FULL_NAME\" on every invocation; check-blast-radius.sh takes owner/name as an argument, not from GITEA_REPO, and any other variable is settable from the job environment; ${guard_cmds_total} invocation(s) found)
 ${guard_cmds}"
     fi
+
+    pin_step_env "$enforce_body" REPO_FULL_NAME '${{github.repository}}' \
+      'the enforcing step binds REPO_FULL_NAME to github.repository' \
+      'The argument pinned above is only as good as what it expands to: bound to anything else - another context, a hardcoded owner/name, or nothing at all - the guard asks a repository the run does not belong to, and any repository whose #43 is closed answers SKIPPED, exit 0.'
 
     # The changed-path set is the guard's other input, and it is unpinned in the
     # same way `--issue`/`--repo` were: `--changed /dev/null` (or any path the
@@ -1212,6 +1309,65 @@ ${guard_cmds}"
       no 'workflow feeds the collector output to --changed' \
         "(want --changed changed-paths.txt, the file the Collect changed paths step writes; any other path empties the diff and every PR passes; ${guard_cmds_total} invocation(s) found)
 ${guard_cmds}"
+    fi
+
+    # The reserved-path LIST is the guard's third input and is unpinned in
+    # exactly the same way `--changed` was. Everything above pins where the list
+    # is READ FROM - `git show "${BASE_SHA}:.terraphim/sync-blast-radius.txt"`
+    # into $GUARD_DIR - and none of it pins which file the matcher is then
+    # handed. `--list .terraphim/sync-blast-radius.txt` reads the PR's own copy
+    # out of the checkout, which under pull_request_target is the base branch
+    # today but is the whole point of the pin step tomorrow; `--list` pointed at
+    # any file holding only comments is exit 2, but pointed at a short list it is
+    # a green PASSED on a PR that rewrote models/auth/. So the pinned copy is
+    # named exactly, on the same joined-and-squeezed lines as the flags above.
+    if [ "$guard_cmds_total" -gt 0 ] &&
+      [ "$(printf '%s\n' "$guard_cmds" | grep -cF -- ' --list "${GUARD_DIR}/sync-blast-radius.txt" ')" -eq "$guard_cmds_total" ]; then
+      ok 'workflow feeds the pinned list to --list'
+    else
+      no 'workflow feeds the pinned list to --list' \
+        "(want --list \"\${GUARD_DIR}/sync-blast-radius.txt\", the base-ref copy the pin step wrote; any other path lets the reserved-path set come from somewhere the pin step does not control; ${guard_cmds_total} invocation(s) found)
+${guard_cmds}"
+    fi
+
+    # The API endpoint decides what "issue #43" answers, so it is pinned to the
+    # instance the run belongs to. `github.api_url` is assembled by
+    # services/actions/context.go:58 as AppURL+"api/v1"; the GitHub idiom of
+    # appending to `github.server_url` builds "https://host//api/v1" here,
+    # because Gitea normalises AppURL to end in "/" - and a doubled slash, a
+    # hardcoded host, or an unset key are all a lookup that does not reach this
+    # instance's #43. A failed lookup is exit 2 and fail-closed, but an endpoint
+    # that ANSWERS with a closed #43 is SKIPPED, exit 0 - the matcher's header
+    # says so in as many words.
+    pin_step_env "$enforce_body" GITEA_API_URL '${{github.api_url}}' \
+      'the enforcing step binds GITEA_API_URL to github.api_url' \
+      'The endpoint writes the reply that becomes the verdict; no parse of it closes that. server_url+/api/v1 doubles the slash, and any other value asks a host this run does not belong to.'
+
+    # ...and the guard's exit status has to reach the job. Everything above pins
+    # the arguments; none of it pins that anyone is listening to the answer.
+    # `bash .../check-blast-radius.sh ... || true`, a trailing `; echo done`, or
+    # a pipe into anything at all leaves the run: block exiting 0 on a
+    # violation, and the step - and the PR - go green with "VIOLATION" sitting
+    # in the log. `continue-on-error: true` on the step or the job does the same
+    # from the other direction, and neither is visible in a diff review as an
+    # outage. The invocation is therefore pinned as the TAIL of its run: block,
+    # after continuations are joined, and both continue-on-error scopes are
+    # pinned absent.
+    enforce_tail=$(printf '%s\n' "$enforce_body" |
+      sed -e ':a' -e '/\\$/{N;s/\\\n/ /;ba' -e '}' |
+      sed -e 's/[[:space:]][[:space:]]*/ /g' -e 's/^ //' -e 's/ $//' |
+      grep -v '^#' | grep '[^[:space:]]' | tail -n 1)
+    enforce_coe=$(printf '%s\n' "$enforce_body" | grep -nE '^[[:space:]]*continue-on-error:')
+    job_coe=$(wf_key "$wf" check-blast-radius continue-on-error)
+    if [ "$enforce_n" -eq 1 ] && [ -n "$enforce_body" ] &&
+      printf '%s\n' "$enforce_tail" |
+      grep -qE '^bash [^[:space:]]*check-blast-radius\.sh"?([[:space:]]|$)' &&
+      ! printf '%s\n' "$enforce_tail" | grep -q '[|;&]' &&
+      [ -z "$enforce_coe" ] && [ -z "$job_coe" ]; then
+      ok 'the guard invocation is the tail of its step and fails the job'
+    else
+      no 'the guard invocation is the tail of its step and fails the job' \
+        "(want the last command of the enforcing step to BE the guard invocation, with no \`|\`, \`||\`, \`;\` or \`&\` on it, and no continue-on-error: on the step or the job; last command: '${enforce_tail}', step continue-on-error: '$(printf '%s' "$enforce_coe" | tr '\n' ',')', job continue-on-error: '$(printf '%s' "$job_coe" | tr '\n' ',')'. A swallowed exit status reports PASSED with the violation in the log.)"
     fi
 
     # ...and the collector must be given the range that produces that file.
