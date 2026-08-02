@@ -1041,6 +1041,118 @@ ${out}"
         '(no line RUNS it - naming the file in the pin loop is not an invocation; without that step CI never executes these assertions and the guard ships untested on the runner)'
     fi
 
+    # The `Pin guard sources` step is where "the guard is read out of the BASE
+    # ref" is actually implemented, and it is a one-token flip away from reading
+    # the pull request's own tree: `BASE_SHA: ${{ ...head.sha }}`, or a single
+    # `git show "${HEAD_SHA}:.terraphim/${f}"`, and the pinned scripts, the
+    # reserved-path list AND this suite all come from the PR instead. That
+    # self-neuters every assertion in this file at once - the PR supplies the
+    # guard that judges it - and, because the next step runs
+    # "${GUARD_DIR}/check-blast-radius_test.sh", it also executes PR-authored
+    # shell on a self-hosted runner, which is the single thing
+    # pull_request_target must never do. Neither failure is visible as an
+    # outage: the run still goes green.
+    #
+    # Nothing else in this file could see that flip - the assertions above pin
+    # what the workflow RUNS, not which revision it reads - so the step's body
+    # is extracted by name and pinned three ways below: the expression bound to
+    # BASE_SHA, the revision every `git show` in it reads from, and the absence
+    # of the head revision from the step altogether.
+    #
+    # wf_step_body <step name> - the lines of that step, from just after its
+    # `- name:` to the start of the next step. A comment at step indentation
+    # (`^      #`) ends the body too: those comment blocks document the step
+    # that FOLLOWS them, and letting them leak in would make the head-revision
+    # assertion below fail on prose about the next step rather than on code.
+    wf_step_body() {
+      awk -v want="$1" '
+        /^      -[[:space:]]*name:/ {
+          n = $0
+          sub(/^      -[[:space:]]*name:[[:space:]]*/, "", n)
+          sub(/[[:space:]]*$/, "", n)
+          inblk = (n == want)
+          next
+        }
+        inblk && $0 ~ /^      [-#]/ { inblk = 0 }
+        inblk && $0 !~ /^      / && $0 ~ /[^[:space:]]/ { inblk = 0 }
+        inblk { print }
+      ' "$wf"
+    }
+
+    pin_step_name='Pin guard sources to the base ref'
+    pin_step_n=$(grep -cE "^      -[[:space:]]*name:[[:space:]]*${pin_step_name}[[:space:]]*\$" "$wf")
+    pin_body=$(wf_step_body "$pin_step_name")
+
+    # Exactly one step may carry that name: zero means the step was renamed or
+    # removed and all three assertions below would pass vacuously against an
+    # empty body, two means the extraction is ambiguous about which one is
+    # pinned.
+    if [ "$pin_step_n" -eq 1 ] && [ -n "$pin_body" ]; then
+      ok 'the pin step is present exactly once'
+    else
+      no 'the pin step is present exactly once' \
+        "(found ${pin_step_n} step(s) named '${pin_step_name}' and a $([ -n "$pin_body" ] && echo non-empty || echo empty) body; the base-ref assertions below cannot pin a step that is not there)"
+    fi
+
+    # (a) BASE_SHA comes from the base revision of the event payload, spelled
+    # exactly. Squeezed, so the expression may be re-spaced inside `${{ }}`, but
+    # `head.sha`, a `||` fallback or an indirection through another env key all
+    # fail here. One line per occurrence, so a second BASE_SHA key - which YAML
+    # would resolve to the last one - is visible as two.
+    pin_base_env=$(printf '%s\n' "$pin_body" |
+      sed -n 's/^[[:space:]]*BASE_SHA:[[:space:]]*//p' | tr -d '[:space:]')
+    pin_base_env_n=$(printf '%s\n' "$pin_body" |
+      grep -cE '^[[:space:]]*BASE_SHA:')
+    want_pin_base='${{github.event.pull_request.base.sha}}'
+    if [ "$pin_step_n" -eq 1 ] && [ "$pin_base_env_n" -eq 1 ] &&
+      [ "$pin_base_env" = "$want_pin_base" ]; then
+      ok 'pin step binds BASE_SHA to the event base sha'
+    else
+      no 'pin step binds BASE_SHA to the event base sha' \
+        "(want exactly one BASE_SHA key in the pin step squeezing to '${want_pin_base}'; found ${pin_base_env_n}: '${pin_base_env}'. Bound to head.sha, the step pins the PR's own copy of the guard and the self-test step then executes it on the runner.)"
+    fi
+
+    # (b) ...and every `git show` in the step reads from that pinned revision.
+    # Anchored on the INVOCATION, not on the step's env block: the two are
+    # independent - `BASE_SHA` can stay correct while a single `git show` reads
+    # `${HEAD_SHA}:` - and a file pulled from the head is PR-authored whatever
+    # the env key says. Every `git show` line is collected and each one must
+    # carry the base prefix, so a second one cannot hide behind the first.
+    # Continuations are joined and whitespace squeezed first, so the step may
+    # spell an invocation across lines.
+    pin_shows=$(printf '%s\n' "$pin_body" |
+      sed -e ':a' -e '/\\$/{N;s/\\\n/ /;ba' -e '}' |
+      sed -e 's/[[:space:]][[:space:]]*/ /g' -e 's/^ //' |
+      grep -E '(^|[^[:alnum:]_])git show ')
+    pin_shows_total=$(printf '%s\n' "$pin_shows" | grep -c '[^[:space:]]')
+    pin_shows_based=$(printf '%s\n' "$pin_shows" |
+      grep -cF -- 'git show "${BASE_SHA}:')
+    if [ "$pin_step_n" -eq 1 ] && [ "$pin_shows_total" -gt 0 ] &&
+      [ "$pin_shows_based" -eq "$pin_shows_total" ]; then
+      ok 'pin step reads every guard file from ${BASE_SHA}:'
+    else
+      no 'pin step reads every guard file from ${BASE_SHA}:' \
+        "(want every \`git show\` in the pin step to read \"\${BASE_SHA}:...\"; ${pin_shows_based} of ${pin_shows_total} invocation(s) do)
+${pin_shows}"
+    fi
+
+    # (c) ...and the head revision is not reachable from the step at all. This
+    # is the belt to (b)'s braces and it is what makes the pair hard to defeat:
+    # (b) constrains the `git show` lines it can see, while this fails on any
+    # mention of the head - a `HEAD_SHA:` env key added to the step, a
+    # `${{ github.event.pull_request.head.sha }}` interpolation, a `git
+    # archive`/`git cat-file` reading the head, or a rewrite of the copy loop
+    # into a form (b)'s anchor does not recognise. The step has no legitimate
+    # need for the head revision: resolving it is the previous step's job.
+    pin_head_refs=$(printf '%s\n' "$pin_body" | grep -nE 'HEAD_SHA|head\.sha')
+    if [ "$pin_step_n" -eq 1 ] && [ -z "$pin_head_refs" ]; then
+      ok 'pin step never names the head revision'
+    else
+      no 'pin step never names the head revision' \
+        "(the pinned sources must be unreachable from the PR; the head revision has no business in this step)
+${pin_head_refs}"
+    fi
+
     # The tracker issue and the repository holding it must both be pinned as
     # ARGUMENTS. As `GUARD_ISSUE:`/`GITEA_REPO:` env keys they would be two more
     # things on a self-hosted runner's job environment, and the script no longer
@@ -1084,6 +1196,49 @@ ${guard_cmds}"
       no 'workflow pins the gating repository via --repo' \
         "(check-blast-radius.sh takes owner/name as an argument, not from GITEA_REPO; ${guard_cmds_total} invocation(s) found)
 ${guard_cmds}"
+    fi
+
+    # The changed-path set is the guard's other input, and it is unpinned in the
+    # same way `--issue`/`--repo` were: `--changed /dev/null` (or any path the
+    # collector never wrote) hands the matcher an empty diff, every reserved
+    # pattern matches nothing, and the step reports PASSED on a PR that rewrote
+    # models/auth/. The file the collector writes is therefore pinned by name on
+    # the enforcing invocation, on the same joined-and-squeezed lines as the two
+    # flags above so that a second invocation cannot hide behind the first.
+    if [ "$guard_cmds_total" -gt 0 ] &&
+      [ "$(printf '%s\n' "$guard_cmds" | grep -cF -- ' --changed changed-paths.txt ')" -eq "$guard_cmds_total" ]; then
+      ok 'workflow feeds the collector output to --changed'
+    else
+      no 'workflow feeds the collector output to --changed' \
+        "(want --changed changed-paths.txt, the file the Collect changed paths step writes; any other path empties the diff and every PR passes; ${guard_cmds_total} invocation(s) found)
+${guard_cmds}"
+    fi
+
+    # ...and the collector must be given the range that produces that file.
+    # `--base "$HEAD_SHA"` is the same one-token flip as the pin step's: the
+    # three-dot range collapses to nothing, changed-paths.txt comes out empty
+    # and the matcher above - correctly wired, correctly pinned - matches an
+    # empty set and passes. Anchored on the INVOCATION for the reason spelled
+    # out above the --issue assertion: the step's own comment names the range in
+    # prose, so a grep for the bare flag could not fail for the reason it
+    # exists. Both flags are checked on every collector line, joined across `\`
+    # continuations and squeezed first - the workflow writes each one on its own
+    # continuation line.
+    wf_collect_cmds=$(
+      sed -e ':a' -e '/\\$/{N;s/\\\n/ /;ba' -e '}' "$wf" |
+        grep -E '^[[:space:]]*bash [^[:space:]]*blast-radius-diff\.sh"?([[:space:]]|$)' |
+        sed -e 's/[[:space:]][[:space:]]*/ /g' -e 's/^ //' -e 's/$/ /'
+    )
+    wf_collect_total=$(printf '%s\n' "$wf_collect_cmds" | grep -c '[^[:space:]]')
+
+    if [ "$wf_collect_total" -gt 0 ] &&
+      [ "$(printf '%s\n' "$wf_collect_cmds" | grep -cF -- ' --base "$BASE_SHA" ')" -eq "$wf_collect_total" ] &&
+      [ "$(printf '%s\n' "$wf_collect_cmds" | grep -cF -- ' --head "$HEAD_SHA" ')" -eq "$wf_collect_total" ]; then
+      ok 'workflow collects the diff over base...head'
+    else
+      no 'workflow collects the diff over base...head' \
+        "(want --base \"\$BASE_SHA\" --head \"\$HEAD_SHA\" on every blast-radius-diff.sh invocation; swapping either empties changed-paths.txt and the enforcement step then passes on any diff; ${wf_collect_total} invocation(s) found)
+${wf_collect_cmds}"
     fi
 
     if grep -qE '^[[:space:]]*GUARD_ISSUE:' "$wf"; then
