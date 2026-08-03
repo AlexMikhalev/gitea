@@ -1379,6 +1379,14 @@ func Routes() *web.Router {
 				// in this repository, query strings included, which is more than read access
 				// to the repository's contents implies.
 				m.Get("/agent-audit", reqToken(), reqAdmin(), agent.ListRepoAudit)
+				// The unified stream spans several units - code, issues, pull requests -
+				// and each of its five sources filters itself down to what the doer may
+				// see, including hiding the agent audit trail from anyone who is not a
+				// repository admin. So the gate here is "may read something in this
+				// repository", not one unit's reader: asking for TypeCode would deny the
+				// issue comments to an issues-only reader, and asking for TypeIssues
+				// would deny the commit statuses to a code-only one.
+				m.Get("/events", reqToken(), reqAnyRepoReader(), repo.ListRepoEvents)
 				// reqHumanAuth() on the POST for the same reason as the collaborator and team
 				// grants below: a transfer hands the whole repository - contents, future writes
 				// and admin - to a different principal, and when the new owner is an organization
