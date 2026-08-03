@@ -8,19 +8,130 @@ package main
 
 import (
 	"bufio"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"strings"
+
+	"code.gitea.io/gitea/modules/nostr"
 )
 
 var (
 	giteaURL   = os.Getenv("GITEA_URL")
 	giteaToken = os.Getenv("GITEA_TOKEN")
+	// giteaNostrKey is the agent's Nostr secret key, as an nsec or as 32-byte hex. When it is
+	// set, mutations are signed with a NIP-98 event instead of carrying the bearer token.
+	// When it is unset every request takes exactly the path it took before this existed.
+	giteaNostrKey = os.Getenv("GITEA_NOSTR_KEY")
 )
+
+// nip98Kind is the NIP-98 "HTTP Auth" event kind.
+const nip98Kind = 27235
+
+// setRequestAuth sets the Authorization header for one API request.
+//
+// With GITEA_NOSTR_KEY set the request is authorized by a signature over this exact method, URL
+// and body, so capturing the header does not let anyone make a different request. Without it,
+// the bearer token is sent as before.
+//
+// It is applied to reads as well as writes on purpose. Signing only the mutations would leave
+// the PAT in the environment, in every process listing that inherits it and on the wire on every
+// GET - so an attacker who could read any of those would still hold an unscoped credential, and
+// the guarantee above would be a property of the header rather than of the deployment. With a
+// Nostr key configured the token is never read, and main() stops requiring one.
+func setRequestAuth(req *http.Request, body string) error {
+	if giteaNostrKey == "" {
+		req.Header.Set("Authorization", "token "+giteaToken)
+		return nil
+	}
+	header, err := nostrAuthHeader(giteaNostrKey, req.Method, req.URL.String(), body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", header)
+	return nil
+}
+
+// nostrAuthHeader builds one NIP-98 `Authorization` header value.
+func nostrAuthHeader(secretKey, method, rawURL, body string) (string, error) {
+	sk, err := nostrSecretKey(secretKey)
+	if err != nil {
+		return "", err
+	}
+
+	nonce, err := nostrNonce()
+	if err != nil {
+		return "", err
+	}
+
+	tags := nostr.Tags{
+		nostr.Tag{"u", rawURL},
+		nostr.Tag{"method", strings.ToUpper(method)},
+		// Every other input to this event is a pure function of the request and the current
+		// whole second, and signing is deterministic - so without a nonce two identical
+		// requests made inside one second would produce the same event id, and the server,
+		// which spends each id exactly once, would refuse the second as a replay. The caller
+		// would see an opaque 401 indistinguishable from a bad key.
+		nostr.Tag{"nonce", nonce},
+	}
+	if body != "" {
+		sum := sha256.Sum256([]byte(body))
+		tags = append(tags, nostr.Tag{"payload", hex.EncodeToString(sum[:])})
+	}
+
+	event := nostr.Event{
+		Kind:      nip98Kind,
+		CreatedAt: nostr.Now(),
+		Tags:      tags,
+	}
+	if err := event.Sign(sk); err != nil {
+		return "", fmt.Errorf("cannot sign NIP-98 event: %w", err)
+	}
+
+	raw, err := json.Marshal(event)
+	if err != nil {
+		return "", fmt.Errorf("cannot serialize NIP-98 event: %w", err)
+	}
+	return "Nostr " + base64.StdEncoding.EncodeToString(raw), nil
+}
+
+// nostrNonce returns 16 bytes of hex from the system CSPRNG, used to make each signed event
+// unique. A failure here is fatal rather than silently degrading to a predictable value: sending
+// an event whose id an observer could have guessed would let them burn it before we do.
+func nostrNonce() (string, error) {
+	var buf [16]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return "", fmt.Errorf("cannot generate a NIP-98 nonce: %w", err)
+	}
+	return hex.EncodeToString(buf[:]), nil
+}
+
+// nostrSecretKey accepts either a NIP-19 nsec or a raw 32-byte hex secret key.
+func nostrSecretKey(input string) (string, error) {
+	input = strings.TrimSpace(input)
+	if strings.HasPrefix(strings.ToLower(input), "nsec1") {
+		hexKey, err := nostr.DecodeSecretKey(input)
+		if err != nil {
+			return "", errors.New("GITEA_NOSTR_KEY is not a valid nsec")
+		}
+		return hexKey, nil
+	}
+	if len(input) != nostr.KeyHexLength {
+		return "", errors.New("GITEA_NOSTR_KEY must be an nsec or 64 hex characters")
+	}
+	if _, err := hex.DecodeString(input); err != nil {
+		return "", errors.New("GITEA_NOSTR_KEY is not valid hex")
+	}
+	return strings.ToLower(input), nil
+}
 
 func main() {
 	// Set default URL
@@ -34,10 +145,20 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Check for GITEA_TOKEN after help check
-	if giteaToken == "" {
-		fmt.Fprintln(os.Stderr, "Error: GITEA_TOKEN environment variable required")
+	// A credential is required, but either kind will do. Demanding GITEA_TOKEN even when a
+	// Nostr key is configured would defeat the point of configuring one: the PAT would still
+	// have to exist on the box for the process to start.
+	if giteaToken == "" && giteaNostrKey == "" {
+		fmt.Fprintln(os.Stderr, "Error: GITEA_TOKEN or GITEA_NOSTR_KEY environment variable required")
 		os.Exit(1)
+	}
+	if giteaNostrKey != "" {
+		// Fail here rather than on the first request, with the reason, instead of an opaque
+		// 401 from the server after the key has silently not been used.
+		if _, err := nostrSecretKey(giteaNostrKey); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	command := os.Args[1]
@@ -75,8 +196,29 @@ Commands:
   mcp-server  Start MCP server exposing gitea-robot functionality
 
 Environment:
-  GITEA_URL    Gitea instance URL (default: http://localhost:3000)
-  GITEA_TOKEN  API token for authentication
+  GITEA_URL        Gitea instance URL (default: http://localhost:3000)
+  GITEA_TOKEN      API token for authentication
+  GITEA_NOSTR_KEY  Nostr secret key (nsec... or 64 hex characters) of a registered
+                   agent. When set, every request is signed as a NIP-98 event
+                   instead of carrying GITEA_TOKEN, and GITEA_TOKEN is not needed.
+                   Register the matching public key first with
+                   POST /api/v1/agent/keys.
+
+                   The signature commits to the absolute URL, so GITEA_URL must
+                   match the server's ROOT_URL exactly - scheme, host and port. If
+                   they differ the server signs off on a different string than the
+                   one it computes and rejects the request with a deliberately
+                   opaque 401; the real reason is only in the server log at Debug
+                   level. This is the most common cause of "invalid NIP-98
+                   authorization". On a sub-path install, GITEA_URL includes the
+                   sub-path (https://git.example/gitea).
+
+                   A signed request body may not exceed 32 MiB, because the
+                   signature covers a hash of the whole body and the server has to
+                   buffer it to check that. This ceiling is the auth layer's own
+                   and is independent of the instance's attachment and release
+                   size limits; over it, the server answers 413 rather than 401.
+                   Send anything larger with GITEA_TOKEN instead.
 
 Examples:
   # Get triage report
@@ -182,7 +324,10 @@ func addDepCmd() {
 	body := fmt.Sprintf(`{"depends_on": %d, "dep_type": "%s"}`, dependsOn, depType)
 
 	req, _ := http.NewRequest("POST", url, strings.NewReader(body))
-	req.Header.Set("Authorization", "token "+giteaToken)
+	if err := setRequestAuth(req, body); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
@@ -208,7 +353,10 @@ func apiGet(url string) string {
 		os.Exit(1)
 	}
 
-	req.Header.Set("Authorization", "token "+giteaToken)
+	if err := setRequestAuth(req, ""); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -224,11 +372,25 @@ func apiGet(url string) string {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		fmt.Fprintf(os.Stderr, "Error: %s\n%s\n", resp.Status, string(body))
+		fmt.Fprintf(os.Stderr, "Error: %s\n%s%s\n", resp.Status, string(body), authFailureHint(resp.StatusCode))
 		os.Exit(1)
 	}
 
 	return string(body)
+}
+
+// authFailureHint explains what a signed request's 401 most likely means. The server refuses
+// every NIP-98 failure with the same opaque message on purpose, so the only place this can be
+// said is here, where we know a key was configured at all.
+func authFailureHint(statusCode int) string {
+	if statusCode != http.StatusUnauthorized || giteaNostrKey == "" {
+		return ""
+	}
+	return fmt.Sprintf("\nThe request was signed with GITEA_NOSTR_KEY. Check that:\n"+
+		"  - the public key is registered and not revoked (GET /api/v1/agent/keys)\n"+
+		"  - GITEA_URL (%s) matches the server's ROOT_URL exactly - the signature\n"+
+		"    commits to the absolute URL, so a mismatched scheme, host or port is refused\n"+
+		"  - this machine's clock is within 60 seconds of the server's\n", giteaURL)
 }
 
 func printTriageMarkdown(result map[string]any) {
@@ -843,7 +1005,9 @@ func apiPostSafe(url, body string) (string, error) {
 		return "", fmt.Errorf("error creating request: %v", err)
 	}
 
-	req.Header.Set("Authorization", "token "+giteaToken)
+	if err := setRequestAuth(req, body); err != nil {
+		return "", err
+	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
@@ -858,7 +1022,7 @@ func apiPostSafe(url, body string) (string, error) {
 	}
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return "", fmt.Errorf("error: %s\n%s", resp.Status, string(respBody))
+		return "", fmt.Errorf("error: %s\n%s%s", resp.Status, string(respBody), authFailureHint(resp.StatusCode))
 	}
 
 	return string(respBody), nil

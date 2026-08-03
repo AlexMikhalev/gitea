@@ -19,6 +19,41 @@ import (
 
 // GetIssueDependencies lists dependencies for an issue
 func GetIssueDependencies(ctx *context.APIContext) {
+	// swagger:operation GET /repos/{owner}/{repo}/issues/{index}/dependencies issue issueListIssueDependencies
+	// ---
+	// summary: List an issue's dependencies, i.e all issues that block this issue.
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: index
+	//   in: path
+	//   description: index of the issue
+	//   type: string
+	//   required: true
+	// - name: page
+	//   in: query
+	//   description: page number of results to return (1-based)
+	//   type: integer
+	// - name: limit
+	//   in: query
+	//   description: page size of results
+	//   type: integer
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/IssueList"
+	//   "404":
+	//     "$ref": "#/responses/notFound"
+
 	if !setting.IssueGraphSettings.Enabled {
 		ctx.APIErrorNotFound("Issue graph features are disabled")
 		return
@@ -54,6 +89,43 @@ func GetIssueDependencies(ctx *context.APIContext) {
 
 // CreateIssueDependency creates a dependency
 func CreateIssueDependency(ctx *context.APIContext) {
+	// swagger:operation POST /repos/{owner}/{repo}/issues/{index}/dependencies issue issueCreateIssueDependencies
+	// ---
+	// summary: Make the issue in the url depend on the issue in the form.
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: index
+	//   in: path
+	//   description: index of the issue
+	//   type: string
+	//   required: true
+	// - name: body
+	//   in: body
+	//   schema:
+	//     "$ref": "#/definitions/IssueMeta"
+	// responses:
+	//   "201":
+	//     "$ref": "#/responses/empty"
+	//   "400":
+	//     "$ref": "#/responses/error"
+	//   "404":
+	//     "$ref": "#/responses/notFound"
+	//   "409":
+	//     "$ref": "#/responses/conflict"
+	//   "423":
+	//     "$ref": "#/responses/repoArchivedError"
+
 	if !setting.IssueGraphSettings.Enabled {
 		ctx.APIErrorNotFound("Issue graph features are disabled")
 		return
@@ -97,6 +169,39 @@ func CreateIssueDependency(ctx *context.APIContext) {
 
 // RemoveIssueDependency removes a dependency
 func RemoveIssueDependency(ctx *context.APIContext) {
+	// swagger:operation DELETE /repos/{owner}/{repo}/issues/{index}/dependencies issue issueRemoveIssueDependencies
+	// ---
+	// summary: Remove an issue dependency
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: index
+	//   in: path
+	//   description: index of the issue
+	//   type: string
+	//   required: true
+	// - name: body
+	//   in: body
+	//   schema:
+	//     "$ref": "#/definitions/IssueMeta"
+	// responses:
+	//   "204":
+	//     "$ref": "#/responses/empty"
+	//   "404":
+	//     "$ref": "#/responses/notFound"
+	//   "423":
+	//     "$ref": "#/responses/repoArchivedError"
+
 	if !setting.IssueGraphSettings.Enabled {
 		ctx.APIErrorNotFound("Issue graph features are disabled")
 		return
@@ -132,6 +237,41 @@ func RemoveIssueDependency(ctx *context.APIContext) {
 
 // GetIssueBlocks lists issues that this issue blocks
 func GetIssueBlocks(ctx *context.APIContext) {
+	// swagger:operation GET /repos/{owner}/{repo}/issues/{index}/blocks issue issueListBlocks
+	// ---
+	// summary: List issues that are blocked by this issue
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: index
+	//   in: path
+	//   description: index of the issue
+	//   type: string
+	//   required: true
+	// - name: page
+	//   in: query
+	//   description: page number of results to return (1-based)
+	//   type: integer
+	// - name: limit
+	//   in: query
+	//   description: page size of results
+	//   type: integer
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/IssueList"
+	//   "404":
+	//     "$ref": "#/responses/notFound"
+
 	if !setting.IssueGraphSettings.Enabled {
 		ctx.APIErrorNotFound("Issue graph features are disabled")
 		return
@@ -167,6 +307,41 @@ func GetIssueBlocks(ctx *context.APIContext) {
 
 // CreateIssueBlocking creates a blocking relationship (this issue blocks another)
 func CreateIssueBlocking(ctx *context.APIContext) {
+	// swagger:operation POST /repos/{owner}/{repo}/issues/{index}/blocks issue issueCreateIssueBlocking
+	// ---
+	// summary: Block the issue given in the body by the issue in path
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: index
+	//   in: path
+	//   description: index of the issue
+	//   type: string
+	//   required: true
+	// - name: body
+	//   in: body
+	//   schema:
+	//     "$ref": "#/definitions/IssueMeta"
+	// responses:
+	//   "201":
+	//     "$ref": "#/responses/empty"
+	//   "400":
+	//     "$ref": "#/responses/error"
+	//   "404":
+	//     "$ref": "#/responses/notFound"
+	//   "409":
+	//     "$ref": "#/responses/conflict"
+
 	if !setting.IssueGraphSettings.Enabled {
 		ctx.APIErrorNotFound("Issue graph features are disabled")
 		return
@@ -211,6 +386,37 @@ func CreateIssueBlocking(ctx *context.APIContext) {
 
 // RemoveIssueBlocking removes a blocking relationship
 func RemoveIssueBlocking(ctx *context.APIContext) {
+	// swagger:operation DELETE /repos/{owner}/{repo}/issues/{index}/blocks issue issueRemoveIssueBlocking
+	// ---
+	// summary: Unblock the issue given in the body by the issue in path
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: owner
+	//   in: path
+	//   description: owner of the repo
+	//   type: string
+	//   required: true
+	// - name: repo
+	//   in: path
+	//   description: name of the repo
+	//   type: string
+	//   required: true
+	// - name: index
+	//   in: path
+	//   description: index of the issue
+	//   type: string
+	//   required: true
+	// - name: body
+	//   in: body
+	//   schema:
+	//     "$ref": "#/definitions/IssueMeta"
+	// responses:
+	//   "204":
+	//     "$ref": "#/responses/empty"
+	//   "404":
+	//     "$ref": "#/responses/notFound"
+
 	if !setting.IssueGraphSettings.Enabled {
 		ctx.APIErrorNotFound("Issue graph features are disabled")
 		return

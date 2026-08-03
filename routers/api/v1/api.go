@@ -70,6 +70,7 @@ import (
 	"net/http"
 	"strings"
 
+	agent_model "code.gitea.io/gitea/models/agent"
 	auth_model "code.gitea.io/gitea/models/auth"
 	"code.gitea.io/gitea/models/organization"
 	"code.gitea.io/gitea/models/perm"
@@ -85,6 +86,7 @@ import (
 	"code.gitea.io/gitea/modules/web"
 	"code.gitea.io/gitea/routers/api/v1/activitypub"
 	"code.gitea.io/gitea/routers/api/v1/admin"
+	"code.gitea.io/gitea/routers/api/v1/agent"
 	"code.gitea.io/gitea/routers/api/v1/misc"
 	"code.gitea.io/gitea/routers/api/v1/notify"
 	"code.gitea.io/gitea/routers/api/v1/org"
@@ -369,6 +371,32 @@ func reqUsersExploreEnabled() func(ctx *context.APIContext) {
 	return func(ctx *context.APIContext) {
 		if setting.Service.Explore.DisableUsersPage {
 			ctx.APIErrorNotFound()
+		}
+	}
+}
+
+// reqHumanAuth refuses a request that authenticated with an agent's own NIP-98 signature.
+//
+// It guards the endpoints that mint or withdraw credentials. Enrolling a signing key is a human
+// act: if an agent could enrol keys with the key it is already holding, then a single leaked key
+// would let its holder create unlimited siblings, and revoking the leaked one would accomplish
+// nothing. reqToken() cannot express this - it only asks whether *someone* is signed in, and a
+// NIP-98 request is signed in.
+//
+// The same argument covers every account-level credential, not just Nostr keys, which is why this
+// also guards /user/keys, /user/gpg_keys and /user/applications/oauth2: each of those outlives the
+// signing key that created it, so allowing an agent to plant one would make revoking its key a
+// half-undo. /users/{username}/tokens needs no guard here - it is already behind
+// reqBasicOrRevProxyAuth(), which a signature cannot satisfy.
+//
+// What this does *not* contain is anything an agent's scopes legitimately permit inside a
+// repository or organization: containment here is about credentials, not about limiting what a
+// correctly-scoped agent may do.
+func reqHumanAuth() func(ctx *context.APIContext) {
+	return func(ctx *context.APIContext) {
+		if method, _ := ctx.Data["AuthedMethod"].(string); method == auth.NostrMethodName {
+			ctx.APIError(http.StatusForbidden, "an agent signature cannot be used here; this endpoint needs the owner's own credential")
+			return
 		}
 	}
 }
@@ -754,6 +782,13 @@ func buildAuthGroup() *auth.Group {
 	group := auth.NewGroup(
 		&auth.OAuth2{},
 		&auth.HTTPSign{},
+		// Nostr's position in this list is not load-bearing, which is worth saying because it
+		// looks as if it should be. It claims only `Authorization: Nostr ...` and returns
+		// (nil, nil) for everything else; Basic reads the same header but
+		// httpauth.ParseAuthorizationHeader recognises `basic`, `token` and `bearer` only, so
+		// Basic already declines a Nostr credential. Neither method can shadow the other in
+		// either order.
+		&auth.Nostr{},
 		&auth.Basic{}, // FIXME: this should be removed once we don't allow basic auth in API
 	)
 	if setting.Service.EnableReverseProxyAuthAPI {
@@ -771,6 +806,12 @@ func apiAuth(authMethod auth.Method) func(*context.APIContext) {
 	return func(ctx *context.APIContext) {
 		ar, err := common.AuthShared(ctx.Base, nil, authMethod)
 		if err != nil {
+			// A few failures are not "your credential was refused" and must not be described
+			// as one; those carry the status to answer with.
+			if status, ok := auth.ErrAsUserAuthStatus(err); ok {
+				ctx.APIError(status.Status, status.Message)
+				return
+			}
 			msg, ok := auth.ErrAsUserAuthMessage(err)
 			msg = util.Iif(ok, msg, "invalid username, password or token")
 			ctx.APIError(http.StatusUnauthorized, msg)
@@ -780,6 +821,41 @@ func apiAuth(authMethod auth.Method) func(*context.APIContext) {
 		ctx.IsSigned = ar.Doer != nil
 		ctx.IsBasicAuth = ar.IsBasicAuth
 	}
+}
+
+// recordAgentAudit attaches the outcome of a NIP-98 authenticated request to the audit row that
+// services/auth wrote when it accepted the credential.
+//
+// The row has to exist before the handler runs, so that a signed request can never be performed
+// without a trace, but that means its bare existence records only that the credential was
+// accepted - not that the request was authorized, and not that it worked. Everything after
+// authentication is observable only here, once the handler has returned and written its status.
+// A request that 403s on a repository permission, or 422s on a malformed body, is therefore
+// distinguishable in the trail from one that succeeded.
+//
+// This is also where the repository comes from: the router has already resolved
+// `/repos/{owner}/{repo}/...` by now, so the audit trail reuses that answer instead of parsing
+// the path a second time and issuing its own lookup on the authentication hot path.
+func recordAgentAudit(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
+		ctx := context.GetAPIContext(req)
+		defer func() {
+			audit, ok := ctx.Data[auth.AgentAuditPendingKey].(*agent_model.AuditEvent)
+			if !ok {
+				return // not a NIP-98 request; this middleware costs nothing
+			}
+			var repoID int64
+			if ctx.Repo != nil && ctx.Repo.Repository != nil {
+				repoID = ctx.Repo.Repository.ID
+			}
+			if err := agent_model.RecordAuditOutcome(ctx, audit.ID, repoID, ctx.Resp.WrittenStatus()); err != nil {
+				// The identifying half of the row is already durable, so the trail is intact
+				// either way; only the outcome is missing, and it stays 0 to say so.
+				log.Error("RecordAuditOutcome(%d): %v", audit.ID, err)
+			}
+		}()
+		next.ServeHTTP(resp, req)
+	})
 }
 
 // verifyAuthWithOptions checks authentication according to options
@@ -889,6 +965,10 @@ func Routes() *web.Router {
 	// Get user from session if logged in.
 	m.Use(apiAuth(buildAuthGroup()))
 
+	// Immediately after authentication, so that it observes everything a signed request goes
+	// on to do, including the authorization checks below.
+	m.Use(recordAgentAudit)
+
 	m.Use(verifyAuthWithOptions(&common.VerifyOptions{
 		SignInRequired: setting.Service.RequireSignInViewStrict,
 	}))
@@ -972,6 +1052,19 @@ func Routes() *web.Router {
 				m.Get("/repository", settings.GetGeneralRepoSettings)
 			})
 		})
+
+		// Agent identity: register, list and revoke the Nostr keys that agents sign their
+		// requests with. reqHumanAuth() puts the whole group out of reach of a NIP-98
+		// credential, so a leaked agent key cannot enrol a replacement for itself or revoke
+		// the key an operator is using to contain it.
+		m.Group("/agent", func() {
+			m.Combo("/keys").Get(agent.ListKeys).
+				Post(bind(api.CreateAgentKeyOption{}), agent.CreateKey)
+			m.Delete("/keys/{id}", agent.RevokeKey)
+			// The owner's view of the trail. The repo-scoped endpoint below can only show
+			// requests that reached a repository; this is where everything else lands.
+			m.Get("/audit", agent.ListOwnedAudit)
+		}, reqToken(), reqHumanAuth(), tokenRequiresScopes(auth_model.AccessTokenScopeCategoryUser))
 
 		// Notifications (requires 'notifications' scope)
 		m.Group("/notifications", func() {
@@ -1076,14 +1169,19 @@ func Routes() *web.Router {
 			})
 
 			// (admin:public_key scope)
+			// reqHumanAuth() for the same reason it guards /agent/keys: an SSH key outlives
+			// the Nostr key that added it, so without this a leaked agent key holding
+			// write:user could plant a credential that revoking the agent key does not remove.
 			m.Group("/keys", func() {
 				m.Combo("").Get(user.ListMyPublicKeys).
 					Post(bind(api.CreateKeyOption{}), user.CreatePublicKey)
 				m.Combo("/{id}").Get(user.GetPublicKey).
 					Delete(user.DeletePublicKey)
-			})
+			}, reqHumanAuth())
 
 			// (admin:application scope)
+			// reqHumanAuth(): an OAuth2 application mints tokens, and those tokens survive
+			// revoking the signing key that registered the application.
 			m.Group("/applications", func() {
 				m.Combo("/oauth2").
 					Get(user.ListOauth2Applications).
@@ -1092,17 +1190,19 @@ func Routes() *web.Router {
 					Delete(user.DeleteOauth2Application).
 					Patch(bind(api.CreateOAuth2ApplicationOptions{}), user.UpdateOauth2Application).
 					Get(user.GetOauth2Application)
-			})
+			}, reqHumanAuth())
 
 			// (admin:gpg_key scope)
+			// reqHumanAuth(): a GPG key does not grant access, but it does let anything the
+			// key signs show as verified under this account, and it too outlives revocation.
 			m.Group("/gpg_keys", func() {
 				m.Combo("").Get(user.ListMyGPGKeys).
 					Post(bind(api.CreateGPGKeyOption{}), user.CreateGPGKey)
 				m.Combo("/{id}").Get(user.GetGPGKey).
 					Delete(user.DeleteGPGKey)
-			})
+			}, reqHumanAuth())
 			m.Get("/gpg_key_token", user.GetVerificationToken)
-			m.Post("/gpg_key_verify", bind(api.VerifyGPGKeyOption{}), user.VerifyUserGPGKey)
+			m.Post("/gpg_key_verify", reqHumanAuth(), bind(api.VerifyGPGKeyOption{}), user.VerifyUserGPGKey)
 
 			// (repo scope)
 			m.Combo("/repos", tokenRequiresScopes(auth_model.AccessTokenScopeCategoryRepository)).Get(user.ListMyRepos).
@@ -1170,6 +1270,10 @@ func Routes() *web.Router {
 					Delete(reqToken(), reqOwner(), repo.Delete).
 					Patch(reqToken(), reqAdmin(), bind(api.EditRepoOption{}), repo.Edit)
 				m.Post("/generate", reqToken(), reqRepoReader(unit.TypeCode), bind(api.GenerateRepoOption{}), repo.Generate)
+				// Repo admin, not any reader: the trail exposes every URL an agent touched
+				// in this repository, query strings included, which is more than read access
+				// to the repository's contents implies.
+				m.Get("/agent-audit", reqToken(), reqAdmin(), agent.ListRepoAudit)
 				m.Group("/transfer", func() {
 					m.Post("", reqOwner(), bind(api.TransferRepoOption{}), repo.Transfer)
 					m.Post("/accept", repo.AcceptTransfer)

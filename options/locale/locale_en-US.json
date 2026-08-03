@@ -2914,6 +2914,7 @@
   "admin.dashboard.cleanup_hook_task_table": "Clean up hook_task table",
   "admin.dashboard.cleanup_packages": "Clean up expired packages",
   "admin.dashboard.cleanup_actions": "Clean up expired actions' resources",
+  "admin.dashboard.cleanup_agent_used_events": "Clean up expired agent replay-guard events",
   "admin.dashboard.server_uptime": "Server Uptime",
   "admin.dashboard.current_goroutine": "Current Goroutines",
   "admin.dashboard.current_memory_usage": "Current Memory Usage",

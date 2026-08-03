@@ -1290,6 +1290,133 @@
         }
       }
     },
+    "/agent/audit": {
+      "get": {
+        "produces": [
+          "application/json"
+        ],
+        "tags": [
+          "agent"
+        ],
+        "summary": "List the signed requests made by the agents the authenticated user owns",
+        "operationId": "agentListOwnedAudit",
+        "parameters": [
+          {
+            "type": "integer",
+            "format": "int64",
+            "description": "only list requests signed on behalf of this agent user",
+            "name": "agent_user_id",
+            "in": "query"
+          },
+          {
+            "type": "integer",
+            "description": "page number of results to return (1-based)",
+            "name": "page",
+            "in": "query"
+          },
+          {
+            "type": "integer",
+            "description": "page size of results",
+            "name": "limit",
+            "in": "query"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/responses/AgentAuditEventList"
+          },
+          "403": {
+            "$ref": "#/responses/forbidden"
+          }
+        }
+      }
+    },
+    "/agent/keys": {
+      "get": {
+        "produces": [
+          "application/json"
+        ],
+        "tags": [
+          "agent"
+        ],
+        "summary": "List the Nostr keys the authenticated user has registered",
+        "operationId": "agentListKeys",
+        "responses": {
+          "200": {
+            "$ref": "#/responses/AgentKeyList"
+          },
+          "403": {
+            "$ref": "#/responses/forbidden"
+          }
+        }
+      },
+      "post": {
+        "consumes": [
+          "application/json"
+        ],
+        "produces": [
+          "application/json"
+        ],
+        "tags": [
+          "agent"
+        ],
+        "summary": "Register a Nostr public key for an agent user",
+        "operationId": "agentCreateKey",
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "schema": {
+              "$ref": "#/definitions/CreateAgentKeyOption"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "$ref": "#/responses/AgentKey"
+          },
+          "403": {
+            "$ref": "#/responses/forbidden"
+          },
+          "422": {
+            "$ref": "#/responses/validationError"
+          }
+        }
+      }
+    },
+    "/agent/keys/{id}": {
+      "delete": {
+        "produces": [
+          "application/json"
+        ],
+        "tags": [
+          "agent"
+        ],
+        "summary": "Revoke a registered Nostr key",
+        "operationId": "agentRevokeKey",
+        "parameters": [
+          {
+            "type": "integer",
+            "format": "int64",
+            "description": "id of the key to revoke",
+            "name": "id",
+            "in": "path",
+            "required": true
+          }
+        ],
+        "responses": {
+          "204": {
+            "$ref": "#/responses/empty"
+          },
+          "403": {
+            "$ref": "#/responses/forbidden"
+          },
+          "404": {
+            "$ref": "#/responses/notFound"
+          }
+        }
+      }
+    },
     "/gitignore/templates": {
       "get": {
         "produces": [
@@ -6225,6 +6352,57 @@
         }
       }
     },
+    "/repos/{owner}/{repo}/agent-audit": {
+      "get": {
+        "produces": [
+          "application/json"
+        ],
+        "tags": [
+          "repository"
+        ],
+        "summary": "List the signed agent requests recorded against a repository",
+        "operationId": "repoListAgentAudit",
+        "parameters": [
+          {
+            "type": "string",
+            "description": "owner of the repo",
+            "name": "owner",
+            "in": "path",
+            "required": true
+          },
+          {
+            "type": "string",
+            "description": "name of the repo",
+            "name": "repo",
+            "in": "path",
+            "required": true
+          },
+          {
+            "type": "integer",
+            "description": "page number of results to return (1-based)",
+            "name": "page",
+            "in": "query"
+          },
+          {
+            "type": "integer",
+            "description": "page size of results",
+            "name": "limit",
+            "in": "query"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/responses/AgentAuditEventList"
+          },
+          "403": {
+            "$ref": "#/responses/forbidden"
+          },
+          "404": {
+            "$ref": "#/responses/notFound"
+          }
+        }
+      }
+    },
     "/repos/{owner}/{repo}/archive/{archive}": {
       "get": {
         "produces": [
@@ -10598,10 +10776,16 @@
         ],
         "responses": {
           "201": {
-            "$ref": "#/responses/Issue"
+            "$ref": "#/responses/empty"
+          },
+          "400": {
+            "$ref": "#/responses/error"
           },
           "404": {
-            "description": "the issue does not exist"
+            "$ref": "#/responses/notFound"
+          },
+          "409": {
+            "$ref": "#/responses/conflict"
           }
         }
       },
@@ -10645,8 +10829,8 @@
           }
         ],
         "responses": {
-          "200": {
-            "$ref": "#/responses/Issue"
+          "204": {
+            "$ref": "#/responses/empty"
           },
           "404": {
             "$ref": "#/responses/notFound"
@@ -11040,10 +11224,16 @@
         ],
         "responses": {
           "201": {
-            "$ref": "#/responses/Issue"
+            "$ref": "#/responses/empty"
+          },
+          "400": {
+            "$ref": "#/responses/error"
           },
           "404": {
-            "description": "the issue does not exist"
+            "$ref": "#/responses/notFound"
+          },
+          "409": {
+            "$ref": "#/responses/conflict"
           },
           "423": {
             "$ref": "#/responses/repoArchivedError"
@@ -11090,8 +11280,8 @@
           }
         ],
         "responses": {
-          "200": {
-            "$ref": "#/responses/Issue"
+          "204": {
+            "$ref": "#/responses/empty"
           },
           "404": {
             "$ref": "#/responses/notFound"
@@ -21819,6 +22009,122 @@
       },
       "x-go-package": "code.gitea.io/gitea/modules/structs"
     },
+    "AgentAuditEvent": {
+      "description": "It records authentication, not authorization: the row is written before the request reaches\nits handler so that nothing an agent signs can happen unlogged. Whether the request was then\npermitted, and whether it worked, is in ResponseStatus.",
+      "type": "object",
+      "title": "AgentAuditEvent is one NIP-98 signed request that authenticated successfully.",
+      "properties": {
+        "agent_key_id": {
+          "type": "integer",
+          "format": "int64",
+          "x-go-name": "AgentKeyID"
+        },
+        "agent_user_id": {
+          "type": "integer",
+          "format": "int64",
+          "x-go-name": "AgentUserID"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time",
+          "x-go-name": "Created"
+        },
+        "event_id": {
+          "type": "string",
+          "x-go-name": "EventID"
+        },
+        "id": {
+          "type": "integer",
+          "format": "int64",
+          "x-go-name": "ID"
+        },
+        "method": {
+          "type": "string",
+          "x-go-name": "Method"
+        },
+        "owner_user_id": {
+          "type": "integer",
+          "format": "int64",
+          "x-go-name": "OwnerUserID"
+        },
+        "payload_hash": {
+          "description": "Hex SHA-256 of the request body, empty when the request had no body.",
+          "type": "string",
+          "x-go-name": "PayloadHash"
+        },
+        "public_key": {
+          "type": "string",
+          "x-go-name": "PublicKey"
+        },
+        "repo_id": {
+          "type": "integer",
+          "format": "int64",
+          "x-go-name": "RepoID"
+        },
+        "request_url": {
+          "type": "string",
+          "x-go-name": "RequestURL"
+        },
+        "response_status": {
+          "description": "The HTTP status the request finally received, or 0 if it never produced one.",
+          "type": "integer",
+          "format": "int64",
+          "x-go-name": "ResponseStatus"
+        }
+      },
+      "x-go-package": "code.gitea.io/gitea/modules/structs"
+    },
+    "AgentKey": {
+      "type": "object",
+      "title": "AgentKey is a Nostr key registered to an agent user.",
+      "properties": {
+        "agent_user_id": {
+          "description": "The user that signed requests are authenticated as.",
+          "type": "integer",
+          "format": "int64",
+          "x-go-name": "AgentUserID"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time",
+          "x-go-name": "Created"
+        },
+        "id": {
+          "type": "integer",
+          "format": "int64",
+          "x-go-name": "ID"
+        },
+        "npub": {
+          "type": "string",
+          "x-go-name": "Npub"
+        },
+        "owner_user_id": {
+          "description": "The human who vouches for the agent (the NIP-OA ownership chain).",
+          "type": "integer",
+          "format": "int64",
+          "x-go-name": "OwnerUserID"
+        },
+        "public_key": {
+          "type": "string",
+          "x-go-name": "PublicKey"
+        },
+        "revoked_at": {
+          "description": "Null while the key is still valid.",
+          "type": "string",
+          "format": "date-time",
+          "x-go-name": "Revoked"
+        },
+        "scopes": {
+          "description": "What the key is permitted to do; the same scopes an access token carries.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "x-go-name": "Scopes"
+        }
+      },
+      "x-go-package": "code.gitea.io/gitea/modules/structs"
+    },
     "AnnotatedTag": {
       "description": "AnnotatedTag represents an annotated tag",
       "type": "object",
@@ -22900,6 +23206,36 @@
           "type": "string",
           "x-go-name": "Ref",
           "example": "refs/heads/main"
+        }
+      },
+      "x-go-package": "code.gitea.io/gitea/modules/structs"
+    },
+    "CreateAgentKeyOption": {
+      "type": "object",
+      "title": "CreateAgentKeyOption is the option for registering a Nostr key for an agent user.",
+      "required": [
+        "public_key",
+        "scopes"
+      ],
+      "properties": {
+        "agent_user_id": {
+          "description": "The user the signed requests will be authenticated as. Defaults to the authenticated\nuser. Only a site administrator may name a different user.",
+          "type": "integer",
+          "format": "int64",
+          "x-go-name": "AgentUserID"
+        },
+        "public_key": {
+          "description": "The Nostr public key, either as 32-byte hex or as a NIP-19 npub.",
+          "type": "string",
+          "x-go-name": "PublicKey"
+        },
+        "scopes": {
+          "description": "What the key is permitted to do, in the same vocabulary as an access token's scopes\n(for example \"write:issue\"). At least one is required: a key with no scope would be able\nto do everything its user can, which is more than any personal access token may.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "x-go-name": "Scopes"
         }
       },
       "x-go-package": "code.gitea.io/gitea/modules/structs"
@@ -29506,6 +29842,30 @@
       "description": "ActivityPub",
       "schema": {
         "$ref": "#/definitions/ActivityPub"
+      }
+    },
+    "AgentAuditEventList": {
+      "description": "AgentAuditEventList",
+      "schema": {
+        "type": "array",
+        "items": {
+          "$ref": "#/definitions/AgentAuditEvent"
+        }
+      }
+    },
+    "AgentKey": {
+      "description": "AgentKey",
+      "schema": {
+        "$ref": "#/definitions/AgentKey"
+      }
+    },
+    "AgentKeyList": {
+      "description": "AgentKeyList",
+      "schema": {
+        "type": "array",
+        "items": {
+          "$ref": "#/definitions/AgentKey"
+        }
       }
     },
     "AnnotatedTag": {
