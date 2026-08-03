@@ -140,10 +140,40 @@ func fetchActions(ctx context.Context, opts *fetchOptions) ([]*Event, error) {
 // else in that enum - label changes, milestone changes, branch deletions, the whole system-comment
 // range - is a record of something already reported by the `action` row next to it, and surfacing
 // both would report every state change twice.
+//
+// CommentTypeReview is in the list but is usually filtered out again by submittedReviewCond, which
+// is where the reasoning for that lives.
 var contentBearingCommentTypes = []issues_model.CommentType{
 	issues_model.CommentTypeComment, // 0
 	issues_model.CommentTypeCode,    // 21
 	issues_model.CommentTypeReview,  // 22
+}
+
+// submittedReviewCond drops the `comment` row Gitea writes beside a review that was submitted.
+//
+// Submitting a review writes two rows for one action: a `review` row and a CommentTypeReview
+// `comment` row carrying the same content, the same poster and the same second
+// (models/issues/review.go, SubmitReview; InsertReviews does the same on import). Both sources read
+// their own table, so without this the stream reports one submission twice - the exact duplication
+// the system comment types are excluded to avoid - and a client cannot even tell that it happened,
+// because the two events name each other by nothing.
+//
+// The `review` row is the copy that is kept. It is the one that carries what the submission was:
+// its review type, whether it counted as official, whether it was later dismissed. The comment row
+// has none of that, so keeping the comment and dropping the review would lose information rather
+// than move it.
+//
+// It is dropped only when its review is actually there to report it. `review` is LEFT-joined, so a
+// CommentTypeReview row whose review was deleted out from under it - or which never had one - joins
+// to NULL and stays: it still records something that happened, and vanishing with a row nobody can
+// see is worse than a duplicate. Comments of any other type are untouched, which includes
+// CommentTypeCode: a line comment is its own remark, not a second copy of the review it belongs to,
+// and carries review_id in its payload so a client can group the two.
+func submittedReviewCond() builder.Cond {
+	return builder.Or(
+		builder.Neq{"`comment`.type": issues_model.CommentTypeReview},
+		builder.IsNull{"`review`.id"},
+	)
 }
 
 // fetchComments reads issue and pull request comments.
@@ -165,6 +195,7 @@ func fetchComments(ctx context.Context, opts *fetchOptions) ([]*Event, error) {
 	}
 	cond = cond.And(builder.In("`comment`.type", contentBearingCommentTypes)).
 		And(publishedReviewCond(opts.Doer)).
+		And(submittedReviewCond()).
 		And(keysetCond(opts.Cursor, KindComment, "`comment`.created_unix", "`comment`.id")).
 		And(rangeCond(opts.Since, opts.Until, "`comment`.created_unix"))
 	if opts.ActorID > 0 {
@@ -198,6 +229,12 @@ func fetchComments(ctx context.Context, opts *fetchOptions) ([]*Event, error) {
 			"comment_type": strconv.Itoa(int(row.Type)),
 			"issue_id":     strconv.FormatInt(row.IssueID, 10),
 		}
+		// The review this comment belongs to, when it belongs to one. A line comment and the
+		// review that carries it are two events of one reading, and this is what lets a client
+		// put them back together - without it the only thing relating them is a shared second.
+		if row.ReviewID != 0 {
+			payload["review_id"] = strconv.FormatInt(row.ReviewID, 10)
+		}
 		setText(payload, "content", row.Content)
 		title := ""
 		if issue := issues[row.IssueID]; issue != nil {
@@ -224,13 +261,21 @@ func fetchComments(ctx context.Context, opts *fetchOptions) ([]*Event, error) {
 // reviewer has not submitted, visible to nobody but its author. It is excluded here rather than
 // filtered downstream, because a draft leaking into a repository-wide stream is a disclosure, not a
 // display bug.
+//
+// ReviewTypeRequest is excluded for a different reason: it is not a review at all. AddReviewRequest
+// writes a `review` row with that type, no content, and reviewer_id set to the person who was
+// *asked* (models/issues/review.go) - so reporting it here would announce a review by someone who
+// has not reviewed, and Event.ActorID below would make ?actor=<them> match an act somebody else
+// performed. The human action is the CommentTypeReviewRequest comment, which this package drops as
+// a system comment; the request row is also hard-deleted when the request is withdrawn, so an event
+// built from it would disappear from a stream a client had already read.
 func fetchReviews(ctx context.Context, opts *fetchOptions) ([]*Event, error) {
 	if !opts.Permission.CanRead(unit.TypePullRequests) {
 		return nil, nil
 	}
 	cond := builder.Eq{"issue.repo_id": opts.Repo.ID}.
 		And(builder.Eq{"issue.is_pull": true}).
-		And(builder.Neq{"`review`.type": issues_model.ReviewTypePending}).
+		And(builder.NotIn("`review`.type", issues_model.ReviewTypePending, issues_model.ReviewTypeRequest)).
 		And(keysetCond(opts.Cursor, KindReview, "`review`.created_unix", "`review`.id")).
 		And(rangeCond(opts.Since, opts.Until, "`review`.created_unix"))
 	if opts.ActorID > 0 {

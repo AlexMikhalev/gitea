@@ -44,6 +44,22 @@ func TestPublishedReviewCondShape(t *testing.T) {
 	})
 }
 
+// Submitting a review writes both a `review` row and a CommentTypeReview `comment` row with the
+// same content, poster and second, so the two sources would each report the same submission. The
+// condition drops the comment copy - but only where the review copy exists to replace it, which is
+// what the "review joined to nothing" branch is for.
+func TestSubmittedReviewCondShape(t *testing.T) {
+	sql, args, err := builder.ToSQL(submittedReviewCond())
+	require.NoError(t, err)
+
+	assert.Contains(t, sql, "`comment`.type<>?")
+	assert.Contains(t, sql, "`review`.id IS NULL")
+	assert.Equal(t, []any{issues_model.CommentTypeReview}, args)
+	// Alternatives, not requirements: a plain comment satisfies the first branch alone.
+	assert.Equal(t, 1, strings.Count(sql, " OR "))
+	assert.NotContains(t, sql, " AND ")
+}
+
 func TestSetTextOmitsEmptyValues(t *testing.T) {
 	payload := map[string]string{}
 	setText(payload, "content", "")

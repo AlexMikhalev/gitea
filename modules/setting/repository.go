@@ -54,6 +54,18 @@ var (
 		AllowForkWithoutMaximumLimit            bool
 		AllowForkIntoSameOwner                  bool
 
+		// EventStreamSearchIndexAutoBuild lets startup build the PostgreSQL full-text indexes that
+		// /repos/{owner}/{repo}/events searches through, when they are missing.
+		//
+		// It exists so that build can be declined. A fresh install has no migration history, so the
+		// migration that creates these indexes never runs on it and startup is the only place left
+		// to create them - hence the default. But a CREATE INDEX holds a SHARE lock on its table
+		// until it completes, and on a mature `action` or `comment` table that is minutes to hours
+		// during which writes block. An operator who would rather create them by hand with CREATE
+		// INDEX CONCURRENTLY, or do without them and let search fall back to LIKE, turns this off.
+		// It has no effect on any other database: the indexes are a PostgreSQL feature.
+		EventStreamSearchIndexAutoBuild bool
+
 		// StreamArchives makes Gitea stream git archive files to the client directly instead of creating an archive first.
 		// Ideally all users should use this streaming method. However, at the moment we don't know whether there are
 		// any users who still need the old behavior, so we introduce this option, intentionally not documenting it.
@@ -175,6 +187,7 @@ var (
 		DisableStars:                            false,
 		DefaultBranch:                           "main",
 		AllowForkWithoutMaximumLimit:            true,
+		EventStreamSearchIndexAutoBuild:         true,
 		StreamArchives:                          true,
 
 		// Repository editor settings

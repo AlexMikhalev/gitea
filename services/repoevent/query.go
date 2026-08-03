@@ -7,8 +7,9 @@ import (
 	"strconv"
 	"strings"
 
-	"code.gitea.io/gitea/models/db"
+	"code.gitea.io/gitea/modules/setting"
 	"code.gitea.io/gitea/modules/timeutil"
+	"code.gitea.io/gitea/modules/util"
 
 	"xorm.io/builder"
 )
@@ -72,7 +73,7 @@ func rangeCond(since, until *timeutil.TimeStamp, createdCol string) builder.Cond
 //
 // The two paths do not, however, match the same rows, and the endpoint documents that as a
 // deployment-dependent behaviour rather than pretending otherwise. plainto_tsquery stems, folds and
-// drops stop words and matches whole lexemes; db.BuildCaseInsensitiveLike matches raw substrings.
+// drops stop words and matches whole lexemes; caseInsensitiveLikeCond matches raw substrings.
 // So `?q=fix` finds "prefix" through LIKE and not through full text, `?q=running` finds "runs"
 // through full text and not through LIKE, and `?q=the` finds every row through LIKE and none
 // through full text. Both are defensible answers to "search this text"; what would not be
@@ -93,9 +94,50 @@ func searchCond(q, ftsExpr string, likeCols ...string) builder.Cond {
 	}
 	cond := builder.NewCond()
 	for _, col := range likeCols {
-		cond = cond.Or(db.BuildCaseInsensitiveLike(col, q))
+		cond = cond.Or(caseInsensitiveLikeCond(col, q))
 	}
 	return cond
+}
+
+// likeEscapeChar is the character the LIKE patterns below escape a wildcard with.
+//
+// Not a backslash, and the ESCAPE clause is always written out, both deliberately. SQLite's LIKE
+// has no escape character at all unless one is named, so a bare `\%` there matches "a backslash
+// followed by anything" rather than a literal per cent; and a backslash inside a string literal
+// means different things to PostgreSQL and MySQL depending on standard_conforming_strings and
+// NO_BACKSLASH_ESCAPES, so `ESCAPE '\\'` is not one statement that runs everywhere. `!` needs no
+// quoting on any of the four dialects and is a wildcard on none of them.
+const likeEscapeChar = "!"
+
+// likePatternEscaper makes a search term match itself rather than act as a pattern. The escape
+// character is replaced first by NewReplacer's left-to-right, non-overlapping rule, so an escape
+// introduced for `%` is never escaped a second time.
+var likePatternEscaper = strings.NewReplacer(
+	likeEscapeChar, likeEscapeChar+likeEscapeChar,
+	"%", likeEscapeChar+"%",
+	"_", likeEscapeChar+"_",
+)
+
+// caseInsensitiveLikeCond is db.BuildCaseInsensitiveLike with the wildcards in the search term
+// escaped, which is the whole reason it is written out here rather than called.
+//
+// `q` is a term a repository reader typed, not a pattern they are entitled to write. Handed to
+// builder.Like unescaped, `?q=%` matches every row of `action`, `comment`, `review`,
+// `commit_status` and `agent_audit_event` - a full scan of the two largest tables on the instance,
+// for free, from anyone who can read one repository - and `?q=a_c` matches "abc", which is simply
+// not what the caller asked for. The full-text path has no such reading of `%` or `_`, so leaving
+// them live would also be a divergence between the two paths that the endpoint does not document.
+//
+// The case folding is db.BuildCaseInsensitiveLike's, rule for rule: LOWER() on the column, and
+// ASCII-only folding of the term on SQLite because SQLite's LOWER() does not fold beyond ASCII.
+// What is added is the ESCAPE clause, which builder.Like cannot render.
+func caseInsensitiveLikeCond(col, q string) builder.Cond {
+	fold := strings.ToLower
+	if setting.Database.Type.IsSQLite3() {
+		fold = util.ToLowerASCII
+	}
+	pattern := "%" + likePatternEscaper.Replace(fold(q)) + "%"
+	return builder.Expr("LOWER("+col+") LIKE ? ESCAPE '"+likeEscapeChar+"'", pattern)
 }
 
 // TSVectorExpr renders the indexed to_tsvector expression for a single column.

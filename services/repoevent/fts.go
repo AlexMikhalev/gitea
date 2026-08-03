@@ -5,6 +5,7 @@ package repoevent
 
 import (
 	"context"
+	"strings"
 	"sync/atomic"
 
 	"code.gitea.io/gitea/models/db"
@@ -25,8 +26,11 @@ type ftsIndex struct {
 	Expr  string
 }
 
-// CreateSQL renders the statement that builds this index. IF NOT EXISTS makes it idempotent, which
-// is what lets it run on every startup rather than once.
+// CreateSQL renders the statement that builds this index. IF NOT EXISTS is what makes this
+// statement and migration 328's copy of it harmless to each other, and covers the boot that loses
+// a race for the same name against another one; it is not what decides whether to issue it at all -
+// ensureFTSIndexes reads the catalog for that, because a skipped statement and a multi-hour
+// blocking build are indistinguishable from here.
 func (i ftsIndex) CreateSQL() string {
 	return "CREATE INDEX IF NOT EXISTS " + i.Name + " ON " + i.Table + " USING GIN (" + i.Expr + ")"
 }
@@ -68,58 +72,143 @@ func Init(ctx context.Context) error {
 	return nil
 }
 
-// ensureFTSIndexes creates the missing indexes and reports whether all four are usable afterwards.
+// ensureFTSIndexes reports whether all four indexes are present and usable, building the ones that
+// are absent when the operator has left that enabled.
+//
+// The catalog is read before any DDL is issued, and that order is the point. CREATE INDEX IF NOT
+// EXISTS is idempotent, but it is not cheap when the index really is missing: it is an ordinary
+// blocking build, holding a SHARE lock on the table until it finishes, which is exactly what
+// migration 328 argues at length belongs inside a window the operator scheduled. Issuing it
+// unconditionally at every boot means any install whose indexes are gone for a reason other than
+// "it is new" - an operator dropped them to reclaim disk, a restore that omitted them - pays that
+// build at the next restart, with writes blocked for its duration and nothing in the log to say
+// that a build rather than a catalog check was about to start. Checking first makes the ordinary
+// case four catalog lookups, and makes the other case announce itself before it begins.
 func ensureFTSIndexes(ctx context.Context) bool {
-	// GIN and to_tsvector are Postgres features; MySQL and SQLite answer ?q= through
-	// db.BuildCaseInsensitiveLike and need no schema of their own, so there is nothing to do
-	// and nothing to check.
+	// GIN and to_tsvector are Postgres features; MySQL and SQLite answer ?q= through the LIKE
+	// path and need no schema of their own, so there is nothing to do and nothing to check.
 	if !setting.Database.Type.IsPostgreSQL() {
 		return false
 	}
-	for _, idx := range ftsIndexes {
+
+	status, err := ftsIndexStatuses(ctx)
+	if err != nil {
+		log.Error("repoevent: cannot read the full-text index catalog: %v - repository event search falls back to LIKE", err)
+		return false
+	}
+	build, invalid := ftsIndexesToBuild(status)
+
+	if len(invalid) > 0 {
+		// Present is not the same as usable: a build that failed part-way - the hazard
+		// CREATE INDEX CONCURRENTLY carries, and the reason migration 328 does not use it -
+		// leaves an INVALID index that the planner ignores and that IF NOT EXISTS then skips
+		// forever. Another CREATE would not repair it, so none is attempted.
+		log.Warn("repoevent: %s exist but never finished building - repository event search falls back to LIKE; REINDEX INDEX <name> repairs them", ftsIndexNames(invalid))
+		return false
+	}
+	if len(build) == 0 {
+		return true
+	}
+	if !setting.Repository.EventStreamSearchIndexAutoBuild {
+		log.Info("repoevent: %s are missing and [repository].EVENT_STREAM_SEARCH_INDEX_AUTO_BUILD is disabled - repository event search falls back to LIKE until they are created", ftsIndexNames(build))
+		return false
+	}
+
+	// Said before the lock is taken rather than after it is released: an operator watching a
+	// startup that has stopped moving needs this line to be already in the log.
+	log.Warn("repoevent: %s are missing and will be built now. Each CREATE INDEX holds a SHARE lock on its table until it completes, which blocks writes to it - on a mature instance `action` and `comment` can take minutes to hours. To avoid this at startup, build them with CREATE INDEX CONCURRENTLY out of band and/or set [repository].EVENT_STREAM_SEARCH_INDEX_AUTO_BUILD = false.", ftsIndexNames(build))
+	for _, idx := range build {
 		if _, err := db.GetEngine(ctx).Exec(idx.CreateSQL()); err != nil {
 			log.Error("repoevent: cannot create %s: %v - repository event search falls back to LIKE", idx.Name, err)
 			return false
 		}
 	}
-	for _, idx := range ftsIndexes {
-		// Present is not the same as usable: a build that failed part-way - the hazard
-		// CREATE INDEX CONCURRENTLY carries, and the reason migration 328 does not use it -
-		// leaves an INVALID index that the planner ignores and that IF NOT EXISTS then skips
-		// forever. An operator repairs that with REINDEX INDEX <name>; until then, LIKE.
-		valid, err := ftsIndexIsValid(ctx, idx.Name)
-		if err != nil {
-			log.Error("repoevent: cannot check %s: %v - repository event search falls back to LIKE", idx.Name, err)
-			return false
-		}
-		if !valid {
-			log.Warn("repoevent: %s is missing or invalid - repository event search falls back to LIKE; REINDEX INDEX %s repairs it", idx.Name, idx.Name)
-			return false
-		}
+
+	// What was just built is read back rather than assumed, for the same reason the flag is not
+	// set from the dialect alone: a statement that returned no error and an index the planner
+	// will use are two different claims.
+	if status, err = ftsIndexStatuses(ctx); err != nil {
+		log.Error("repoevent: cannot read the full-text index catalog: %v - repository event search falls back to LIKE", err)
+		return false
 	}
+	if remaining, stillInvalid := ftsIndexesToBuild(status); len(remaining) > 0 || len(stillInvalid) > 0 {
+		log.Warn("repoevent: %s are still not usable after being built - repository event search falls back to LIKE", ftsIndexNames(append(remaining, stillInvalid...)))
+		return false
+	}
+	log.Info("repoevent: built %s - repository event search uses full text", ftsIndexNames(build))
 	return true
 }
 
-// ftsIndexIsValid asks Postgres whether one index exists and finished building.
+// ftsIndexesToBuild splits the four indexes by what the catalog said about them: the ones a CREATE
+// would help, and the ones only a REINDEX can. An index nothing is known about is treated as
+// missing, which is what the zero value of the map lookup gives.
+func ftsIndexesToBuild(status map[string]ftsIndexStatus) (build, invalid []ftsIndex) {
+	for _, idx := range ftsIndexes {
+		switch status[idx.Name] {
+		case ftsIndexValid:
+		case ftsIndexInvalid:
+			invalid = append(invalid, idx)
+		default:
+			build = append(build, idx)
+		}
+	}
+	return build, invalid
+}
+
+// ftsIndexNames renders a set of indexes for a log line.
+func ftsIndexNames(indexes []ftsIndex) string {
+	names := make([]string, 0, len(indexes))
+	for _, idx := range indexes {
+		names = append(names, idx.Name)
+	}
+	return strings.Join(names, ", ")
+}
+
+// ftsIndexStatus is what the catalog says about one index.
+//
+// Missing and invalid are kept apart because the repair differs: a missing index is created, an
+// invalid one has to be REINDEXed and another CREATE IF NOT EXISTS would silently do nothing.
+type ftsIndexStatus int
+
+const (
+	ftsIndexMissing ftsIndexStatus = iota
+	ftsIndexInvalid
+	ftsIndexValid
+)
+
+// ftsIndexStatuses asks Postgres about all four indexes at once.
+func ftsIndexStatuses(ctx context.Context) (map[string]ftsIndexStatus, error) {
+	status := make(map[string]ftsIndexStatus, len(ftsIndexes))
+	for _, idx := range ftsIndexes {
+		one, err := ftsIndexStatusOf(ctx, idx.Name)
+		if err != nil {
+			return nil, err
+		}
+		status[idx.Name] = one
+	}
+	return status, nil
+}
+
+// ftsIndexStatusOf asks Postgres whether one index exists and finished building.
 //
 // to_regclass resolves the name through search_path, so an install using database.SCHEMA finds its
 // own index rather than a same-named one elsewhere, and returns NULL - matching no row - when the
 // index does not exist at all.
-func ftsIndexIsValid(ctx context.Context, name string) (bool, error) {
+func ftsIndexStatusOf(ctx context.Context, name string) (ftsIndexStatus, error) {
 	rows, err := db.GetEngine(ctx).Query("SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass(?)", name)
 	if err != nil {
-		return false, err
+		return ftsIndexMissing, err
 	}
 	if len(rows) == 0 {
-		return false, nil
+		return ftsIndexMissing, nil
 	}
 	// Drivers render a Postgres bool as "t" or as "true" depending on the wire format in use;
-	// both mean the same thing and anything else means not valid.
+	// both mean the same thing and anything else means the index is there but not usable.
 	switch string(rows[0]["indisvalid"]) {
 	case "t", "true":
-		return true, nil
+		return ftsIndexValid, nil
 	default:
-		return false, nil
+		return ftsIndexInvalid, nil
 	}
 }
 

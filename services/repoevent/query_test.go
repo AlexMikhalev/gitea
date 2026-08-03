@@ -111,6 +111,33 @@ func TestSearchCondUsesFullTextOnPostgres(t *testing.T) {
 	assert.Equal(t, []any{"hello world"}, args)
 }
 
+// `q` is a term a repository reader typed, not a pattern they may write. Unescaped, `?q=%` is a
+// LIKE that matches every row of the two largest tables on the instance and `?q=a_c` matches "abc";
+// the full-text path reads neither character as a wildcard, so leaving them live would be a third
+// undocumented divergence between the two paths on top of being wrong on its own.
+func TestSearchCondEscapesLikeWildcards(t *testing.T) {
+	defer withDatabaseType(t, "sqlite3")()
+	require.False(t, UsesFullTextSearch())
+
+	for name, tc := range map[string]struct{ query, pattern string }{
+		"per cent":                {"%", `%!%%`},
+		"underscore":              {"a_c", `%a!_c%`},
+		"the escape character":    {"!", `%!!%`},
+		"escape before wildcards": {"!%", `%!!!%%`},
+		"an ordinary term":        {"Hello", `%hello%`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			sql, args := sqlOf(t, searchCond(tc.query, TSVectorExpr("content"), "content"))
+			// SQLite's LIKE has no escape character unless one is named, and a
+			// backslash means different things to Postgres and MySQL inside a string
+			// literal - so the clause is always written out, with a character that is
+			// quoted identically everywhere.
+			assert.Contains(t, sql, "LOWER(content) LIKE ? ESCAPE '!'")
+			assert.Equal(t, []any{tc.pattern}, args)
+		})
+	}
+}
+
 // A source with no index takes the LIKE path on every dialect. `q` is never dropped - the same
 // rows come back, they just cost a scan.
 func TestSearchCondWithoutIndexStillFiltersOnPostgres(t *testing.T) {

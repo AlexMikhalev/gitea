@@ -32,6 +32,12 @@ func ListRepoEvents(ctx *context.APIContext) {
 	//   `<key>_truncated: "true"` and the full text must be read from the endpoint that owns
 	//   the row.
 	//
+	//   One action is one event. Submitting a review writes both a review row and a comment row
+	//   in Gitea, and only the review one is reported - so a submitted review is a single event
+	//   of kind `review`, never also a `comment`, and asking for `kinds=comment` alone will not
+	//   show it. The line comments of a review are separate events, each carrying that review's
+	//   id as `review_id` in its payload so that they can be grouped with it.
+	//
 	//   Visibility is per kind. Comments, reviews and statuses are filtered by the repository
 	//   unit they belong to (issues, pull requests, code), and the agent audit trail is
 	//   repository admins only. The action kind is filtered the way
@@ -81,6 +87,9 @@ func ListRepoEvents(ctx *context.APIContext) {
 	//     matches "runs" and `the` matches nothing. On MySQL and SQLite it is a
 	//     case-insensitive substring match: `fix` matches "prefix". Callers that must behave
 	//     identically everywhere should not depend on either one's extra matches.
+	//
+	//     The term is matched literally either way. `%` and `_` are searched for as themselves
+	//     rather than read as wildcards, so there is no pattern syntax here on any database.
 	//   type: string
 	// - name: cursor
 	//   in: query

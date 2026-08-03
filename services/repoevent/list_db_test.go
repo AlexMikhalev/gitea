@@ -525,6 +525,158 @@ func TestListOverFixtureRowsStaysWithinTheRepository(t *testing.T) {
 	}
 }
 
+// One submission is one event. Gitea writes both a `review` row and a CommentTypeReview `comment`
+// row for it, with the same content, the same poster and the same second, and the two are read by
+// two different adapters - so without the filter the stream reports it twice and a client has no
+// field on either event with which to notice.
+func TestListReportsASubmittedReviewOnce(t *testing.T) {
+	s := prepareStream(t)
+
+	// The row SubmitReview writes beside the review prepareStream already inserted.
+	submission := &issues_model.Comment{
+		Type:        issues_model.CommentTypeReview,
+		PosterID:    s.owner.ID,
+		IssueID:     2,
+		ReviewID:    s.review,
+		Content:     "published review",
+		CreatedUnix: streamBase + 40,
+	}
+	// A CommentTypeReview row whose review is gone still records something that happened, and
+	// is the case the "review joined to nothing" branch keeps.
+	orphan := &issues_model.Comment{
+		Type:        issues_model.CommentTypeReview,
+		PosterID:    s.owner.ID,
+		IssueID:     2,
+		ReviewID:    9_999_999,
+		Content:     "a review whose row was deleted",
+		CreatedUnix: streamBase + 41,
+	}
+	insertAt(t, submission, orphan)
+
+	events, _ := listOrFail(t, &ListOptions{
+		Repo: s.repo, Doer: s.owner, Permission: repoPermission(t, s.repo, s.owner),
+		Since: since(), Limit: 50,
+	})
+	got := keysOf(events)
+
+	assert.Contains(t, got, key(KindReview, s.review),
+		"the review row is the copy that is kept - it carries the review type, official and dismissed")
+	assert.NotContains(t, got, key(KindComment, submission.ID),
+		"one submission reached the stream as two events")
+	assert.Contains(t, got, key(KindComment, orphan.ID),
+		"a review comment with no review row left is the only report of it there is")
+}
+
+// The pair is in the shipped fixtures on its own, without this file writing anything: `review` 20
+// and `comment` 9 (review_id 20) are one submission at 946684810, and `review` 21 and `comment` 10
+// (review_id 21) are another. A window-scoped test cannot catch a regression here, because the rows
+// it writes are the ones it also asserts about.
+func TestListDeduplicatesFixtureReviewSubmissions(t *testing.T) {
+	s := prepareStream(t)
+	events, _ := listOrFail(t, &ListOptions{
+		Repo: s.repo, Doer: s.owner, Permission: repoPermission(t, s.repo, s.owner),
+		Limit: MaxLimit,
+	})
+	got := keysOf(events)
+
+	for _, pair := range []struct{ review, comment int64 }{{20, 9}, {21, 10}} {
+		comment := unittest.AssertExistsAndLoadBean(t, &issues_model.Comment{ID: pair.comment})
+		require.Equal(t, issues_model.CommentTypeReview, comment.Type)
+		require.Equal(t, pair.review, comment.ReviewID)
+
+		assert.Contains(t, got, key(KindReview, pair.review))
+		assert.NotContains(t, got, key(KindComment, pair.comment))
+	}
+}
+
+// A line comment is not a duplicate of the review it belongs to - it is a remark of its own, at its
+// own place in the diff - so it stays, and carries the review's id so a client can group the two
+// rather than having to infer the relation from a shared second.
+func TestListCorrelatesCodeCommentsWithTheirReview(t *testing.T) {
+	s := prepareStream(t)
+	events, _ := listOrFail(t, &ListOptions{
+		Repo: s.repo, Doer: s.draftReviewer, Permission: repoPermission(t, s.repo, s.draftReviewer),
+		Since: since(), Limit: 50,
+	})
+
+	var draft *Event
+	for _, e := range events {
+		if e.Kind == KindComment && e.SourceID == s.draftComment {
+			draft = e
+		}
+	}
+	require.NotNil(t, draft)
+	assert.Equal(t, strconv.FormatInt(s.draftReview, 10), draft.Payload["review_id"])
+
+	// A comment that belongs to no review says so by carrying no such key, rather than by
+	// carrying a zero a client would have to know to ignore.
+	for _, e := range events {
+		if e.Kind == KindComment && e.SourceID == s.issueComment {
+			assert.NotContains(t, e.Payload, "review_id")
+		}
+	}
+}
+
+// A review request is not a review. AddReviewRequest writes a `review` row of ReviewTypeRequest
+// whose reviewer_id is the person who was asked, so surfacing it would report a review by someone
+// who has not reviewed - and ?actor= would match them for an act somebody else performed.
+func TestListDoesNotReportReviewRequestsAsReviews(t *testing.T) {
+	s := prepareStream(t)
+	request := &issues_model.Review{
+		Type:        issues_model.ReviewTypeRequest,
+		ReviewerID:  s.outsider.ID, // the person asked, not the person who asked
+		IssueID:     2,
+		CreatedUnix: streamBase + 45,
+	}
+	insertAt(t, request)
+
+	events, _ := listOrFail(t, &ListOptions{
+		Repo: s.repo, Doer: s.owner, Permission: repoPermission(t, s.repo, s.owner),
+		Since: since(), Limit: 50,
+	})
+	got := keysOf(events)
+	assert.NotContains(t, got, key(KindReview, request.ID))
+	assert.Contains(t, got, key(KindReview, s.review), "a submitted review is still reported")
+
+	events, _ = listOrFail(t, &ListOptions{
+		Repo: s.repo, Doer: s.owner, Permission: repoPermission(t, s.repo, s.owner),
+		Since: since(), ActorID: s.outsider.ID, Limit: 50,
+	})
+	assert.Empty(t, keysOf(events),
+		"the requested reviewer did nothing in this window and must not be credited with the request")
+}
+
+// `%` and `_` are LIKE's wildcards, and `q` is a term a repository reader typed rather than a
+// pattern they may write. Unescaped, `?q=%` matches every row of every source - a free full scan of
+// the two largest tables on the instance from anyone who can read one repository.
+func TestListDoesNotTreatQueryWildcardsAsPatterns(t *testing.T) {
+	s := prepareStream(t)
+	literal := &issues_model.Comment{
+		Type:        issues_model.CommentTypeComment,
+		PosterID:    s.owner.ID,
+		IssueID:     1,
+		Content:     "coverage went from 90% to 95%",
+		CreatedUnix: streamBase + 90,
+	}
+	insertAt(t, literal)
+
+	list := func(query string) []string {
+		events, _ := listOrFail(t, &ListOptions{
+			Repo: s.repo, Doer: s.owner, Permission: repoPermission(t, s.repo, s.owner),
+			Since: since(), Query: query, Limit: 50,
+		})
+		return keysOf(events)
+	}
+
+	assert.Equal(t, []string{key(KindComment, literal.ID)}, list("%"),
+		"?q=%% is a search for a per cent sign, not for everything")
+	// `_` matches any single character, so an unescaped one turns this into the query that
+	// finds "a hedgehog on the issue".
+	assert.Empty(t, list("a_hedgehog"))
+	assert.Equal(t, []string{key(KindComment, s.issueComment)}, list("a hedgehog"),
+		"escaping must not stop an ordinary term from matching")
+}
+
 func intersect(a, b []string) []string {
 	seen := make(map[string]bool, len(a))
 	for _, v := range a {
