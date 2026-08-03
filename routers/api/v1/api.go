@@ -400,8 +400,16 @@ func reqUsersExploreEnabled() func(ctx *context.APIContext) {
 //   - repository and organization Actions secrets, variables and runner registration tokens
 //     (addActionsRoutes), which are the same objects as their /user/* counterparts;
 //   - repository deploy keys, which are an SSH credential carrying repository write;
-//   - /admin/users and /admin/users/{username}/keys, which mint an account and an SSH key;
+//   - /admin/users and /admin/users/{username}/keys, which mint an account and an SSH key, and
+//     PATCH /admin/users/{username}, which sets the password, primary email, login source,
+//     site-admin flag and AllowGitHook on an account that already exists;
 //   - /admin/actions/runners/registration-token and /admin/runners/registration-token.
+//
+// The same test also catches artifacts that are not credentials this instance issued but grants of
+// standing access to a principal that already holds its own: adding a repository collaborator or an
+// organization team member lets that account in with its own password, PAT or SSH key afterwards,
+// so revoking the agent's key does not take the access away. Those two PUTs are guarded; the
+// matching DELETEs are not, because withdrawing access leaves nothing behind.
 //
 // Leaving those open would have made revocation complete only for account-level credentials: a
 // leaked key scoped write:repository for a user with admin on a repository could install a deploy
@@ -1378,8 +1386,16 @@ func Routes() *web.Router {
 				m.Group("/collaborators", func() {
 					m.Get("", reqAnyRepoReader(), repo.ListCollaborators)
 					m.Group("/{collaborator}", func() {
+						// reqHumanAuth() for the same reason as the deploy keys below: adding a
+						// collaborator grants a *different account* standing access to this
+						// repository, up to admin. That account reaches it with its own password,
+						// PAT or SSH key, none of which revoking the agent's Nostr key touches -
+						// the half-undo the deploy-key guard exists to prevent, reached at a lower
+						// bar. reqAdmin() cannot draw the line: it asks whether the agent user may
+						// manage collaborators, which a correctly-scoped agent for a repository
+						// admin may. Removing one grants nothing and stays open.
 						m.Combo("").Get(reqAnyRepoReader(), repo.IsCollaborator).
-							Put(reqAdmin(), bind(api.AddCollaboratorOption{}), repo.AddOrUpdateCollaborator).
+							Put(reqAdmin(), reqHumanAuth(), bind(api.AddCollaboratorOption{}), repo.AddOrUpdateCollaborator).
 							Delete(reqAdmin(), repo.DeleteCollaborator)
 						m.Get("/permission", repo.GetRepoPermissions)
 					})
@@ -1849,9 +1865,12 @@ func Routes() *web.Router {
 				Delete(reqToken(), reqOrgOwnership(), org.DeleteTeam)
 			m.Group("/members", func() {
 				m.Get("", reqToken(), org.GetTeamMembers)
+				// reqHumanAuth() on the PUT for the same reason as repository collaborators:
+				// team membership is standing access for a different account, held through that
+				// account's own credentials, and it survives revoking the key that granted it.
 				m.Combo("/{username}").
 					Get(reqToken(), org.GetTeamMember).
-					Put(reqToken(), reqOrgOwnership(), org.AddTeamMember).
+					Put(reqToken(), reqOrgOwnership(), reqHumanAuth(), org.AddTeamMember).
 					Delete(reqToken(), reqOrgOwnership(), org.RemoveTeamMember)
 			})
 			m.Group("/repos", func() {
@@ -1877,7 +1896,14 @@ func Routes() *web.Router {
 				// revoking the agent key that created it.
 				m.Post("", reqHumanAuth(), bind(api.CreateUserOption{}), admin.CreateUser)
 				m.Group("/{username}", func() {
-					m.Combo("").Patch(bind(api.EditUserOption{}), admin.EditUser).
+					// reqHumanAuth() on the PATCH for a stronger form of the same reason: it
+					// sets the password, the primary email, LoginName/LoginSource, IsAdmin and
+					// AllowGitHook on an *existing* account. Every one of those is a durable
+					// independent login that revoking the agent key does not take away - and
+					// taking over an existing administrator is strictly more than creating a
+					// fresh account, so guarding only the POST one line up would buy nothing.
+					// The DELETE stays open: it destroys, it does not leave a credential behind.
+					m.Combo("").Patch(reqHumanAuth(), bind(api.EditUserOption{}), admin.EditUser).
 						Delete(admin.DeleteUser)
 					// reqHumanAuth() for the same reason as /user/keys, one level up: this
 					// plants an SSH credential on an arbitrary account.

@@ -116,6 +116,30 @@ func (n *Nostr) Verify(req *http.Request, w http.ResponseWriter, store DataStore
 		return nil, ErrUserAuthMessage("invalid NIP-98 authorization")
 	}
 
+	// The human end of the ownership chain has to be checked too, and at authentication time
+	// rather than only when the row was written. An agent key is not an independent credential:
+	// it exists because a person vouched for it, and it is that person the trail holds
+	// accountable. So if the account that vouched is deactivated, barred from logging in, or
+	// gone, the vouching has stopped and the key must stop with it.
+	//
+	// Without this, deactivating a departing employee - the standard containment action, which
+	// does revoke their personal access tokens and SSH keys - would leave every agent they
+	// enrolled signing requests indefinitely. That is also the moment the trail becomes
+	// unreadable: ListOwnedAudit selects on owner_user_id and is reached as the owner, so an
+	// orphaned owner id means the credential turns unaccountable at exactly the point it turns
+	// uncontained.
+	owner := u
+	if key.OwnerUserID != u.ID {
+		if owner, err = user_model.GetUserByID(ctx, key.OwnerUserID); err != nil {
+			log.Error("Nostr Authorization: owner GetUserByID(%d): %v", key.OwnerUserID, err)
+			return nil, ErrUserAuthMessage("invalid NIP-98 authorization")
+		}
+	}
+	if !owner.IsActive || owner.ProhibitLogin {
+		log.Debug("Nostr Authorization: owner %d can no longer vouch for agent key %d", owner.ID, key.ID)
+		return nil, ErrUserAuthMessage("invalid NIP-98 authorization")
+	}
+
 	// Step 3: the body. Buffering it is the only step whose cost the caller chooses, so it
 	// waits until the request is known to come from a registered, unrevoked, eligible agent -
 	// and even then it is bounded by a number the operator set, because a registered key can
@@ -166,8 +190,11 @@ func (n *Nostr) Verify(req *http.Request, w http.ResponseWriter, store DataStore
 		return nil, ErrUserAuthMessage("could not record the agent audit event")
 	}
 	audit := &agent_model.AuditEvent{
-		AgentUserID:      u.ID,
-		OwnerUserID:      key.OwnerUserID,
+		AgentUserID: u.ID,
+		// The owner that was just checked, not the raw column: the row names an account this
+		// request proved was still able to vouch, so reading the trail back never turns up an
+		// owner id that authentication had already stopped honouring.
+		OwnerUserID:      owner.ID,
 		AgentKeyID:       key.ID,
 		EventID:          signed.EventID,
 		PubKey:           signed.PubKey,

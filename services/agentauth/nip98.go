@@ -63,6 +63,7 @@ var (
 	ErrWrongKind       = errors.New("authorization event is not kind 27235")
 	ErrURLMismatch     = errors.New("authorization event was signed for a different URL")
 	ErrMethodMismatch  = errors.New("authorization event was signed for a different method")
+	ErrMethodUnknown   = errors.New("authorization event was signed for an unrecognised HTTP method")
 	ErrPayloadMismatch = errors.New("authorization event was signed for a different body")
 	ErrStale           = errors.New("authorization event is outside the accepted time window")
 	ErrBadSignature    = errors.New("authorization event signature is invalid")
@@ -203,6 +204,18 @@ func VerifyCredential(req *http.Request, opts Options) (*SignedRequest, error) {
 	if signedMethod == "" {
 		return nil, fmt.Errorf("%w: missing `method` tag", ErrInvalidEvent)
 	}
+	// Only the methods RFC 9110 defines are honoured. Authentication runs before routing, so any
+	// RFC 7230 token an attacker cares to send arrives here - net/http does not restrict the
+	// method - and the accepted value is written verbatim into the audit trail. That column is
+	// narrow, so a long method (`VERSION-CONTROL`, `UNSUBSCRIBE`) either fails the insert, turning
+	// a request that deserved a 404 into a 500, or is silently truncated, after which the row's
+	// `method` column no longer matches the `method` tag its signature covers and an authentic row
+	// reads as tampered. Refusing the credential is the fix rather than a wider column, because
+	// none of those methods is routable here anyway: the request could only ever have ended in a
+	// 404 or 405, and this way it does so without spending a row.
+	if !isKnownHTTPMethod(signedMethod) {
+		return nil, fmt.Errorf("%w: signed for %q", ErrMethodUnknown, signedMethod)
+	}
 	if !strings.EqualFold(signedMethod, req.Method) {
 		return nil, fmt.Errorf("%w: signed for %s", ErrMethodMismatch, signedMethod)
 	}
@@ -258,6 +271,26 @@ func VerifyCredential(req *http.Request, opts Options) (*SignedRequest, error) {
 		Sig:           event.Sig,
 		signedPayload: strings.ToLower(tagValue(event.Tags, "payload")),
 	}, nil
+}
+
+// knownHTTPMethods is the set of request methods RFC 9110 defines, which is every method this
+// server routes. The longest is 7 characters, comfortably inside the audit trail's `method`
+// column; keeping the set and the column in step is the point of checking against it at all.
+var knownHTTPMethods = map[string]bool{
+	http.MethodGet:     true,
+	http.MethodHead:    true,
+	http.MethodPost:    true,
+	http.MethodPut:     true,
+	http.MethodPatch:   true,
+	http.MethodDelete:  true,
+	http.MethodConnect: true,
+	http.MethodOptions: true,
+	http.MethodTrace:   true,
+}
+
+// isKnownHTTPMethod reports whether an already upper-cased method is one of the RFC 9110 set.
+func isKnownHTTPMethod(method string) bool {
+	return knownHTTPMethods[method]
 }
 
 // isLowerHex reports whether s is exactly n lower-case hexadecimal characters.

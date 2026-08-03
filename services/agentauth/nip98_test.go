@@ -183,6 +183,19 @@ func TestVerify(t *testing.T) {
 			},
 			wantErr: ErrMethodMismatch,
 		},
+		// The audit trail stores the accepted method verbatim in a narrow column, so a method
+		// outside the RFC 9110 set is refused here rather than recorded. `VERSION-CONTROL` is a
+		// real RFC 3253 method and a legal RFC 9110 token, so net/http carries it happily; it is
+		// also 15 characters, which is what makes it the case worth pinning.
+		{
+			name:   "a method the server does not route is refused",
+			method: "VERSION-CONTROL",
+			url:    testURL,
+			header: func(t *testing.T) string {
+				return encodeHeader(t, signedEvent(t, EventKind, frozenNow, authTags(testURL, "VERSION-CONTROL", "")))
+			},
+			wantErr: ErrMethodUnknown,
+		},
 		{
 			name:   "stale created_at",
 			method: "GET",
@@ -321,6 +334,23 @@ func TestVerify(t *testing.T) {
 				assert.Empty(t, got.PayloadHash)
 			}
 		})
+	}
+}
+
+// The point of checking the method against a fixed set is that models/agent.AuditEvent stores it
+// in a VARCHAR(10), and a row is written for every accepted credential. If the two ever drift, the
+// symptom is not a rejected request: it is a 500 on a strict database, or a truncated column whose
+// value no longer matches the `method` tag the signature covers - an authentic audit row that
+// reads as forged. So assert the coupling here rather than trusting that nobody widens the set.
+func TestAcceptedMethodsFitTheAuditColumn(t *testing.T) {
+	// models/agent.AuditEvent.Method and models/migrations/v1_26/v327.go.
+	const auditMethodColumnWidth = 10
+
+	require.NotEmpty(t, knownHTTPMethods)
+	for method := range knownHTTPMethods {
+		assert.LessOrEqual(t, len(method), auditMethodColumnWidth,
+			"method %q does not fit agent_audit_event.method; widen the column in a migration or drop the method", method)
+		assert.Equal(t, strings.ToUpper(method), method, "the set is matched against an upper-cased tag")
 	}
 }
 

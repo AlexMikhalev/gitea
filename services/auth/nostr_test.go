@@ -409,6 +409,128 @@ func TestNostrVerifyOwnerIsNotTheAgent(t *testing.T) {
 	assert.Equal(t, key.ID, events[0].AgentKeyID)
 }
 
+// TestNostrVerifyOwnerMustStillBeEligible pins the other end of the ownership chain.
+//
+// An agent key is not an independent credential - it exists because a person vouched for it - so
+// containing that person has to contain their agents. Deactivating a departing employee is the
+// standard containment action and it already revokes their access tokens and SSH keys; if it left
+// their agents signing, the account would be shut out while the credentials it stood behind kept
+// working, and the audit trail keyed on owner_user_id would be pointing at a disabled account.
+func TestNostrVerifyOwnerMustStillBeEligible(t *testing.T) {
+	require.NoError(t, unittest.PrepareTestDatabase())
+	defer test.MockVariableValue(&setting.AppURL, "http://localhost:3000/")()
+
+	ctx := t.Context()
+
+	owner := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 1})
+	agentUser := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 4})
+	agentUser.IsAgent = true
+	require.NoError(t, user_model.UpdateUserCols(ctx, agentUser, "is_agent"))
+
+	const secretKey = "000000000000000000000000000000000000000000000000000000000000002f"
+	pubKeyHex, err := nostr.PubKeyFromSecretKey(secretKey)
+	require.NoError(t, err)
+	pubKey, npub, err := agent_model.PubKeyFromInput(pubKeyHex)
+	require.NoError(t, err)
+
+	key := &agent_model.Key{
+		OwnerUserID: owner.ID,
+		AgentUserID: agentUser.ID,
+		PubKey:      pubKey,
+		Npub:        npub,
+		Scope:       auth_model.AccessTokenScopeWriteIssue,
+	}
+	require.NoError(t, agent_model.RegisterKey(ctx, key))
+	require.NotEqual(t, key.OwnerUserID, key.AgentUserID, "this test is meaningless if they are equal")
+
+	const path = "/api/v1/repos/user2/repo1/issues"
+	const body = "signed while the owner is being offboarded"
+	fullURL := "http://localhost:3000" + path
+
+	signedRequest := func(nonce string) *http.Request {
+		return nostrTestRequest(t, "POST", path, body,
+			nostrSignedHeaderNonced(t, secretKey, "POST", fullURL, body, nonce))
+	}
+
+	// The agent user itself is untouched throughout: every refusal below is the owner's doing,
+	// which is the whole point.
+	cases := []struct {
+		name  string
+		col   string
+		apply func()
+		reset func()
+	}{
+		{
+			name: "a deactivated owner cannot vouch",
+			col:  "is_active",
+			apply: func() {
+				owner.IsActive = false
+				require.NoError(t, user_model.UpdateUserCols(ctx, owner, "is_active"))
+			},
+			reset: func() {
+				owner.IsActive = true
+				require.NoError(t, user_model.UpdateUserCols(ctx, owner, "is_active"))
+			},
+		},
+		{
+			name: "an owner barred from logging in cannot vouch",
+			col:  "prohibit_login",
+			apply: func() {
+				owner.ProhibitLogin = true
+				require.NoError(t, user_model.UpdateUserCols(ctx, owner, "prohibit_login"))
+			},
+			reset: func() {
+				owner.ProhibitLogin = false
+				require.NoError(t, user_model.UpdateUserCols(ctx, owner, "prohibit_login"))
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.apply()
+			defer tc.reset()
+
+			before, err := db.GetEngine(ctx).Count(&agent_model.AuditEvent{})
+			require.NoError(t, err)
+
+			u, err := (&Nostr{}).Verify(signedRequest(tc.col), nil, reqctx.ContextData{}, nil)
+			assert.Error(t, err)
+			assert.Nil(t, u)
+
+			after, err := db.GetEngine(ctx).Count(&agent_model.AuditEvent{})
+			require.NoError(t, err)
+			assert.Equal(t, before, after, "a refused credential must not append to the audit trail")
+		})
+	}
+
+	// A deleted owner is the same answer by a different route: the lookup fails rather than the
+	// eligibility check, and the request must still be refused rather than treated as unowned.
+	t.Run("an owner who no longer exists cannot vouch", func(t *testing.T) {
+		_, err := db.GetEngine(ctx).ID(key.ID).Cols("owner_user_id").
+			Update(&agent_model.Key{OwnerUserID: unittest.NonexistentID})
+		require.NoError(t, err)
+		defer func() {
+			_, err := db.GetEngine(ctx).ID(key.ID).Cols("owner_user_id").
+				Update(&agent_model.Key{OwnerUserID: owner.ID})
+			require.NoError(t, err)
+		}()
+
+		u, err := (&Nostr{}).Verify(signedRequest("missing-owner"), nil, reqctx.ContextData{}, nil)
+		assert.Error(t, err)
+		assert.Nil(t, u)
+	})
+
+	// And with the owner restored the identical request is accepted, so the refusals above are
+	// the owner's state and nothing else about the fixture.
+	t.Run("an eligible owner still vouches", func(t *testing.T) {
+		u, err := (&Nostr{}).Verify(signedRequest("owner-restored"), nil, reqctx.ContextData{}, nil)
+		require.NoError(t, err)
+		require.NotNil(t, u)
+		assert.Equal(t, agentUser.ID, u.ID)
+	})
+}
+
 func TestExpectedRequestURL(t *testing.T) {
 	defer test.MockVariableValue(&setting.AppURL, "https://gitea.example.com/")()
 
