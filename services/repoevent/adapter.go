@@ -346,6 +346,15 @@ func fetchComments(ctx context.Context, opts *fetchOptions) ([]*Event, error) {
 // updated_unix, so a dismissal re-reports the review at its new position carrying dismissed=true.
 // That is a duplicate a client can see and act on, and it is the direction worth failing in -
 // created_unix fails by making the event unreachable instead.
+//
+// The other mutation that could have moved it does not. CreateReview marks every earlier approve or
+// reject by the same reviewer on the same issue as dismissed when a new one is submitted
+// (models/issues/review.go), which happens on every re-approval rather than as a rare admin action.
+// That update is raw SQL precisely so it leaves updated_unix alone: it is not an act by the
+// superseded reviewer, and restamping would move a review submitted last January to now - past the
+// position a backfilling client had already walked, and out of the `?since=`/`?until=` window that
+// used to contain it. So a review's position moves only when something happened to it that a reader
+// should see again.
 const reviewTimeCol = "`review`.updated_unix"
 
 // fetchReviews reads published pull request reviews.

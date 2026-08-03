@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	auth_model "code.gitea.io/gitea/models/auth"
 	user_model "code.gitea.io/gitea/models/user"
 	api "code.gitea.io/gitea/modules/structs"
 	"code.gitea.io/gitea/modules/timeutil"
@@ -50,11 +51,16 @@ func ListRepoEvents(ctx *context.APIContext) {
 	//   author began drafting it - Gitea writes the row when the first draft line comment is
 	//   typed and publishes it later, and a stream ordered by the earlier second would place a
 	//   review behind a position readers had already passed. Dismissing a review reports it
-	//   again, at the dismissal's second, with `dismissed` set.
+	//   again, at the dismissal's second, with `dismissed` set. A review superseded by a later
+	//   one from the same reviewer is not reported again: it keeps its submission position and
+	//   its `dismissed` flag is set where it stands.
 	//
 	//   Visibility is per kind. Comments, reviews and statuses are filtered by the repository
 	//   unit they belong to (issues, pull requests, code), and the agent audit trail is
-	//   repository admins only. The action kind is filtered the way
+	//   repository admins only. When the caller is an access token, a kind is also dropped if
+	//   the token lacks the scope the endpoint owning that kind's rows requires: `comment`
+	//   needs `read:issue`, the scope `/repos/{owner}/{repo}/issues/comments` is behind. The
+	//   action kind is filtered the way
 	//   `/repos/{owner}/{repo}/activities/feeds` filters it - by access to the repository and by
 	//   the actor's own activity-privacy setting - and not by unit, so a reader with access to
 	//   only some units still sees this repository's activity rows.
@@ -150,6 +156,21 @@ func ListRepoEvents(ctx *context.APIContext) {
 		return
 	}
 
+	// After the 422s rather than before them: a caller whose token cannot reach the kind they
+	// asked for still wrote the rest of the request, and answering 200 to a malformed `since`
+	// because of their scopes would hide the parameter error behind an empty page.
+	if opts.Kinds, err = kindsWithinTokenScope(ctx, opts.Kinds); err != nil {
+		ctx.APIError(http.StatusForbidden, "checking scope failed: "+err.Error())
+		return
+	}
+	if len(opts.Kinds) == 0 {
+		// Every kind the caller asked for is outside their token's scopes. That is the empty
+		// stream, not a refusal, for the same reason the audit trail is absent rather than
+		// forbidden: the answer to "what may I see" is the stream itself.
+		ctx.JSON(http.StatusOK, &api.RepoEventList{Data: []*api.RepoEvent{}})
+		return
+	}
+
 	if actor := ctx.FormString("actor"); actor != "" {
 		user, err := user_model.GetUserByName(ctx, actor)
 		if err != nil {
@@ -188,6 +209,67 @@ func ListRepoEvents(ctx *context.APIContext) {
 		result.NextCursor = next.Encode()
 	}
 	ctx.JSON(http.StatusOK, result)
+}
+
+// kindScopeCategories names, per kind, the token scope category the endpoint that owns those rows
+// sits behind - for the kinds where that is more than this route's own gate.
+//
+// This route is registered inside the group closed by
+// tokenRequiresScopes(AccessTokenScopeCategoryRepository) (routers/api/v1/api.go), which is also
+// what `/pulls/{index}/reviews`, `/pulls/{index}/reviews/{id}/comments` and the commit status
+// endpoints sit behind - so `review` and `status` are already no wider here than at their own
+// endpoints, and the audit trail is narrower still (repository admin, enforced in the adapter).
+//
+// `comment` is the one that is wider. Plain issue and pull request comment bodies are owned by
+// `/repos/{owner}/{repo}/issues/comments` and `/issues/{index}/comments`, which are inside the
+// group closed by tokenRequiresScopes(AccessTokenScopeCategoryIssue). Without this a token
+// deliberately created with `read:repository` and *not* `read:issue` would read every comment body
+// in the repository off this endpoint - data that scope has no other route to. tokenRequiresScopes
+// is any-of, so naming both categories on the route would not draw this line; only the handler can.
+//
+// The whole kind goes rather than the issue-owned subset of it. A review's line comments are
+// reachable at repository scope, so dropping them too is stricter than the disclosure requires -
+// but "this kind is absent" is a rule a client can hold, and a comment kind that silently contains
+// some comment types and not others is not. Erring toward the narrower stream is also the direction
+// that fails safely.
+var kindScopeCategories = map[repoevent.Kind]auth_model.AccessTokenScopeCategory{
+	repoevent.KindComment: auth_model.AccessTokenScopeCategoryIssue,
+}
+
+// kindsWithinTokenScope drops the kinds the caller's token has no scope for, and expands "all
+// kinds" to the explicit list first - an empty ListOptions.Kinds means every kind, so a filter that
+// left it empty would widen the stream rather than narrow it.
+//
+// A caller who is not an access token (a session, basic auth, an Actions task) is unrestricted
+// here: scopes are a property of tokens, and there is nothing to check.
+func kindsWithinTokenScope(ctx *context.APIContext, kinds []repoevent.Kind) ([]repoevent.Kind, error) {
+	scope, ok := ctx.Data["ApiTokenScope"].(auth_model.AccessTokenScope)
+	if ctx.Data["IsApiToken"] != true || !ok {
+		return kinds, nil
+	}
+
+	requested := kinds
+	if len(requested) == 0 {
+		requested = repoevent.AllKinds
+	}
+	allowed := make([]repoevent.Kind, 0, len(requested))
+	for _, kind := range requested {
+		category, restricted := kindScopeCategories[kind]
+		if restricted {
+			// Read level: this route is GET only, so a write scope is not what is being
+			// asked for. GetRequiredScopes is the same mapping tokenRequiresScopes uses,
+			// so the two cannot drift apart on what "read:issue" is.
+			has, err := scope.HasScope(auth_model.GetRequiredScopes(auth_model.Read, category)...)
+			if err != nil {
+				return nil, err
+			}
+			if !has {
+				continue
+			}
+		}
+		allowed = append(allowed, kind)
+	}
+	return allowed, nil
 }
 
 // parseKinds reads the `kinds` parameter. An unknown kind is rejected rather than ignored: silently

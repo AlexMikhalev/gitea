@@ -361,9 +361,21 @@ func CreateReview(ctx context.Context, opts CreateReviewOptions) (*Review, error
 			}
 			// make sure if the created review gets dismissed no old review surface
 			// other types can be ignored, as they don't affect branch protection
+			//
+			// Raw SQL rather than a bean update, because a bean update restamps
+			// updated_unix on every row it touches - and that column is a review's
+			// position in the unified event stream (services/repoevent/adapter.go,
+			// reviewTimeCol). Superseding is not a new act by the superseded reviewer:
+			// it flips a flag on reviews submitted arbitrarily long ago, so restamping
+			// them would move each one to now, out of the historical window a reader
+			// had already walked past - the review would silently leave the stream on
+			// every re-approval. Dismissal still restamps, deliberately: that one is
+			// its own act and re-reports the review with dismissed set.
 			if opts.Type == ReviewTypeApprove || opts.Type == ReviewTypeReject {
-				if _, err := sess.Where(reviewCond.And(builder.In("type", ReviewTypeApprove, ReviewTypeReject))).
-					Cols("dismissed").Update(&Review{Dismissed: true}); err != nil {
+				if _, err := sess.Exec(
+					"UPDATE `review` SET dismissed=? WHERE reviewer_id=? AND issue_id=? AND type IN (?,?)",
+					true, opts.Reviewer.ID, opts.Issue.ID, int(ReviewTypeApprove), int(ReviewTypeReject),
+				); err != nil {
 					return nil, err
 				}
 			}

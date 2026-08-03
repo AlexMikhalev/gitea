@@ -643,6 +643,68 @@ func TestListStampsAReviewWithItsSubmission(t *testing.T) {
 	}
 }
 
+// A review that a later one supersedes stays where it was.
+//
+// Submitting an approve or a reject marks every earlier approve/reject by the same reviewer on the
+// same issue as dismissed (models/issues/review.go, CreateReview). That is a per-re-approval event,
+// not a rare admin action, and doing it through an xorm bean would restamp updated_unix on every
+// row it touched - the column this stream orders, pages and range-filters reviews by. A review
+// submitted long ago would then jump to now: a client backfilling newest-first has already walked
+// past that position and would never be handed the review at all, and the `?since=`/`?until=`
+// window that used to contain it no longer would.
+//
+// The window here is a real one rather than the 2033 band the rest of this file writes into,
+// because the failure is about a row leaving the window it was in.
+func TestListKeepsASupersededReviewInPlace(t *testing.T) {
+	s := prepareStream(t)
+
+	// user4 rather than user1, who already holds a pending review on issue 2 in the shipped
+	// fixtures - SubmitReview would reuse that one instead of taking the CreateReview path
+	// this test is about.
+	reviewer := s.outsider
+	issue := unittest.AssertExistsAndLoadBean(t, &issues_model.Issue{ID: 2})
+	require.NoError(t, issue.LoadRepo(t.Context()))
+
+	approvedAt := timeutil.TimeStamp(1_000_000_000)
+	first := &issues_model.Review{
+		Type:        issues_model.ReviewTypeApprove,
+		ReviewerID:  reviewer.ID,
+		IssueID:     issue.ID,
+		Content:     "approved long ago",
+		CreatedUnix: approvedAt,
+		UpdatedUnix: approvedAt,
+	}
+	insertAt(t, first)
+
+	from, to := approvedAt-1, approvedAt+1
+	inWindow := func() []string {
+		t.Helper()
+		events, _ := listOrFail(t, &ListOptions{
+			Repo: s.repo, Doer: s.owner, Permission: repoPermission(t, s.repo, s.owner),
+			Since: &from, Until: &to, Limit: MaxLimit,
+		})
+		return keysOf(events)
+	}
+	require.Contains(t, inWindow(), key(KindReview, first.ID),
+		"the review is not in its own window before anything has happened to it")
+
+	// The re-approval. Called rather than simulated: what is under test is which columns the
+	// supersede path writes, and a hand-built update would encode this test's belief about that.
+	again, _, err := issues_model.SubmitReview(t.Context(), reviewer, issue,
+		issues_model.ReviewTypeApprove, "approved again", "", false, nil)
+	require.NoError(t, err)
+	require.NotEqual(t, first.ID, again.ID, "SubmitReview reused the row instead of superseding it")
+
+	superseded := unittest.AssertExistsAndLoadBean(t, &issues_model.Review{ID: first.ID})
+	require.True(t, superseded.Dismissed,
+		"the supersede no longer happens at all - this test guards how it is written, not whether")
+	assert.Equal(t, approvedAt, superseded.UpdatedUnix,
+		"superseding restamped the review, moving its position in the stream")
+
+	assert.Contains(t, inWindow(), key(KindReview, first.ID),
+		"a superseded review left the historical window it was submitted in")
+}
+
 // The pair is in the shipped fixtures on its own, without this file writing anything: `review` 20
 // and `comment` 9 (review_id 20) are one submission at 946684810, and `review` 21 and `comment` 10
 // (review_id 21) are another. A window-scoped test cannot catch a regression here, because the rows

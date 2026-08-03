@@ -134,7 +134,11 @@ func TestAPIRepoEventStream(t *testing.T) {
 	since := writeEventStreamRows(t)
 	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
 	owner := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: repo.OwnerID})
-	token := getUserToken(t, owner.Name, auth_model.AccessTokenScopeReadRepository)
+	// Both scopes: the route is gated on read:repository, but the comment kind is served only to
+	// a token that also holds the scope the comment endpoints themselves sit behind - see
+	// TestAPIRepoEventStreamWithholdsCommentsFromARepositoryScopedToken.
+	token := getUserToken(t, owner.Name,
+		auth_model.AccessTokenScopeReadRepository, auth_model.AccessTokenScopeReadIssue)
 
 	t.Run("one page holds the window, newest first", func(t *testing.T) {
 		resp := MakeRequest(t, NewRequest(t, "GET",
@@ -269,7 +273,8 @@ func TestAPIRepoEventStreamHidesTheAuditTrailFromReaders(t *testing.T) {
 	reader := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 4})
 
 	kindsFor := func(user *user_model.User) []string {
-		token := getUserToken(t, user.Name, auth_model.AccessTokenScopeReadRepository)
+		token := getUserToken(t, user.Name,
+			auth_model.AccessTokenScopeReadRepository, auth_model.AccessTokenScopeReadIssue)
 		resp := MakeRequest(t, NewRequest(t, "GET",
 			eventStreamURL(t, owner.Name, repo.Name, url.Values{"since": {since}, "limit": {"50"}}),
 		).AddTokenAuth(token), http.StatusOK)
@@ -288,6 +293,54 @@ func TestAPIRepoEventStreamHidesTheAuditTrailFromReaders(t *testing.T) {
 	readerKinds := kindsFor(reader)
 	assert.NotContains(t, readerKinds, "agent_audit")
 	assert.Contains(t, readerKinds, "comment", "the rest of the stream is still served")
+}
+
+// The route sits behind tokenRequiresScopes(AccessTokenScopeCategoryRepository), but the endpoints
+// that own plain issue and pull request comment bodies - /issues/comments, /issues/{index}/comments -
+// sit behind AccessTokenScopeCategoryIssue. A token deliberately created with read:repository and
+// not read:issue must therefore not read comment bodies off this endpoint: they are data that scope
+// has no other route to, and /activities/feeds (the same scope) leaks only a 200-character excerpt.
+func TestAPIRepoEventStreamWithholdsCommentsFromARepositoryScopedToken(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+
+	since := writeEventStreamRows(t)
+	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+	owner := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: repo.OwnerID})
+
+	listWith := func(t *testing.T, params url.Values, scopes ...auth_model.AccessTokenScope) api.RepoEventList {
+		t.Helper()
+		token := getUserToken(t, owner.Name, scopes...)
+		resp := MakeRequest(t, NewRequest(t, "GET",
+			eventStreamURL(t, owner.Name, repo.Name, params),
+		).AddTokenAuth(token), http.StatusOK)
+		var list api.RepoEventList
+		DecodeJSON(t, resp, &list)
+		return list
+	}
+
+	window := url.Values{"since": {since}, "limit": {"50"}}
+
+	repoOnly := listWith(t, window, auth_model.AccessTokenScopeReadRepository)
+	assert.NotContains(t, eventKinds(&repoOnly), "comment",
+		"a read:repository token was handed issue comment bodies")
+	for _, event := range repoOnly.Data {
+		assert.NotEqual(t, "a hedgehog on the issue", event.Payload["content"])
+	}
+	// The rest of the stream is still served rather than the request refused: review, status
+	// and the audit trail are owned by endpoints inside the same repository-scoped group.
+	assert.Equal(t, []string{"status", "agent_audit", "review", "action"}, eventKinds(&repoOnly))
+
+	withIssue := listWith(t, window,
+		auth_model.AccessTokenScopeReadRepository, auth_model.AccessTokenScopeReadIssue)
+	assert.Contains(t, eventKinds(&withIssue), "comment",
+		"read:issue is what the comment kind is withheld for, so it has to bring it back")
+
+	// Asking for only the withheld kind is the empty stream, not the whole stream: an empty
+	// kinds list means *every* kind one layer down, so this is where that would go wrong.
+	onlyComments := listWith(t, url.Values{"since": {since}, "kinds": {"comment"}},
+		auth_model.AccessTokenScopeReadRepository)
+	assert.Empty(t, onlyComments.Data)
+	assert.Empty(t, onlyComments.NextCursor)
 }
 
 // The route is behind reqToken(): an anonymous caller gets 401 rather than an anonymous view of the
