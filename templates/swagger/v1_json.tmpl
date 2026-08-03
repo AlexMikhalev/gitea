@@ -1339,7 +1339,7 @@
         "tags": [
           "agent"
         ],
-        "summary": "List the Nostr keys the authenticated user has registered",
+        "summary": "List the Nostr keys the authenticated user registered, and those registered for them",
         "operationId": "agentListKeys",
         "responses": {
           "200": {
@@ -1377,6 +1377,9 @@
           },
           "403": {
             "$ref": "#/responses/forbidden"
+          },
+          "409": {
+            "$ref": "#/responses/conflict"
           },
           "422": {
             "$ref": "#/responses/validationError"
@@ -22010,7 +22013,7 @@
       "x-go-package": "code.gitea.io/gitea/modules/structs"
     },
     "AgentAuditEvent": {
-      "description": "It records authentication, not authorization: the row is written before the request reaches\nits handler so that nothing an agent signs can happen unlogged. Whether the request was then\npermitted, and whether it worked, is in ResponseStatus.",
+      "description": "It records authentication, not authorization: the row is written before the request reaches\nits handler so that nothing an agent signs can happen unlogged. Whether the request was then\npermitted, and whether it worked, is in ResponseStatus.\n\nThe signed event is returned in full - created_at, kind, nonce, tags, content and the\nsignature - so that a client can re-derive EventID and check the signature against PublicKey\nwithout trusting this server's copy of the summary fields. An entry that cannot be verified\nthat way was altered after it was written.",
       "type": "object",
       "title": "AgentAuditEvent is one NIP-98 signed request that authenticated successfully.",
       "properties": {
@@ -22029,9 +22032,37 @@
           "format": "date-time",
           "x-go-name": "Created"
         },
+        "event_content": {
+          "description": "The event's content, empty for a NIP-98 authorization event.",
+          "type": "string",
+          "x-go-name": "EventContent"
+        },
+        "event_created_at": {
+          "description": "The event's own created_at, in seconds since the Unix epoch. This is what the signature\ncovers, and is not the same as CreatedAt below, which is when the server stored the row.",
+          "type": "integer",
+          "format": "int64",
+          "x-go-name": "EventCreatedAt"
+        },
         "event_id": {
           "type": "string",
           "x-go-name": "EventID"
+        },
+        "event_kind": {
+          "description": "The NIP-01 kind, 27235 for every NIP-98 authorization event.",
+          "type": "integer",
+          "format": "int64",
+          "x-go-name": "EventKind"
+        },
+        "event_tags": {
+          "description": "The event's full NIP-01 tag list, in the order the signature covers.",
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "x-go-name": "EventTags"
         },
         "id": {
           "type": "integer",
@@ -22041,6 +22072,11 @@
         "method": {
           "type": "string",
           "x-go-name": "Method"
+        },
+        "nonce": {
+          "description": "The event's nonce tag, which is what makes two otherwise identical requests distinct events.",
+          "type": "string",
+          "x-go-name": "Nonce"
         },
         "owner_user_id": {
           "type": "integer",
@@ -22070,6 +22106,11 @@
           "type": "integer",
           "format": "int64",
           "x-go-name": "ResponseStatus"
+        },
+        "signature": {
+          "description": "Hex BIP-340 signature over EventID by PublicKey.",
+          "type": "string",
+          "x-go-name": "Signature"
         }
       },
       "x-go-package": "code.gitea.io/gitea/modules/structs"

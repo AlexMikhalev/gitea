@@ -393,8 +393,33 @@ func reqUsersExploreEnabled() func(ctx *context.APIContext) {
 // both qualify. /users/{username}/tokens needs no guard here - it is already behind
 // reqBasicOrRevProxyAuth(), which a signature cannot satisfy.
 //
-// What this does *not* contain is anything an agent's scopes legitimately permit inside a
-// repository or organization: containment here is about credentials, not about limiting what a
+// That test is about the *artifact*, not about which path reaches it, so the guard follows the
+// artifact classes wherever they are exposed rather than stopping at /user/*. The identical
+// classes are reachable one level down and are guarded there too:
+//
+//   - repository and organization Actions secrets, variables and runner registration tokens
+//     (addActionsRoutes), which are the same objects as their /user/* counterparts;
+//   - repository deploy keys, which are an SSH credential carrying repository write;
+//   - /admin/users and /admin/users/{username}/keys, which mint an account and an SSH key;
+//   - /admin/actions/runners/registration-token and /admin/runners/registration-token.
+//
+// Leaving those open would have made revocation complete only for account-level credentials: a
+// leaked key scoped write:repository for a user with admin on a repository could install a deploy
+// key, and revoking the Nostr key would not take it away again. "A correctly-scoped agent may do
+// what its scope allows" does not distinguish these from /user/keys, which write:user allows just
+// as legitimately - so it cannot be the line.
+//
+// On the Actions routes the line is drawn at planting rather than at reading: a GET is guarded
+// only where reading is equivalent to minting (a runner registration token is usable by whoever
+// reads it), while listing variables or secret names leaves nothing behind that outlives
+// revocation and stays open. The key groups are guarded wholesale instead, following the
+// precedent /user/keys already set: they are small, and the read tells an agent which credentials
+// it would have to displace.
+//
+// None of this narrows a personal access token: the guard tests the authentication method, so a
+// PAT or session with the same scopes reaches every one of these endpoints exactly as before.
+// What it does *not* contain is anything else an agent's scopes legitimately permit inside a
+// repository or organization - containment here is about credentials, not about limiting what a
 // correctly-scoped agent may do.
 func reqHumanAuth() func(ctx *context.APIContext) {
 	return func(ctx *context.APIContext) {
@@ -990,27 +1015,34 @@ func Routes() *web.Router {
 		reqChecker func(ctx *context.APIContext),
 		act actions.API,
 	) {
+		// reqHumanAuth() on the writes below: these routes are registered for both repositories
+		// and organizations, and the objects they manage are the same artifact classes that are
+		// kept out of an agent signature's reach at /user/actions (see reqHumanAuth). A secret or
+		// a variable planted here is handed to every subsequent workflow run of that repository or
+		// organization, and a runner registration token yields an independent long-lived
+		// credential - none of which revoking the agent key undoes. The reads are left alone
+		// except for the registration token, where reading is minting.
 		m.Group("/actions", func() {
 			m.Group("/secrets", func() {
 				m.Get("", reqToken(), reqChecker, act.ListActionsSecrets)
 				m.Combo("/{secretname}").
-					Put(reqToken(), reqChecker, bind(api.CreateOrUpdateSecretOption{}), act.CreateOrUpdateSecret).
-					Delete(reqToken(), reqChecker, act.DeleteSecret)
+					Put(reqToken(), reqChecker, reqHumanAuth(), bind(api.CreateOrUpdateSecretOption{}), act.CreateOrUpdateSecret).
+					Delete(reqToken(), reqChecker, reqHumanAuth(), act.DeleteSecret)
 			})
 
 			m.Group("/variables", func() {
 				m.Get("", reqToken(), reqChecker, act.ListVariables)
 				m.Combo("/{variablename}").
 					Get(reqToken(), reqChecker, act.GetVariable).
-					Delete(reqToken(), reqChecker, act.DeleteVariable).
-					Post(reqToken(), reqChecker, bind(api.CreateVariableOption{}), act.CreateVariable).
-					Put(reqToken(), reqChecker, bind(api.UpdateVariableOption{}), act.UpdateVariable)
+					Delete(reqToken(), reqChecker, reqHumanAuth(), act.DeleteVariable).
+					Post(reqToken(), reqChecker, reqHumanAuth(), bind(api.CreateVariableOption{}), act.CreateVariable).
+					Put(reqToken(), reqChecker, reqHumanAuth(), bind(api.UpdateVariableOption{}), act.UpdateVariable)
 			})
 
 			m.Group("/runners", func() {
 				m.Get("", reqToken(), reqChecker, act.ListRunners)
-				m.Get("/registration-token", reqToken(), reqChecker, act.GetRegistrationToken)
-				m.Post("/registration-token", reqToken(), reqChecker, act.CreateRegistrationToken)
+				m.Get("/registration-token", reqToken(), reqChecker, reqHumanAuth(), act.GetRegistrationToken)
+				m.Post("/registration-token", reqToken(), reqChecker, reqHumanAuth(), act.CreateRegistrationToken)
 				m.Get("/{runner_id}", reqToken(), reqChecker, act.GetRunner)
 				m.Delete("/{runner_id}", reqToken(), reqChecker, act.DeleteRunner)
 			})
@@ -1154,13 +1186,19 @@ func Routes() *web.Router {
 						Delete(user.DeleteSecret)
 				}, reqHumanAuth())
 
+				// reqHumanAuth() on the writes for the same reason as /secrets above: the
+				// difference between a user-level Actions variable and a user-level Actions
+				// secret is confidentiality, not persistence, and persistence is what this
+				// guard is about. A variable written here is read by every subsequent workflow
+				// run for the account and survives revoking the key that wrote it. Reading one
+				// leaves nothing behind, so the GETs stay open.
 				m.Group("/variables", func() {
 					m.Get("", user.ListVariables)
 					m.Combo("/{variablename}").
 						Get(user.GetVariable).
-						Delete(user.DeleteVariable).
-						Post(bind(api.CreateVariableOption{}), user.CreateVariable).
-						Put(bind(api.UpdateVariableOption{}), user.UpdateVariable)
+						Delete(reqHumanAuth(), user.DeleteVariable).
+						Post(reqHumanAuth(), bind(api.CreateVariableOption{}), user.CreateVariable).
+						Put(reqHumanAuth(), bind(api.UpdateVariableOption{}), user.UpdateVariable)
 				})
 
 				m.Group("/runners", func() {
@@ -1410,12 +1448,17 @@ func Routes() *web.Router {
 					})
 					m.Get("/artifacts/{artifact_id}/zip", repo.DownloadArtifact)
 				}, reqRepoReader(unit.TypeActions), context.ReferencesGitRepo(true))
+				// reqHumanAuth() for the same reason it guards /user/keys: a deploy key is an SSH
+				// credential with write access to this repository, and it outlives the Nostr key
+				// that installed it - revoking the agent key leaves the deploy key working.
+				// reqAdmin() does not substitute for this: it asks whether the *agent user* may
+				// manage deploy keys, which a correctly-scoped agent for a repository admin may.
 				m.Group("/keys", func() {
 					m.Combo("").Get(repo.ListDeployKeys).
 						Post(bind(api.CreateKeyOption{}), repo.CreateDeployKey)
 					m.Combo("/{id}").Get(repo.GetDeployKey).
 						Delete(repo.DeleteDeploykey)
-				}, reqToken(), reqAdmin())
+				}, reqToken(), reqAdmin(), reqHumanAuth())
 				m.Group("/times", func() {
 					m.Combo("").Get(repo.ListTrackedTimesByRepository)
 					m.Combo("/{timetrackingusername}").Get(repo.ListTrackedTimesByUser)
@@ -1829,14 +1872,19 @@ func Routes() *web.Router {
 			m.Get("/orgs", admin.GetAllOrgs)
 			m.Group("/users", func() {
 				m.Get("", admin.SearchUsers)
-				m.Post("", bind(api.CreateUserOption{}), admin.CreateUser)
+				// reqHumanAuth(): creating a user creates a whole independent login, which is
+				// the most durable credential on the instance and is entirely unaffected by
+				// revoking the agent key that created it.
+				m.Post("", reqHumanAuth(), bind(api.CreateUserOption{}), admin.CreateUser)
 				m.Group("/{username}", func() {
 					m.Combo("").Patch(bind(api.EditUserOption{}), admin.EditUser).
 						Delete(admin.DeleteUser)
+					// reqHumanAuth() for the same reason as /user/keys, one level up: this
+					// plants an SSH credential on an arbitrary account.
 					m.Group("/keys", func() {
 						m.Post("", bind(api.CreateKeyOption{}), admin.CreatePublicKey)
 						m.Delete("/{id}", admin.DeleteUserPublicKey)
-					})
+					}, reqHumanAuth())
 					m.Get("/orgs", org.ListUserOrgs)
 					m.Post("/orgs", bind(api.CreateOrgOption{}), admin.CreateOrg)
 					m.Post("/repos", bind(api.CreateRepoOption{}), admin.CreateRepo)
@@ -1862,10 +1910,15 @@ func Routes() *web.Router {
 					Patch(bind(api.EditHookOption{}), admin.EditHook).
 					Delete(admin.DeleteHook)
 			})
+			// reqHumanAuth() on both registration-token routes, for the reason given at
+			// /user/actions/runners: the token registers a runner that holds a long-lived
+			// credential of its own and executes workflow jobs, and an instance-level runner
+			// executes them for every repository. Reading the current token is as good as
+			// minting one, so the GET is guarded too.
 			m.Group("/actions", func() {
 				m.Group("/runners", func() {
 					m.Get("", admin.ListRunners)
-					m.Post("/registration-token", admin.CreateRegistrationToken)
+					m.Post("/registration-token", reqHumanAuth(), admin.CreateRegistrationToken)
 					m.Get("/{runner_id}", admin.GetRunner)
 					m.Delete("/{runner_id}", admin.DeleteRunner)
 				})
@@ -1873,7 +1926,7 @@ func Routes() *web.Router {
 				m.Get("/jobs", admin.ListWorkflowJobs)
 			})
 			m.Group("/runners", func() {
-				m.Get("/registration-token", admin.GetRegistrationToken)
+				m.Get("/registration-token", reqHumanAuth(), admin.GetRegistrationToken)
 			})
 		}, tokenRequiresScopes(auth_model.AccessTokenScopeCategoryAdmin), reqToken(), reqSiteAdmin())
 

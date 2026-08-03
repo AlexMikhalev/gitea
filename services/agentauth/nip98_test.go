@@ -88,7 +88,7 @@ func verifyWholeRequest(req *http.Request, opts Options) (*SignedRequest, error)
 	if err != nil {
 		return nil, err
 	}
-	if err := signed.VerifyPayload(req); err != nil {
+	if err := signed.VerifyPayload(req, DefaultMaxBodySize); err != nil {
 		return nil, err
 	}
 	return signed, nil
@@ -359,7 +359,7 @@ func TestVerifyCredentialDoesNotTouchTheBody(t *testing.T) {
 	assert.Empty(t, signed.PayloadHash, "the payload hash cannot be known before the body is read")
 
 	// And the second half really does read it, so the first half is not silently doing nothing.
-	require.NoError(t, signed.VerifyPayload(req))
+	require.NoError(t, signed.VerifyPayload(req, DefaultMaxBodySize))
 	assert.NotZero(t, counting.n)
 	assert.NotEmpty(t, signed.PayloadHash)
 }
@@ -380,7 +380,7 @@ func TestVerifyCredentialRejectsBeforeTheBodyOnABadSignature(t *testing.T) {
 	assert.Zero(t, counting.n, "a request with an invalid signature was buffered anyway")
 }
 
-// MaxBodySize is declared as a bound; check that it actually binds, both when the caller
+// The body cap is declared as a bound; check that it actually binds, both when the caller
 // advertises an oversized body and when it lies about the length and streams one anyway.
 func TestVerifyPayloadRejectsAnOversizedBody(t *testing.T) {
 	header := encodeHeader(t, signedEvent(t, EventKind, frozenNow, authTags(testURL, "POST", "x")))
@@ -390,23 +390,23 @@ func TestVerifyPayloadRejectsAnOversizedBody(t *testing.T) {
 		req, err := http.NewRequest(http.MethodPost, testURL, counting)
 		require.NoError(t, err)
 		req.Header.Set("Authorization", header)
-		req.ContentLength = MaxBodySize + 1
+		req.ContentLength = DefaultMaxBodySize + 1
 
 		signed, err := VerifyCredential(req, Options{ExpectedURL: testURL, Now: frozenNow})
 		require.NoError(t, err)
-		assert.ErrorIs(t, signed.VerifyPayload(req), ErrBodyTooLarge)
+		assert.ErrorIs(t, signed.VerifyPayload(req, DefaultMaxBodySize), ErrBodyTooLarge)
 		assert.Zero(t, counting.n, "an over-length body should be refused on the header alone")
 	})
 
 	t.Run("undeclared body longer than the cap", func(t *testing.T) {
-		req, err := http.NewRequest(http.MethodPost, testURL, io.LimitReader(zeroReader{}, MaxBodySize+10))
+		req, err := http.NewRequest(http.MethodPost, testURL, io.LimitReader(zeroReader{}, DefaultMaxBodySize+10))
 		require.NoError(t, err)
 		req.Header.Set("Authorization", header)
 		req.ContentLength = -1
 
 		signed, err := VerifyCredential(req, Options{ExpectedURL: testURL, Now: frozenNow})
 		require.NoError(t, err)
-		assert.ErrorIs(t, signed.VerifyPayload(req), ErrBodyTooLarge)
+		assert.ErrorIs(t, signed.VerifyPayload(req, DefaultMaxBodySize), ErrBodyTooLarge)
 	})
 }
 

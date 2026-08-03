@@ -11,6 +11,7 @@ import (
 
 	agent_model "code.gitea.io/gitea/models/agent"
 	user_model "code.gitea.io/gitea/models/user"
+	"code.gitea.io/gitea/modules/json"
 	"code.gitea.io/gitea/modules/log"
 	"code.gitea.io/gitea/modules/setting"
 	"code.gitea.io/gitea/modules/timeutil"
@@ -116,14 +117,16 @@ func (n *Nostr) Verify(req *http.Request, w http.ResponseWriter, store DataStore
 	}
 
 	// Step 3: the body. Buffering it is the only step whose cost the caller chooses, so it
-	// waits until the request is known to come from a registered, unrevoked, eligible agent.
-	if err := signed.VerifyPayload(req); err != nil {
+	// waits until the request is known to come from a registered, unrevoked, eligible agent -
+	// and even then it is bounded by a number the operator set, because a registered key can
+	// still have N requests in flight and each one holds its buffer resident.
+	if err := signed.VerifyPayload(req, setting.Agent.MaxRequestBodySize); err != nil {
 		// A body over the limit is not a rejected credential, and saying so would send the
 		// operator hunting for a key or clock problem they do not have. It is the one payload
 		// failure whose reason is safe to state: the caller already knows how big their request
 		// was, so naming it tells an attacker nothing they did not supply themselves.
 		if errors.Is(err, agentauth.ErrBodyTooLarge) {
-			log.Debug("Nostr Authorization: body exceeds the %d byte NIP-98 limit", agentauth.MaxBodySize)
+			log.Debug("Nostr Authorization: body exceeds the %d byte NIP-98 limit", setting.Agent.MaxRequestBodySize)
 			return nil, ErrUserAuthStatus{
 				Status:  http.StatusRequestEntityTooLarge,
 				Message: "request body is too large to authorize with NIP-98",
@@ -149,15 +152,34 @@ func (n *Nostr) Verify(req *http.Request, w http.ResponseWriter, store DataStore
 	// The audit row is written now, not after the handler, so that a signed request can never
 	// be performed unlogged: if this insert fails the request is refused. What the request went
 	// on to do is attached to the row later by the audit middleware in routers/api/v1.
+	//
+	// The whole event goes in, not a summary of it. A row holding only the event id records an
+	// identifier that nothing can be checked against: the id is a hash of fields the row did not
+	// keep, so no reader - not the audit endpoints, not an operator with a SQL prompt - could
+	// tell an authentic row from one that had been edited afterwards. With created_at, the kind,
+	// the tags, the content and the signature stored alongside, models/agent.VerifyEvent
+	// re-derives the id and re-checks the signature against the recorded pubkey, so altering
+	// what the trail says an agent did means forging the agent's key.
+	tags, err := json.Marshal(signed.Tags)
+	if err != nil {
+		log.Error("Nostr Authorization: cannot serialize event tags: %v", err)
+		return nil, ErrUserAuthMessage("could not record the agent audit event")
+	}
 	audit := &agent_model.AuditEvent{
-		AgentUserID: u.ID,
-		OwnerUserID: key.OwnerUserID,
-		AgentKeyID:  key.ID,
-		EventID:     signed.EventID,
-		PubKey:      signed.PubKey,
-		Method:      signed.Method,
-		RequestURL:  signed.RequestURL,
-		PayloadHash: signed.PayloadHash,
+		AgentUserID:      u.ID,
+		OwnerUserID:      key.OwnerUserID,
+		AgentKeyID:       key.ID,
+		EventID:          signed.EventID,
+		PubKey:           signed.PubKey,
+		Method:           signed.Method,
+		RequestURL:       signed.RequestURL,
+		PayloadHash:      signed.PayloadHash,
+		EventCreatedUnix: timeutil.TimeStamp(signed.CreatedAt.Unix()),
+		EventKind:        signed.Kind,
+		Nonce:            signed.Nonce,
+		EventTags:        string(tags),
+		EventContent:     signed.Content,
+		Sig:              signed.Sig,
 	}
 	if err := agent_model.InsertAuditEvent(ctx, audit); err != nil {
 		log.Error("Nostr Authorization: InsertAuditEvent: %v", err)

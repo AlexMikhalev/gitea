@@ -11,6 +11,8 @@ import (
 	auth_model "code.gitea.io/gitea/models/auth"
 	"code.gitea.io/gitea/models/db"
 	"code.gitea.io/gitea/models/unittest"
+	"code.gitea.io/gitea/modules/json"
+	"code.gitea.io/gitea/modules/nostr"
 	"code.gitea.io/gitea/modules/timeutil"
 	"code.gitea.io/gitea/modules/util"
 
@@ -27,6 +29,54 @@ const (
 // Any valid scope will do for the tests that are not about scopes; what matters is that one is
 // present, because RegisterKey refuses a key without.
 const testScope = auth_model.AccessTokenScopeWriteIssue
+
+// An arbitrary secret key, used to mint real signatures below. It is not the counterpart of
+// specPubKeyHex: the audit rows have to be signed by *something* whose signature verifies, and
+// the NIP-19 vector above is a public key with no published secret.
+const testSecretKeyHex = "1111111111111111111111111111111111111111111111111111111111111111"
+
+// signedAuditEvent mints a genuinely signed NIP-98 event and returns it projected onto an audit
+// row, the way services/auth does for a real request.
+//
+// The tests build rows this way rather than from made-up strings because InsertAuditEvent now
+// refuses a row whose stored fields do not re-derive its event id - which is the property that
+// makes the trail checkable, and would be untested if every fixture sidestepped it. nonce is
+// varied per call for the same reason a real client varies it: without it two rows built in the
+// same second are the same event.
+func signedAuditEvent(t *testing.T, keyID, repoID int64, nonce, requestURL string) *AuditEvent {
+	t.Helper()
+
+	event := &nostr.Event{
+		CreatedAt: nostr.Now(),
+		Kind:      27235,
+		Tags: nostr.Tags{
+			{"u", requestURL},
+			{"method", "POST"},
+			{"nonce", nonce},
+		},
+	}
+	require.NoError(t, event.Sign(testSecretKeyHex))
+
+	tags, err := json.Marshal(event.Tags)
+	require.NoError(t, err)
+
+	return &AuditEvent{
+		RepoID:           repoID,
+		AgentUserID:      2,
+		OwnerUserID:      1,
+		AgentKeyID:       keyID,
+		EventID:          event.ID,
+		PubKey:           event.PubKey,
+		Method:           "POST",
+		RequestURL:       requestURL,
+		EventCreatedUnix: timeutil.TimeStamp(event.CreatedAt),
+		EventKind:        event.Kind,
+		Nonce:            nonce,
+		EventTags:        string(tags),
+		EventContent:     event.Content,
+		Sig:              event.Sig,
+	}
+}
 
 func TestPubKeyFromInput(t *testing.T) {
 	t.Run("hex in, npub derived", func(t *testing.T) {
@@ -133,16 +183,8 @@ func TestAuditEventsAreRepoScoped(t *testing.T) {
 	require.NoError(t, RegisterKey(ctx, key))
 
 	for i, repoID := range []int64{1, 1, 2} {
-		require.NoError(t, InsertAuditEvent(ctx, &AuditEvent{
-			RepoID:      repoID,
-			AgentUserID: 2,
-			OwnerUserID: 1,
-			AgentKeyID:  key.ID,
-			EventID:     fmt.Sprintf("%063d%d", 0, i),
-			PubKey:      specPubKeyHex,
-			Method:      "POST",
-			RequestURL:  "https://gitea.example.com/api/v1/repos/x/y/issues",
-		}))
+		require.NoError(t, InsertAuditEvent(ctx, signedAuditEvent(t, key.ID, repoID,
+			fmt.Sprintf("scoped-%d", i), "https://gitea.example.com/api/v1/repos/x/y/issues")))
 	}
 
 	events, total, err := FindAuditEvents(ctx, FindAuditEventsOptions{ListOptions: db.ListOptionsAll, RepoID: 1})
@@ -252,15 +294,7 @@ func TestRecordAuditOutcome(t *testing.T) {
 	key := &Key{OwnerUserID: 1, AgentUserID: 2, PubKey: specPubKeyHex, Scope: testScope}
 	require.NoError(t, RegisterKey(ctx, key))
 
-	event := &AuditEvent{
-		AgentUserID: 2,
-		OwnerUserID: 1,
-		AgentKeyID:  key.ID,
-		EventID:     strings.Repeat("5", 64),
-		PubKey:      specPubKeyHex,
-		Method:      "POST",
-		RequestURL:  "https://gitea.example.com/api/v1/repos/x/y/issues",
-	}
+	event := signedAuditEvent(t, key.ID, 0, "outcome", "https://gitea.example.com/api/v1/repos/x/y/issues")
 	require.NoError(t, InsertAuditEvent(ctx, event))
 	assert.Zero(t, event.ResponseStatus)
 
@@ -295,15 +329,69 @@ func TestAuditEventIDIsUnique(t *testing.T) {
 	key := &Key{OwnerUserID: 1, AgentUserID: 2, PubKey: specPubKeyHex, Scope: testScope}
 	require.NoError(t, RegisterKey(ctx, key))
 
-	row := func() *AuditEvent {
-		return &AuditEvent{
-			AgentUserID: 2, OwnerUserID: 1, AgentKeyID: key.ID,
-			EventID: strings.Repeat("6", 64), PubKey: specPubKeyHex, Method: "POST",
-			RequestURL: "https://gitea.example.com/api/v1/repos/x/y/issues",
-		}
-	}
-	require.NoError(t, InsertAuditEvent(ctx, row()))
-	assert.Error(t, InsertAuditEvent(ctx, row()))
+	// The same nonce and the same second give the same event id, which is exactly the collision
+	// the unique index has to refuse.
+	first := signedAuditEvent(t, key.ID, 0, "duplicate", "https://gitea.example.com/api/v1/repos/x/y/issues")
+	second := *first
+	require.NoError(t, InsertAuditEvent(ctx, first))
+	assert.Error(t, InsertAuditEvent(ctx, &second))
+}
+
+// The trail's central claim is that a row can be checked against itself. Both halves are asserted
+// here: a row as written verifies, and the same row with its recorded method or URL edited - the
+// two columns a reader actually trusts - does not.
+func TestAuditEventVerifiesAgainstItsOwnSignature(t *testing.T) {
+	require.NoError(t, unittest.PrepareTestDatabase())
+	ctx := t.Context()
+
+	key := &Key{OwnerUserID: 1, AgentUserID: 2, PubKey: specPubKeyHex, Scope: testScope}
+	require.NoError(t, RegisterKey(ctx, key))
+
+	const url = "https://gitea.example.com/api/v1/repos/x/y/issues"
+	event := signedAuditEvent(t, key.ID, 1, "verifiable", url)
+	require.NoError(t, InsertAuditEvent(ctx, event))
+
+	stored := new(AuditEvent)
+	has, err := db.GetEngine(ctx).ID(event.ID).Get(stored)
+	require.NoError(t, err)
+	require.True(t, has)
+	require.NoError(t, stored.VerifyEvent(), "a row must verify as read back out of the database")
+
+	tampered := *stored
+	tampered.Method = "GET"
+	assert.Error(t, tampered.VerifyEvent(), "an edited method must not verify")
+
+	tampered = *stored
+	tampered.RequestURL = "https://gitea.example.com/api/v1/repos/x/y/harmless"
+	assert.Error(t, tampered.VerifyEvent(), "an edited url must not verify")
+
+	tampered = *stored
+	tampered.Sig = strings.Repeat("0", len(tampered.Sig))
+	assert.Error(t, tampered.VerifyEvent(), "a row whose signature was replaced must not verify")
+
+	// The URL comparison is on the normalized form, not byte-for-byte, so a row storing the
+	// normalized URL for a tag that was not already normalized still verifies.
+	equivalent := *stored
+	equivalent.RequestURL = url
+	assert.NoError(t, equivalent.VerifyEvent())
+}
+
+// InsertAuditEvent refuses a projection that cannot re-derive its own event id. Without this the
+// property above could rot silently: every row would still look complete and none would verify.
+func TestInsertAuditEventRejectsAnUnverifiableProjection(t *testing.T) {
+	require.NoError(t, unittest.PrepareTestDatabase())
+	ctx := t.Context()
+
+	key := &Key{OwnerUserID: 1, AgentUserID: 2, PubKey: specPubKeyHex, Scope: testScope}
+	require.NoError(t, RegisterKey(ctx, key))
+
+	dropped := signedAuditEvent(t, key.ID, 0, "lossy", "https://gitea.example.com/api/v1/repos/x/y/issues")
+	dropped.EventTags = ""
+	assert.Error(t, InsertAuditEvent(ctx, dropped), "a row with its tags dropped cannot re-derive its id")
+
+	unsigned := signedAuditEvent(t, key.ID, 0, "unsigned", "https://gitea.example.com/api/v1/repos/x/y/issues")
+	unsigned.Sig = ""
+	assert.Error(t, InsertAuditEvent(ctx, unsigned), "a row with no signature records a claim, not evidence")
 }
 
 func TestInsertAuditEventRejectsIncompleteAttribution(t *testing.T) {

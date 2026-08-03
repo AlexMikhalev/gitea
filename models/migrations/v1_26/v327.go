@@ -27,19 +27,30 @@ func (k *AgentKey) TableName() string {
 }
 
 // AgentAuditEvent is the record of one NIP-98 signed request that authenticated successfully.
+//
+// The event's own fields (EventCreatedUnix, EventKind, Nonce, EventTags, EventContent, Sig) are
+// stored alongside the summary columns because together with PubKey they are exactly the inputs
+// of the NIP-01 serialization: without them EventID is an identifier nothing can be checked
+// against. See models/agent.AuditEvent.
 type AgentAuditEvent struct {
-	ID             int64              `xorm:"pk autoincr"`
-	RepoID         int64              `xorm:"INDEX NOT NULL DEFAULT 0"`
-	AgentUserID    int64              `xorm:"INDEX NOT NULL"`
-	OwnerUserID    int64              `xorm:"INDEX NOT NULL"`
-	AgentKeyID     int64              `xorm:"INDEX NOT NULL"`
-	EventID        string             `xorm:"VARCHAR(64) UNIQUE NOT NULL"`
-	PubKey         string             `xorm:"VARCHAR(64) NOT NULL"`
-	Method         string             `xorm:"VARCHAR(10) NOT NULL"`
-	RequestURL     string             `xorm:"TEXT NOT NULL"`
-	PayloadHash    string             `xorm:"VARCHAR(64) NOT NULL DEFAULT ''"`
-	ResponseStatus int                `xorm:"NOT NULL DEFAULT 0"`
-	CreatedUnix    timeutil.TimeStamp `xorm:"created INDEX NOT NULL"`
+	ID               int64              `xorm:"pk autoincr"`
+	RepoID           int64              `xorm:"INDEX NOT NULL DEFAULT 0"`
+	AgentUserID      int64              `xorm:"INDEX NOT NULL"`
+	OwnerUserID      int64              `xorm:"INDEX NOT NULL"`
+	AgentKeyID       int64              `xorm:"INDEX NOT NULL"`
+	EventID          string             `xorm:"VARCHAR(64) UNIQUE NOT NULL"`
+	PubKey           string             `xorm:"VARCHAR(64) NOT NULL"`
+	Method           string             `xorm:"VARCHAR(10) NOT NULL"`
+	RequestURL       string             `xorm:"TEXT NOT NULL"`
+	PayloadHash      string             `xorm:"VARCHAR(64) NOT NULL DEFAULT ''"`
+	EventCreatedUnix timeutil.TimeStamp `xorm:"NOT NULL DEFAULT 0"`
+	EventKind        int                `xorm:"NOT NULL DEFAULT 0"`
+	Nonce            string             `xorm:"VARCHAR(255) NOT NULL DEFAULT ''"`
+	EventTags        string             `xorm:"TEXT NOT NULL DEFAULT ''"`
+	EventContent     string             `xorm:"TEXT NOT NULL DEFAULT ''"`
+	Sig              string             `xorm:"VARCHAR(128) NOT NULL DEFAULT ''"`
+	ResponseStatus   int                `xorm:"NOT NULL DEFAULT 0"`
+	CreatedUnix      timeutil.TimeStamp `xorm:"created INDEX NOT NULL"`
 }
 
 // TableName returns the database table name.

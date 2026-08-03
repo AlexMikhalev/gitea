@@ -150,6 +150,7 @@ func loadCommonSettingsFrom(cfg ConfigProvider) error {
 	loadGlobalLockFrom(cfg)
 	loadOtherFrom(cfg)
 	loadIssueGraphFrom(cfg)
+	loadAgentFrom(cfg)
 	return nil
 }
 

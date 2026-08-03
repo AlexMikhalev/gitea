@@ -86,6 +86,15 @@ func Test_AddAgentIdentity(t *testing.T) {
 	_, err = x.Insert(&AgentUsedEvent{EventID: "a1", ExpiresUnix: 2})
 	require.Error(t, err, "agent_used_event.event_id must be unique")
 
+	// The audit row has to carry the signed event, not just a summary of it: without sig and the
+	// other serialization inputs, event_id is an identifier no reader can check the row against.
+	// Asserted on the live schema for the same reason as is_agent above.
+	for _, column := range []string{"sig", "nonce", "event_tags", "event_content", "event_kind", "event_created_unix"} {
+		exists, err := columnExists(x, "agent_audit_event", column)
+		require.NoError(t, err)
+		assert.True(t, exists, "agent_audit_event.%s was not added", column)
+	}
+
 	count, err := x.Count(new(AgentKey))
 	require.NoError(t, err)
 	require.EqualValues(t, 0, count)

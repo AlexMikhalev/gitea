@@ -420,10 +420,80 @@ func TestAPIAgentCannotPlantCredentialsUnderUserActions(t *testing.T) {
 		MakeRequest(t, req, http.StatusForbidden)
 	})
 
+	// Writing a user-level Actions variable is the same act as writing a secret, one confidence
+	// level down: every later workflow run for the account reads it, and revoking the Nostr key
+	// does not take it back out.
+	t.Run("planting a user-level Actions variable", func(t *testing.T) {
+		const path = "/api/v1/user/actions/variables/AGENT_PLANTED"
+		body := `{"value":"a value every later workflow run would receive"}`
+		req := NewRequestWithBody(t, "PUT", path, strings.NewReader(body)).
+			SetHeader("Content-Type", "application/json").
+			SetHeader("Authorization", signNIP98(t, secretKey, "PUT", path, body, time.Now(), "plant-variable"))
+		MakeRequest(t, req, http.StatusForbidden)
+	})
+
+	// Reading one leaves nothing behind that outlives revocation, so it is deliberately still
+	// reachable. Asserting it pins where the line is: this guard is about persistence, and a
+	// later widening that swallowed the reads too would be a different decision, not a tidy-up.
+	t.Run("reading Actions variables is still allowed", func(t *testing.T) {
+		const path = "/api/v1/user/actions/variables"
+		req := NewRequest(t, "GET", path).
+			SetHeader("Authorization", signNIP98(t, secretKey, "GET", path, "", time.Now(), "read-variables"))
+		MakeRequest(t, req, http.StatusOK)
+	})
+
 	// The guard is about the credential in the request, not about the endpoint being off
 	// limits: the human holding a token still gets through.
 	t.Run("the owner's own credential is unaffected", func(t *testing.T) {
 		req := NewRequest(t, "GET", "/api/v1/user/actions/runners/registration-token").AddTokenAuth(token)
+		MakeRequest(t, req, http.StatusOK)
+	})
+}
+
+// The same artifact classes are reachable one level down, and the containment has to follow them
+// there. A leaked key scoped write:repository for a user with admin on a repository could install
+// a deploy key - an SSH credential with write access - or plant a repository Actions secret, and
+// revoking the Nostr key afterwards would remove neither.
+//
+// This is the half of the claim the /user-only coverage above could not make: "a correctly-scoped
+// agent may do what its scope allows" would have excused /user/keys just as readily, since
+// write:user legitimately covers SSH-key management too, so scope cannot be the line.
+func TestAPIAgentCannotPlantCredentialsUnderRepo(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+
+	const secretKey = "0000000000000000000000000000000000000000000000000000000000000041"
+	token := getUserToken(t, "user2", auth_model.AccessTokenScopeWriteRepository)
+	registerAgentKey(t, token, agentPubKey(t, secretKey), string(auth_model.AccessTokenScopeWriteRepository))
+
+	t.Run("installing a deploy key", func(t *testing.T) {
+		const path = "/api/v1/repos/user2/repo1/keys"
+		body := `{"title":"planted","key":"ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDWVj0fQ5N8wNc0LVNA41wDLYJ89ZIbejrPfg/avyj7u7BG8VjS/4Q==","read_only":false}`
+		req := NewRequestWithBody(t, "POST", path, strings.NewReader(body)).
+			SetHeader("Content-Type", "application/json").
+			SetHeader("Authorization", signNIP98(t, secretKey, "POST", path, body, time.Now(), "plant-deploy-key"))
+		MakeRequest(t, req, http.StatusForbidden)
+	})
+
+	t.Run("planting a repository Actions secret", func(t *testing.T) {
+		const path = "/api/v1/repos/user2/repo1/actions/secrets/AGENT_PLANTED"
+		body := `{"data":"a value every later workflow run would receive"}`
+		req := NewRequestWithBody(t, "PUT", path, strings.NewReader(body)).
+			SetHeader("Content-Type", "application/json").
+			SetHeader("Authorization", signNIP98(t, secretKey, "PUT", path, body, time.Now(), "plant-repo-secret"))
+		MakeRequest(t, req, http.StatusForbidden)
+	})
+
+	t.Run("minting a repository runner registration token", func(t *testing.T) {
+		const path = "/api/v1/repos/user2/repo1/actions/runners/registration-token"
+		req := NewRequestWithBody(t, "POST", path, strings.NewReader("")).
+			SetHeader("Authorization", signNIP98(t, secretKey, "POST", path, "", time.Now(), "mint-repo-runner-token"))
+		MakeRequest(t, req, http.StatusForbidden)
+	})
+
+	// PAT parity: the guard tests how the request authenticated, so the same scope carried by a
+	// token still reaches the endpoint. Without this the change would read as a scope narrowing.
+	t.Run("the owner's own credential is unaffected", func(t *testing.T) {
+		req := NewRequest(t, "GET", "/api/v1/repos/user2/repo1/keys").AddTokenAuth(token)
 		MakeRequest(t, req, http.StatusOK)
 	})
 }

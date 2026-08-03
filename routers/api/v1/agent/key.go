@@ -15,6 +15,7 @@ import (
 	auth_model "code.gitea.io/gitea/models/auth"
 	"code.gitea.io/gitea/models/db"
 	user_model "code.gitea.io/gitea/models/user"
+	"code.gitea.io/gitea/modules/log"
 	api "code.gitea.io/gitea/modules/structs"
 	"code.gitea.io/gitea/modules/util"
 	"code.gitea.io/gitea/modules/web"
@@ -36,6 +37,16 @@ var errDuplicateKey = errors.New("this public key is already registered")
 // refusal is the same either way.
 var errRevokedKey = errors.New("this public key was revoked and cannot be re-registered; enrol a new keypair")
 
+// errConcurrentRegistration is the loser of a registration race - two callers registering the same
+// pub_key at once, where the UNIQUE index rather than the check above decided which one won.
+//
+// It is reported as 409 rather than folded into errDuplicateKey's 422 because the two say
+// different things to the caller. "Already registered" is a statement about the past that invites
+// a retry; this is a statement about *this* request, and the retry will not help. Naming the
+// winner's whereabouts is the recoverable part: the key exists and is listable, so the caller can
+// find out whether the registration it wanted is in place rather than guessing from a 500.
+var errConcurrentRegistration = errors.New("this public key was registered by a concurrent request; list your agent keys to see the registration that won")
+
 // CreateKey registers a Nostr public key for an agent user.
 func CreateKey(ctx *context.APIContext) {
 	// swagger:operation POST /agent/keys agent agentCreateKey
@@ -55,6 +66,8 @@ func CreateKey(ctx *context.APIContext) {
 	//     "$ref": "#/responses/AgentKey"
 	//   "403":
 	//     "$ref": "#/responses/forbidden"
+	//   "409":
+	//     "$ref": "#/responses/conflict"
 	//   "422":
 	//     "$ref": "#/responses/validationError"
 
@@ -144,9 +157,21 @@ func CreateKey(ctx *context.APIContext) {
 
 		// Registering a key is what makes a user an agent; services/auth refuses to
 		// authenticate a signed request for a user without the flag.
-		if !agentUser.IsAgent {
-			agentUser.IsAgent = true
-			if err := user_model.UpdateUserCols(ctx, agentUser, "is_agent"); err != nil {
+		//
+		// The user is re-read here rather than reused from the copy fetched above, and the
+		// difference is not cosmetic: that copy was read before the transaction opened, so
+		// its IsAgent is a snapshot that a concurrent revocation can have invalidated. Skipping
+		// the flag write on the strength of a stale `true` commits an unrevoked key onto an
+		// account with is_agent = false, which authenticates nothing - and since pub_key is
+		// UNIQUE with no delete path, re-registering it returns "already registered" for good.
+		// The keypair would be burned by exactly the race the comment above exists to prevent.
+		txAgentUser, err := user_model.GetUserByID(ctx, agentUser.ID)
+		if err != nil {
+			return err
+		}
+		if !txAgentUser.IsAgent {
+			txAgentUser.IsAgent = true
+			if err := user_model.UpdateUserCols(ctx, txAgentUser, "is_agent"); err != nil {
 				return err
 			}
 		}
@@ -160,6 +185,24 @@ func CreateKey(ctx *context.APIContext) {
 		ctx.APIError(http.StatusUnprocessableEntity, err)
 		return
 	case err != nil:
+		// The check-then-insert above is not atomic against a second registration of the same
+		// pub_key: both callers can find nothing and both can proceed to the insert, where the
+		// UNIQUE index picks one. Reported as-is that is a 500 indistinguishable from a database
+		// fault, and the loser's next retry gets a 422 saying the key is already registered - so
+		// the caller cannot tell whether their own request was the one that succeeded. Naming the
+		// race makes the outcome deterministic and tells the operator what to do about it.
+		//
+		// The lookup deliberately happens here rather than inside the transaction: on PostgreSQL
+		// a failed insert aborts the surrounding transaction, so a query issued after it fails
+		// too. This is the same reason ConsumeEvent documents for staying outside one.
+		if existing, lookupErr := agent_model.GetKeyByPubKey(ctx, pubKey); lookupErr == nil {
+			if existing.IsRevoked() {
+				ctx.APIError(http.StatusUnprocessableEntity, errRevokedKey)
+			} else {
+				ctx.APIError(http.StatusConflict, errConcurrentRegistration)
+			}
+			return
+		}
 		ctx.APIErrorInternal(err)
 		return
 	}
@@ -456,7 +499,22 @@ func toAPIAgentKey(key *agent_model.Key) *api.AgentKey {
 	return result
 }
 
+// toAPIAgentAuditEvent renders one audit row, including the signed event it was written from.
+//
+// The event fields are what make the answer checkable by the reader rather than only by this
+// server: with created_at, kind, nonce, tags, content and sig in hand, a client re-derives the
+// NIP-01 id and verifies the signature against the public key, and a row that has been edited
+// since it was written stops matching. Returning the summary alone would ask the caller to
+// believe the same database the trail is meant to be evidence about.
 func toAPIAgentAuditEvent(event *agent_model.AuditEvent) *api.AgentAuditEvent {
+	// A row written before this server stored tags, or one whose tags have been corrupted, must
+	// still be listed - an audit endpoint that hid the rows it could not parse would hide exactly
+	// the interesting ones. It comes back with an empty tag list, which fails verification.
+	tags, err := event.EventTagsList()
+	if err != nil {
+		log.Warn("agent audit row %d has unreadable tags: %v", event.ID, err)
+	}
+
 	return &api.AgentAuditEvent{
 		ID:             event.ID,
 		RepoID:         event.RepoID,
@@ -468,6 +526,12 @@ func toAPIAgentAuditEvent(event *agent_model.AuditEvent) *api.AgentAuditEvent {
 		Method:         event.Method,
 		RequestURL:     event.RequestURL,
 		PayloadHash:    event.PayloadHash,
+		EventCreatedAt: int64(event.EventCreatedUnix),
+		EventKind:      event.EventKind,
+		Nonce:          event.Nonce,
+		EventTags:      tags,
+		EventContent:   event.EventContent,
+		Signature:      event.Sig,
 		ResponseStatus: event.ResponseStatus,
 		Created:        event.CreatedUnix.AsTime(),
 	}

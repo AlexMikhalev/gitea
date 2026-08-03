@@ -26,8 +26,13 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 )
 
-// KeyHexLength is the length of a hex-encoded 32-byte secp256k1 x-only key, public or secret.
-const KeyHexLength = 64
+const (
+	// KeyHexLength is the length of a hex-encoded 32-byte secp256k1 x-only key, public or secret.
+	KeyHexLength = 64
+
+	// SigHexLength is the length of a hex-encoded 64-byte BIP-340 signature.
+	SigHexLength = 2 * schnorr.SignatureSize
+)
 
 // Errors returned when an event cannot be verified. They are distinguished so callers can log a
 // precise reason; NIP-98 callers must collapse them all into one opaque rejection.

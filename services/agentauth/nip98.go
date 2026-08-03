@@ -19,12 +19,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
 	"code.gitea.io/gitea/modules/json"
 	"code.gitea.io/gitea/modules/nostr"
+	"code.gitea.io/gitea/modules/util"
 )
 
 const (
@@ -38,9 +38,16 @@ const (
 	// either direction. NIP-98 suggests 60 seconds.
 	DefaultClockSkew = 60 * time.Second
 
-	// MaxBodySize caps the request body this package will hash. Only requests that actually
-	// carry a NIP-98 header are read here, so this does not constrain any other upload path.
-	MaxBodySize = 32 << 20 // 32 MiB
+	// DefaultMaxBodySize caps the request body this package will hash when the caller names no
+	// limit of its own. Only requests that actually carry a NIP-98 header are read here, so this
+	// does not constrain any other upload path.
+	//
+	// It is a default rather than the limit because the buffer is the one cost of a signed
+	// request an operator cannot otherwise bound: a signature commits to a hash of the whole
+	// body, so the body cannot be streamed, and N concurrent requests from one registered key
+	// hold N buffers resident. services/auth passes setting.Agent.MaxRequestBodySize, which is
+	// this value unless the operator says otherwise.
+	DefaultMaxBodySize = 32 << 20 // 32 MiB
 )
 
 // Errors returned by Verify. They are distinguished so that callers can log a precise reason;
@@ -76,6 +83,20 @@ type SignedRequest struct {
 	// when VerifyPayload has not run yet.
 	PayloadHash string
 	CreatedAt   time.Time
+
+	// Nonce is the `nonce` tag. It is what makes EventID unique per request rather than a pure
+	// function of (pubkey, second, url, method), and is pulled out of Tags so that a caller
+	// storing the event does not have to re-walk them.
+	Nonce string
+
+	// Kind, Tags, Content and Sig are the remaining ingredients of the event, kept so that a
+	// caller can persist enough to re-derive EventID and re-check the signature later. Without
+	// them a stored event id is an opaque string: nothing binds it to PubKey, and nothing binds
+	// the recorded method and URL to either. See models/agent.AuditEvent.
+	Kind    int
+	Tags    nostr.Tags
+	Content string
+	Sig     string
 
 	// signedPayload is the `payload` tag as it appeared in the signed event, kept so that
 	// VerifyPayload can compare against it without re-parsing the credential.
@@ -196,8 +217,22 @@ func VerifyCredential(req *http.Request, opts Options) (*SignedRequest, error) {
 	// with a reason the server log can name, which is the difference between a client bug that
 	// is found in a minute and one that reads like a clock or key problem for an afternoon.
 	// It is also symmetric with `u` and `method`, which are already required.
-	if tagValue(event.Tags, "nonce") == "" {
+	nonce := tagValue(event.Tags, "nonce")
+	if nonce == "" {
 		return nil, fmt.Errorf("%w: every signed request must carry a unique nonce", ErrMissingNonce)
+	}
+
+	// The hex fields must be in NIP-01's canonical lower case. This is not tidiness: the event id
+	// is the hash of a serialization that embeds `pubkey` as its literal characters, so an event
+	// whose pubkey were upper case would have an id that a lower-cased copy of the same fields
+	// does not reproduce. A caller stores those fields in order to re-derive the id later
+	// (models/agent.AuditEvent), so one representation has to be *the* representation, and NIP-01
+	// already picked it: "32-bytes lowercase hex-encoded". Cheap, so it goes before the signature.
+	if !isLowerHex(event.ID, nostr.KeyHexLength) || !isLowerHex(event.PubKey, nostr.KeyHexLength) {
+		return nil, fmt.Errorf("%w: id and pubkey must be %d lower-case hex characters", ErrInvalidEvent, nostr.KeyHexLength)
+	}
+	if !isLowerHex(event.Sig, nostr.SigHexLength) {
+		return nil, fmt.Errorf("%w: sig must be %d lower-case hex characters", ErrInvalidEvent, nostr.SigHexLength)
 	}
 
 	// Signature last of the header-only checks: it is the expensive one, so a flood of events
@@ -211,13 +246,32 @@ func VerifyCredential(req *http.Request, opts Options) (*SignedRequest, error) {
 	}
 
 	return &SignedRequest{
-		EventID:       strings.ToLower(event.ID),
-		PubKey:        strings.ToLower(event.PubKey),
+		EventID:       event.ID,
+		PubKey:        event.PubKey,
 		Method:        signedMethod,
 		RequestURL:    gotURL,
 		CreatedAt:     createdAt,
+		Nonce:         nonce,
+		Kind:          event.Kind,
+		Tags:          event.Tags,
+		Content:       event.Content,
+		Sig:           event.Sig,
 		signedPayload: strings.ToLower(tagValue(event.Tags, "payload")),
 	}, nil
+}
+
+// isLowerHex reports whether s is exactly n lower-case hexadecimal characters.
+func isLowerHex(s string, n int) bool {
+	if len(s) != n {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // VerifyPayload reads the request body, checks it against the `payload` tag the signature
@@ -227,10 +281,17 @@ func VerifyCredential(req *http.Request, opts Options) (*SignedRequest, error) {
 // must match the body, and no tag requires an empty body. Without the second half a signed
 // GET credential could be replayed as a POST carrying arbitrary content.
 //
+// maxBodySize bounds what will be held in memory to do that; anything larger is refused with
+// ErrBodyTooLarge before it is read. A value of 0 or less means DefaultMaxBodySize - the limit
+// is never absent, only chosen.
+//
 // It consumes req.Body and puts an equivalent reader back, so handlers downstream still see the
 // full body.
-func (s *SignedRequest) VerifyPayload(req *http.Request) error {
-	body, err := readAndRestoreBody(req)
+func (s *SignedRequest) VerifyPayload(req *http.Request, maxBodySize int64) error {
+	if maxBodySize <= 0 {
+		maxBodySize = DefaultMaxBodySize
+	}
+	body, err := readAndRestoreBody(req, maxBodySize)
 	if err != nil {
 		return err
 	}
@@ -277,18 +338,18 @@ func tagValue(tags nostr.Tags, key string) string {
 }
 
 // readAndRestoreBody drains req.Body and replaces it with an equivalent reader.
-func readAndRestoreBody(req *http.Request) ([]byte, error) {
+func readAndRestoreBody(req *http.Request, maxBodySize int64) ([]byte, error) {
 	if req.Body == nil || req.Body == http.NoBody {
 		return nil, nil
 	}
-	if req.ContentLength > MaxBodySize {
+	if req.ContentLength > maxBodySize {
 		return nil, ErrBodyTooLarge
 	}
-	body, err := io.ReadAll(io.LimitReader(req.Body, MaxBodySize+1))
+	body, err := io.ReadAll(io.LimitReader(req.Body, maxBodySize+1))
 	if err != nil {
 		return nil, fmt.Errorf("%w: cannot read request body: %v", ErrInvalidEvent, err)
 	}
-	if len(body) > MaxBodySize {
+	if int64(len(body)) > maxBodySize {
 		return nil, ErrBodyTooLarge
 	}
 	_ = req.Body.Close()
@@ -302,29 +363,9 @@ func readAndRestoreBody(req *http.Request) ([]byte, error) {
 // NormalizeURL renders an absolute URL in a form that can be compared byte-for-byte: lower-case
 // scheme and host, no default port, non-empty path. It deliberately does not touch the query -
 // parameter order is part of what the client signed.
+//
+// The implementation lives in modules/util because models/agent needs the identical answer to
+// re-check a stored audit row against its signature; see util.NormalizeAbsoluteURL.
 func NormalizeURL(raw string) (string, error) {
-	u, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil {
-		return "", err
-	}
-	scheme := strings.ToLower(u.Scheme)
-	host := strings.ToLower(u.Host)
-	if scheme == "" || host == "" {
-		return "", errors.New("url is not absolute")
-	}
-	switch {
-	case scheme == "http" && strings.HasSuffix(host, ":80"):
-		host = strings.TrimSuffix(host, ":80")
-	case scheme == "https" && strings.HasSuffix(host, ":443"):
-		host = strings.TrimSuffix(host, ":443")
-	}
-	path := u.EscapedPath()
-	if path == "" {
-		path = "/"
-	}
-	out := scheme + "://" + host + path
-	if u.RawQuery != "" {
-		out += "?" + u.RawQuery
-	}
-	return out, nil
+	return util.NormalizeAbsoluteURL(raw)
 }
