@@ -34,10 +34,19 @@ var frozenNow = time.Unix(1_800_000_000, 0).UTC()
 // parameter, so no test has to reach into the signing internals.
 func signedEvent(t *testing.T, kind int, createdAt time.Time, tags nostr.Tags) nostr.Event {
 	t.Helper()
+	return signedEventWithContent(t, kind, createdAt, tags, "")
+}
+
+// signedEventWithContent is signedEvent plus the `content` field. It is separate because content
+// is empty in a conformant NIP-98 event and only the size tests care about it: it is the largest
+// client-controlled part of the event, and the part MaxCredentialLength exists to bound.
+func signedEventWithContent(t *testing.T, kind int, createdAt time.Time, tags nostr.Tags, content string) nostr.Event {
+	t.Helper()
 	event := nostr.Event{
 		Kind:      kind,
 		CreatedAt: nostr.Timestamp(createdAt.Unix()),
 		Tags:      tags,
+		Content:   content,
 	}
 	require.NoError(t, event.Sign(testSecretKey))
 	return event
@@ -64,6 +73,28 @@ func encodeHeader(t *testing.T, event nostr.Event) string {
 	raw, err := json.Marshal(event)
 	require.NoError(t, err)
 	return "Nostr " + base64.StdEncoding.EncodeToString(raw)
+}
+
+// headerOfEncodedLength builds a valid, correctly signed credential whose base64 payload is
+// exactly want characters long, by padding the event's `content` with the shortfall. Every other
+// field of a signed event has a fixed width - the id, pubkey and sig are hex of a known length -
+// and each padding character costs exactly one byte of JSON, so the fit is exact rather than
+// approximate. That is what lets the limit be tested as a limit and not as an order of magnitude.
+func headerOfEncodedLength(t *testing.T, want int) string {
+	t.Helper()
+	// base64 of n bytes is 4*ceil(n/3) characters, so an exact target must be a multiple of 4 and
+	// is reached from exactly want/4*3 raw bytes.
+	require.Zero(t, want%4, "an exactly-sized base64 payload has a length divisible by 4")
+
+	tags := authTags(testURL, "GET", "")
+	raw, err := json.Marshal(signedEventWithContent(t, EventKind, frozenNow, tags, ""))
+	require.NoError(t, err)
+	pad := want/4*3 - len(raw)
+	require.Positive(t, pad, "target is smaller than an empty event")
+
+	header := encodeHeader(t, signedEventWithContent(t, EventKind, frozenNow, tags, strings.Repeat("a", pad)))
+	require.Len(t, strings.TrimPrefix(header, "Nostr "), want)
+	return header
 }
 
 func newRequest(t *testing.T, method, rawURL, body, authHeader string) *http.Request {
@@ -343,6 +374,45 @@ func TestVerify(t *testing.T) {
 				}))
 			},
 		},
+		// The same coupling again, for the whole credential rather than one tag. `content`, the
+		// tag list and the `u` tag are client-controlled and are recorded verbatim in TEXT audit
+		// columns - 65,535 bytes on MySQL - which are the ones AuditEvent.VerifyEvent re-derives
+		// the event id from. Unbounded, the only ceiling is net/http's 1 MiB header limit, so a
+		// registered key could sign an otherwise ordinary event carrying a ~768 KiB `content`:
+		// the insert then fails on a strict database, after the event id has already been spent,
+		// or truncates on a lax one and the authentic row reads as tampered forever after.
+		{
+			name:   "credential longer than the audit columns can hold",
+			method: "GET",
+			url:    testURL,
+			header: func(t *testing.T) string {
+				return headerOfEncodedLength(t, MaxCredentialLength+4)
+			},
+			wantErr: ErrCredentialTooLong,
+		},
+		// The bound is a bound and not a fencepost off it, exactly as for the nonce.
+		{
+			name:   "credential exactly at the limit",
+			method: "GET",
+			url:    testURL,
+			header: func(t *testing.T) string {
+				return headerOfEncodedLength(t, MaxCredentialLength)
+			},
+		},
+		// The length is checked before the payload is decoded, which is the other half of why the
+		// bound exists: everything in VerifyCredential runs before the signing key has been looked
+		// up, so an unauthenticated caller must not be able to buy four base64 decode attempts and
+		// a JSON unmarshal of ~768 KiB with one request. This payload is not valid base64, so a
+		// check placed after the decode would report ErrMalformedHeader instead.
+		{
+			name:   "oversized credential is refused before it is decoded",
+			method: "GET",
+			url:    testURL,
+			header: func(t *testing.T) string {
+				return "Nostr " + strings.Repeat("!", MaxCredentialLength+1)
+			},
+			wantErr: ErrCredentialTooLong,
+		},
 	}
 
 	for _, tc := range cases {
@@ -399,6 +469,25 @@ func TestAcceptedNoncesFitTheAuditColumn(t *testing.T) {
 
 	assert.LessOrEqual(t, MaxNonceLength, auditNonceColumnWidth,
 		"a nonce this package accepts does not fit agent_audit_event.nonce; widen the column in a migration or lower the bound")
+}
+
+// And once more for the credential as a whole. agent_audit_event.request_url, .event_tags and
+// .event_content are TEXT, which is 65,535 *bytes* on MySQL/MariaDB - the narrowest of the
+// supported backends. A credential this package accepts must fit there whole, because in the worst
+// case a single one of those columns carries nearly the entire event.
+func TestAcceptedCredentialsFitTheAuditColumns(t *testing.T) {
+	// models/agent.AuditEvent.RequestURL, .EventTags, .EventContent, all `xorm:"TEXT"`.
+	const mysqlTextBytes = 65535
+
+	// A base64 payload of n characters decodes to at most 3n/4 bytes of event.
+	assert.LessOrEqual(t, MaxCredentialLength/4*3, mysqlTextBytes,
+		"an event this package accepts does not fit the TEXT audit columns; widen them in a migration or lower the bound")
+
+	// The other direction: a bound that no conformant client can meet would be just as much of a
+	// bug, and a less visible one, so assert the headroom rather than only the ceiling.
+	header := encodeHeader(t, signedEvent(t, EventKind, frozenNow, authTags(testURL, "POST", `{"title":"hello"}`)))
+	assert.Less(t, len(strings.TrimPrefix(header, "Nostr ")), MaxCredentialLength/4,
+		"an ordinary credential is close to the limit; the bound is too tight")
 }
 
 // The verifier has to read the body to hash it; a handler downstream must still see all of it.

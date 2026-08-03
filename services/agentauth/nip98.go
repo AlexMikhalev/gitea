@@ -63,6 +63,30 @@ const (
 	// keeps the row and the tag in step, and costs a conformant client nothing: a nonce exists
 	// to be unique, and 255 characters is far more than uniqueness needs.
 	MaxNonceLength = 255
+
+	// MaxCredentialLength bounds the base64 payload of the `Authorization: Nostr` header before
+	// it is decoded. It is the same column coupling as MaxNonceLength and the `method` allowlist,
+	// applied to the three fields those two leave unbounded - `content`, the whole tag list and
+	// the `u` tag - which are the ones VerifyEvent re-derives the event id from.
+	//
+	// Without it the only ceiling is net/http's DefaultMaxHeaderBytes (1 MiB), so a registered key
+	// can sign an otherwise ordinary event carrying a ~768 KiB `content` or `u` tag. Those land in
+	// models/agent.AuditEvent.EventContent, EventTags and RequestURL, which are TEXT - 65,535
+	// *bytes* on MySQL/MariaDB. The two halves of that are the familiar pair: the insert errors on
+	// a strict database, refusing a request that deserved its ordinary response after the event id
+	// has already been spent, or the value is silently truncated on a lax one, after which
+	// AuditEvent.VerifyEvent can never re-derive EventID from the row again and an authentic row
+	// permanently reads as tampered.
+	//
+	// It is checked before decodeBase64 rather than after, which also closes the pre-auth cost
+	// channel the split verification otherwise leaves open: the decode and JSON unmarshal run
+	// before the pubkey is looked up, so an unauthenticated caller could otherwise force four full
+	// base64 decode attempts and an unmarshal of ~768 KiB on any /api/v1 path. Bounding hostile
+	// input before doing work on it is what modules/nostr.DecodeBech32 does for the same reason.
+	//
+	// 8 KiB of base64 decodes to at most 6 KiB of event: an order of magnitude under the 64 KiB
+	// TEXT floor, and an order of magnitude above the few hundred bytes a NIP-98 event needs.
+	MaxCredentialLength = 8 << 10 // 8 KiB
 )
 
 // Errors returned by Verify. They are distinguished so that callers can log a precise reason;
@@ -72,10 +96,12 @@ var (
 	// failure: the caller must fall through to the other authentication methods.
 	ErrNotApplicable = errors.New("no NIP-98 authorization header")
 
-	ErrMalformedHeader = errors.New("malformed NIP-98 authorization header")
-	ErrInvalidEvent    = errors.New("invalid NIP-98 event")
-	ErrMissingNonce    = errors.New("authorization event has no `nonce` tag")
-	ErrNonceTooLong    = errors.New("authorization event `nonce` tag is too long to record")
+	ErrMalformedHeader   = errors.New("malformed NIP-98 authorization header")
+	ErrCredentialTooLong = errors.New("authorization event is too long to record")
+	ErrInvalidEvent      = errors.New("invalid NIP-98 event")
+	ErrMissingNonce      = errors.New("authorization event has no `nonce` tag")
+	ErrNonceTooLong      = errors.New("authorization event `nonce` tag is too long to record")
+
 	ErrWrongKind       = errors.New("authorization event is not kind 27235")
 	ErrURLMismatch     = errors.New("authorization event was signed for a different URL")
 	ErrMethodMismatch  = errors.New("authorization event was signed for a different method")
@@ -167,6 +193,13 @@ func VerifyCredential(req *http.Request, opts Options) (*SignedRequest, error) {
 	encoded, ok := parseHeader(req.Header.Get("Authorization"))
 	if !ok {
 		return nil, ErrNotApplicable
+	}
+
+	// Bounded before any work is done on it: the event's `content`, `u` tag and tag list are
+	// client-controlled and are recorded verbatim in TEXT audit columns, and everything below this
+	// line runs before the signing key has been recognised. See MaxCredentialLength.
+	if len(encoded) > MaxCredentialLength {
+		return nil, fmt.Errorf("%w: %d bytes, the limit is %d", ErrCredentialTooLong, len(encoded), MaxCredentialLength)
 	}
 
 	raw, err := decodeBase64(encoded)
