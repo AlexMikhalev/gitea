@@ -314,7 +314,8 @@ func TestVerify(t *testing.T) {
 		// nonce that does not fit either fails the insert - a 401 for a request that deserved
 		// its ordinary response, after the event id has already been spent - or is truncated,
 		// leaving a row whose `nonce` column disagrees with the tag its signature covers while
-		// still verifying cleanly, since VerifyEvent cross-checks only `method` and `u`.
+		// still verifying cleanly, since VerifyEvent cross-checks `method`, `u` and `payload`
+		// but not the nonce.
 		{
 			name:   "nonce longer than the audit column",
 			method: "GET",

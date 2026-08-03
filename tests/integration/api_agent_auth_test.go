@@ -15,12 +15,14 @@ import (
 
 	agent_model "code.gitea.io/gitea/models/agent"
 	auth_model "code.gitea.io/gitea/models/auth"
+	repo_model "code.gitea.io/gitea/models/repo"
 	"code.gitea.io/gitea/models/unittest"
 	user_model "code.gitea.io/gitea/models/user"
 	"code.gitea.io/gitea/modules/json"
 	"code.gitea.io/gitea/modules/nostr"
 	"code.gitea.io/gitea/modules/setting"
 	api "code.gitea.io/gitea/modules/structs"
+	"code.gitea.io/gitea/modules/test"
 	"code.gitea.io/gitea/services/agentauth"
 	"code.gitea.io/gitea/tests"
 
@@ -498,6 +500,64 @@ func TestAPIAgentCannotPlantCredentialsUnderRepo(t *testing.T) {
 	})
 }
 
+// A git hook is the plainest case the containment test describes: PATCH writes a shell script that
+// the server runs on every later push, as its own process user, with no NIP-98 signature anywhere
+// near it. Revoking the agent's key leaves the script in place and running. reqGitHook() is not the
+// line - it asks whether the agent *user* may edit git hooks (IsAdmin || AllowGitHook), which is
+// true of a correctly-scoped agent for an administrator, exactly as reqAdmin() is for deploy keys.
+func TestAPIAgentCannotPlantAGitHook(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+	// Git hooks are off by default, which is what keeps this bounded on a stock instance; the
+	// guard has to hold on the instances that turn them on, which is what this pins.
+	defer test.MockVariableValue(&setting.DisableGitHooks, false)()
+
+	const secretKey = "000000000000000000000000000000000000000000000000000000000000004b"
+	// user1 is the site administrator, so reqAdmin() and reqGitHook() are both satisfied and the
+	// refusal below is the guard's doing. write:user is what reaches /agent/keys to enrol at all.
+	token := getUserToken(t, "user1", auth_model.AccessTokenScopeWriteRepository, auth_model.AccessTokenScopeWriteUser)
+	registerAgentKey(t, token, agentPubKey(t, secretKey), string(auth_model.AccessTokenScopeWriteRepository))
+
+	const path = "/api/v1/repos/user2/repo1/hooks/git/pre-receive"
+	const hook = "#!/bin/bash\necho \"planted by an agent, run on every push\"\n"
+
+	t.Run("writing a git hook", func(t *testing.T) {
+		body := `{"content":"#!/bin/bash\necho \"planted by an agent, run on every push\"\n"}`
+		req := NewRequestWithBody(t, "PATCH", path, strings.NewReader(body)).
+			SetHeader("Content-Type", "application/json").
+			SetHeader("Authorization", signNIP98(t, secretKey, "PATCH", path, body, time.Now(), "plant-git-hook"))
+		MakeRequest(t, req, http.StatusForbidden)
+
+		// The refusal has to be a refusal: nothing may have reached the hook file, or the next
+		// push would run it whatever the response said.
+		req = NewRequest(t, "GET", path).AddTokenAuth(token)
+		resp := MakeRequest(t, req, http.StatusOK)
+		var planted *api.GitHook
+		DecodeJSON(t, resp, &planted)
+		assert.False(t, planted.IsActive)
+		assert.Empty(t, planted.Content)
+	})
+
+	// Reading a hook plants nothing, so it stays reachable - the same line the Actions secrets
+	// draw between planting and reading.
+	t.Run("reading the git hooks is still allowed", func(t *testing.T) {
+		const listPath = "/api/v1/repos/user2/repo1/hooks/git"
+		req := NewRequest(t, "GET", listPath).
+			SetHeader("Authorization", signNIP98(t, secretKey, "GET", listPath, "", time.Now(), "list-git-hooks"))
+		MakeRequest(t, req, http.StatusOK)
+	})
+
+	// PAT parity, and the non-vacuity of the refusal above: the identical request carrying the
+	// administrator's own token writes the hook, so the 403 was the guard and not reqGitHook().
+	t.Run("the administrator's own credential still writes it", func(t *testing.T) {
+		req := NewRequestWithJSON(t, "PATCH", path, &api.EditGitHookOption{Content: hook}).AddTokenAuth(token)
+		resp := MakeRequest(t, req, http.StatusOK)
+		var written *api.GitHook
+		DecodeJSON(t, resp, &written)
+		assert.True(t, written.IsActive)
+		assert.Equal(t, hook, written.Content)
+	})
+}
+
 // The third class the containment has to cover: granting a *different account* standing access.
 // A collaborator, a team member and a team's repository all reach the granted repository through
 // their own passwords, PATs and SSH keys, so revoking the agent's Nostr key takes none of it back
@@ -545,6 +605,25 @@ func TestAPIAgentCannotGrantStandingAccess(t *testing.T) {
 		MakeRequest(t, req, http.StatusForbidden)
 	})
 
+	// Transferring the repository is the widest form of the same grant: it hands over contents,
+	// future writes and admin at once. org3 is an organization user2 can create repositories in,
+	// so StartRepositoryTransfer would complete it immediately rather than leaving a request the
+	// owner still has to accept - every owner-team member would reach the repository afterwards
+	// with their own credential, and revoking the Nostr key would undo none of it.
+	t.Run("transferring the repository away", func(t *testing.T) {
+		const path = "/api/v1/repos/user2/repo1/transfer"
+		body := `{"new_owner":"org3"}`
+		req := NewRequestWithBody(t, "POST", path, strings.NewReader(body)).
+			SetHeader("Content-Type", "application/json").
+			SetHeader("Authorization", signNIP98(t, repoSecretKey, "POST", path, body, time.Now(), "transfer-repo"))
+		MakeRequest(t, req, http.StatusForbidden)
+
+		// A refusal, not a 403 after the fact: the repository must still be user2's, and there
+		// must not be a pending transfer waiting for someone to accept it either.
+		unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1, OwnerID: 2})
+		unittest.AssertNotExistsBean(t, &repo_model.RepoTransfer{RepoID: 1})
+	})
+
 	// Reading who already has access grants nothing, so it stays reachable. Asserting it pins
 	// where the line is: this guard is about handing out standing access, and a later widening
 	// that swallowed the reads too would be a different decision, not a tidy-up.
@@ -569,6 +648,16 @@ func TestAPIAgentCannotGrantStandingAccess(t *testing.T) {
 		req := NewRequestWithJSON(t, "PUT", "/api/v1/repos/user2/repo1/collaborators/user4",
 			&api.AddCollaboratorOption{Permission: &permission}).AddTokenAuth(repoToken)
 		MakeRequest(t, req, http.StatusNoContent)
+	})
+
+	// The same parity for the transfer, and it is what makes the refusal above non-vacuous: the
+	// identical request carrying the owner's own token goes through and moves the repository, so
+	// the 403 was the guard rather than reqOwner() or the scope. Last, because it does transfer.
+	t.Run("the owner's own credential still transfers", func(t *testing.T) {
+		req := NewRequestWithJSON(t, "POST", "/api/v1/repos/user2/repo1/transfer",
+			&api.TransferRepoOption{NewOwner: "org3"}).AddTokenAuth(repoToken)
+		MakeRequest(t, req, http.StatusAccepted)
+		unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1, OwnerName: "org3"})
 	})
 }
 

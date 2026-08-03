@@ -40,10 +40,10 @@ import (
 // inputs of the NIP-01 serialization. That makes the row checkable against itself - VerifyEvent
 // re-derives EventID from those columns and re-checks Sig against PubKey - rather than leaving
 // EventID an opaque string that nothing binds to the key or to the recorded method and URL. An
-// UPDATE that rewrites request_url or method now contradicts the signature it sits next to, and
-// producing a row that does not is as hard as forging the agent's key. Method and RequestURL stay
-// as their own columns because they are what the trail is read and filtered by; they are a
-// projection *of* EventTags, and VerifyEvent is what says the projection is honest.
+// UPDATE that rewrites request_url, method or payload_hash now contradicts the signature it sits
+// next to, and producing a row that does not is as hard as forging the agent's key. Those three
+// stay as their own columns because they are what the trail is read, filtered and reported by;
+// they are a projection *of* EventTags, and VerifyEvent is what says the projection is honest.
 type AuditEvent struct {
 	ID int64 `xorm:"pk autoincr"`
 	// RepoID is 0 for requests that are not repository-scoped, and also for requests that
@@ -140,9 +140,14 @@ func (e *AuditEvent) SignedEvent() (*nostr.Event, error) {
 // authentic, and answering it out of a table that the same actor could also have edited would
 // give the answer away.
 //
-// Method and RequestURL are checked against the tags the signature actually covers, because those
-// two columns are the ones a reader trusts and the ones an editor would go for; a row whose
-// `method` column disagreed with its `method` tag would otherwise verify cleanly while lying.
+// Method, RequestURL and PayloadHash are checked against the tags the signature actually covers,
+// because those three columns are the ones a reader trusts and the ones an editor would go for; a
+// row whose `method` column disagreed with its `method` tag would otherwise verify cleanly while
+// lying. PayloadHash is the same kind of projection one column over - when a body existed it is the
+// hex SHA-256 the `payload` tag committed to, and the audit API hands it to the auditor as the
+// answer to "which body did the agent submit" - so leaving it unchecked would make an UPDATE of
+// that column the one edit the trail could not detect. A row with neither a `payload` tag nor a
+// stored hash is a request that had no body, and matches.
 func (e *AuditEvent) VerifyEvent() error {
 	event, err := e.SignedEvent()
 	if err != nil {
@@ -161,6 +166,9 @@ func (e *AuditEvent) VerifyEvent() error {
 		if nErr != nil || normalized != e.RequestURL {
 			return fmt.Errorf("audit row %d records url %q but the signature covers %q", e.ID, e.RequestURL, got)
 		}
+	}
+	if got := event.Tags.Find("payload").Value(); !strings.EqualFold(got, e.PayloadHash) {
+		return fmt.Errorf("audit row %d records payload hash %q but the signature covers %q", e.ID, e.PayloadHash, got)
 	}
 	return nil
 }

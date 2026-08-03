@@ -4,6 +4,8 @@
 package agent
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"testing"
@@ -45,15 +47,31 @@ const testSecretKeyHex = "111111111111111111111111111111111111111111111111111111
 // same second are the same event.
 func signedAuditEvent(t *testing.T, keyID, repoID int64, nonce, requestURL string) *AuditEvent {
 	t.Helper()
+	return signedAuditEventWithBody(t, keyID, repoID, nonce, requestURL, "")
+}
+
+// signedAuditEventWithBody is signedAuditEvent for a request that carried one: the event gains the
+// `payload` tag NIP-98 requires over a body, and the row gains the projection of that tag. An empty
+// body means no tag and no hash, which is the shape every other fixture here uses.
+func signedAuditEventWithBody(t *testing.T, keyID, repoID int64, nonce, requestURL, body string) *AuditEvent {
+	t.Helper()
+
+	var payloadHash string
+	eventTags := nostr.Tags{
+		{"u", requestURL},
+		{"method", "POST"},
+		{"nonce", nonce},
+	}
+	if body != "" {
+		sum := sha256.Sum256([]byte(body))
+		payloadHash = hex.EncodeToString(sum[:])
+		eventTags = append(eventTags, nostr.Tag{"payload", payloadHash})
+	}
 
 	event := &nostr.Event{
 		CreatedAt: nostr.Now(),
 		Kind:      27235,
-		Tags: nostr.Tags{
-			{"u", requestURL},
-			{"method", "POST"},
-			{"nonce", nonce},
-		},
+		Tags:      eventTags,
 	}
 	require.NoError(t, event.Sign(testSecretKeyHex))
 
@@ -69,6 +87,7 @@ func signedAuditEvent(t *testing.T, keyID, repoID int64, nonce, requestURL strin
 		PubKey:           event.PubKey,
 		Method:           "POST",
 		RequestURL:       requestURL,
+		PayloadHash:      payloadHash,
 		EventCreatedUnix: timeutil.TimeStamp(event.CreatedAt),
 		EventKind:        event.Kind,
 		Nonce:            nonce,
@@ -374,6 +393,55 @@ func TestAuditEventVerifiesAgainstItsOwnSignature(t *testing.T) {
 	equivalent := *stored
 	equivalent.RequestURL = url
 	assert.NoError(t, equivalent.VerifyEvent())
+}
+
+// payload_hash is the third projection a reader trusts: it is what the audit API answers "which
+// body did the agent submit" with, and it is a column like any other to anything holding DB write
+// access. Unchecked, editing it alone would produce a row that verifies cleanly while misreporting
+// the request - the same failure the method and URL checks above exist to prevent, one column over.
+func TestAuditEventVerifiesItsPayloadHash(t *testing.T) {
+	require.NoError(t, unittest.PrepareTestDatabase())
+	ctx := t.Context()
+
+	key := &Key{OwnerUserID: 1, AgentUserID: 2, PubKey: specPubKeyHex, Scope: testScope}
+	require.NoError(t, RegisterKey(ctx, key))
+
+	const url = "https://gitea.example.com/api/v1/repos/x/y/issues"
+	event := signedAuditEventWithBody(t, key.ID, 1, "with-a-body", url, `{"title":"what the agent actually sent"}`)
+	require.NotEmpty(t, event.PayloadHash)
+	require.NoError(t, InsertAuditEvent(ctx, event))
+
+	stored := new(AuditEvent)
+	has, err := db.GetEngine(ctx).ID(event.ID).Get(stored)
+	require.NoError(t, err)
+	require.True(t, has)
+	require.NoError(t, stored.VerifyEvent(), "a row carrying a body must verify as written")
+
+	tampered := *stored
+	tampered.PayloadHash = strings.Repeat("0", len(tampered.PayloadHash))
+	assert.Error(t, tampered.VerifyEvent(), "an edited payload hash must not verify")
+
+	// Erasing the column is the same edit made quietly: the row would then claim the request had
+	// no body at all, which the `payload` tag says it did.
+	tampered = *stored
+	tampered.PayloadHash = ""
+	assert.Error(t, tampered.VerifyEvent(), "a dropped payload hash must not verify")
+
+	// Hex is case-insensitive, so a row storing the same digest in the other case is the same
+	// answer and still verifies.
+	equivalent := *stored
+	equivalent.PayloadHash = strings.ToUpper(equivalent.PayloadHash)
+	assert.NoError(t, equivalent.VerifyEvent())
+
+	// The other direction: a bodyless request signs no `payload` tag, so both being empty is a
+	// match, and a hash appearing on such a row is not.
+	bodyless := signedAuditEvent(t, key.ID, 1, "without-a-body", url)
+	require.NoError(t, InsertAuditEvent(ctx, bodyless))
+	require.NoError(t, bodyless.VerifyEvent(), "no body and no hash must match")
+
+	invented := *bodyless
+	invented.PayloadHash = strings.Repeat("a", 64)
+	assert.Error(t, invented.VerifyEvent(), "a hash on a request that carried no body must not verify")
 }
 
 // InsertAuditEvent refuses a projection that cannot re-derive its own event id. Without this the

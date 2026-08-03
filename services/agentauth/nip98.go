@@ -57,9 +57,9 @@ const (
 	// controls this string entirely, so without a bound a long nonce either fails the audit
 	// insert on a strict database - turning a request that deserved its ordinary response into a
 	// 401 after the event id has already been spent - or is silently truncated on a lax one.
-	// Truncation is the worse half here: AuditEvent.VerifyEvent cross-checks only the `method`
-	// and `u` projections against the signed tags, so a row whose `nonce` column no longer
-	// matches the tag its signature covers still verifies cleanly. Refusing the credential
+	// Truncation is the worse half here: AuditEvent.VerifyEvent cross-checks the `method`, `u`
+	// and `payload` projections against the signed tags but not this one, so a row whose
+	// `nonce` column no longer matches the tag its signature covers still verifies cleanly. Refusing the credential
 	// keeps the row and the tag in step, and costs a conformant client nothing: a nonce exists
 	// to be unique, and 255 characters is far more than uniqueness needs.
 	MaxNonceLength = 255

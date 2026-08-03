@@ -400,16 +400,24 @@ func reqUsersExploreEnabled() func(ctx *context.APIContext) {
 //   - repository and organization Actions secrets, variables and runner registration tokens
 //     (addActionsRoutes), which are the same objects as their /user/* counterparts;
 //   - repository deploy keys, which are an SSH credential carrying repository write;
+//   - PATCH on a repository git hook, which is a shell script the server executes on every later
+//     push as its own process user, with no signature involved;
 //   - /admin/users and /admin/users/{username}/keys, which mint an account and an SSH key, and
 //     PATCH /admin/users/{username}, which sets the password, primary email, login source,
 //     site-admin flag and AllowGitHook on an account that already exists;
 //   - /admin/actions/runners/registration-token and /admin/runners/registration-token.
 //
 // The same test also catches artifacts that are not credentials this instance issued but grants of
-// standing access to a principal that already holds its own: adding a repository collaborator or an
-// organization team member lets that account in with its own password, PAT or SSH key afterwards,
-// so revoking the agent's key does not take the access away. Those two PUTs are guarded; the
-// matching DELETEs are not, because withdrawing access leaves nothing behind.
+// standing access to a principal that already holds its own: adding a repository collaborator, an
+// organization team member or a repository to a team lets those accounts in with their own
+// passwords, PATs or SSH keys afterwards, and transferring a repository hands the whole of it over
+// the same way, so revoking the agent's key does not take the access away. Those four writes are
+// guarded; the matching DELETEs are not, because withdrawing access leaves nothing behind.
+//
+// Webhooks - repository, organization and system - are deliberately outside this set. One creates
+// a persistent outbound channel that does survive revocation, but it is neither a credential this
+// instance issued nor standing access for a principal, so it fails the test as stated; a change
+// that decided to guard them would be widening the policy, not filling a gap in it.
 //
 // Leaving those open would have made revocation complete only for account-level credentials: a
 // leaked key scoped write:repository for a user with admin on a repository could install a deploy
@@ -1353,8 +1361,19 @@ func Routes() *web.Router {
 				// in this repository, query strings included, which is more than read access
 				// to the repository's contents implies.
 				m.Get("/agent-audit", reqToken(), reqAdmin(), agent.ListRepoAudit)
+				// reqHumanAuth() on the POST for the same reason as the collaborator and team
+				// grants below: a transfer hands the whole repository - contents, future writes
+				// and admin - to a different principal, and when the new owner is an organization
+				// the doer can create repositories in, StartRepositoryTransfer completes it
+				// immediately. Every owner-team member then reaches it with their own password,
+				// PAT or SSH key, and revoking the agent's Nostr key takes none of that back; it
+				// is the widest standing-access grant in the API rather than a narrower one.
+				// reqOwner() cannot draw the line, for the same reason reqAdmin() cannot at
+				// :1398: it asks whether the *agent user* may transfer, which a correctly-scoped
+				// agent for a repository owner may. Accept and reject stay open - they answer a
+				// grant some other owner already offered, and neither creates one.
 				m.Group("/transfer", func() {
-					m.Post("", reqOwner(), bind(api.TransferRepoOption{}), repo.Transfer)
+					m.Post("", reqOwner(), reqHumanAuth(), bind(api.TransferRepoOption{}), repo.Transfer)
 					m.Post("/accept", repo.AcceptTransfer)
 					m.Post("/reject", repo.RejectTransfer)
 				}, reqToken())
@@ -1374,11 +1393,21 @@ func Routes() *web.Router {
 					m.Get("/{job_id}/logs", repo.DownloadActionsRunJobLogs)
 				}, reqToken(), reqRepoReader(unit.TypeActions))
 
+				// reqHumanAuth() on the PATCH: it writes a shell script that the server runs on
+				// every subsequent push, as the Gitea process user, with no NIP-98 signature
+				// anywhere in sight - the plainest case of "does a later unsigned request get
+				// anything out of it", and strictly more durable than the deploy key guarded
+				// below. The PATCH /admin/users guard already counts AllowGitHook among the things
+				// too durable for an agent signature to set; this is the endpoint that actually
+				// writes the hook body. reqGitHook() does not substitute: it gates on
+				// IsAdmin || AllowGitHook, which asks whether the *agent user* may edit git hooks,
+				// not whether a human authorized this request. The GET and the DELETE stay open -
+				// reading a hook plants nothing and deleting one takes a hook away.
 				m.Group("/hooks/git", func() {
 					m.Combo("").Get(repo.ListGitHooks)
 					m.Group("/{id}", func() {
 						m.Combo("").Get(repo.GetGitHook).
-							Patch(bind(api.EditGitHookOption{}), repo.EditGitHook).
+							Patch(reqHumanAuth(), bind(api.EditGitHookOption{}), repo.EditGitHook).
 							Delete(repo.DeleteGitHook)
 					})
 				}, reqToken(), reqAdmin(), reqGitHook(), context.ReferencesGitRepo(true))
