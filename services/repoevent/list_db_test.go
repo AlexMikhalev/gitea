@@ -415,6 +415,142 @@ func TestListPagesEveryEventExactlyOnce(t *testing.T) {
 	}
 }
 
+// Every other row this file writes sits at its own second, which is the one case the cursor does
+// not need to exist for: created_unix alone already orders those. The keyset condition decides
+// something only when two sources stamp the same second - the common case on a busy repository -
+// and what it decides is per kind, so it is only here that each adapter's agreement between the
+// Kind it hands keysetCond and the column pair its ORDER BY names becomes observable at all.
+//
+// Every kind gets a *pair* at that second, because the two halves of a source's sort key fail
+// separately: a wrong Kind in keysetCond shows up at the boundary between two kinds, and an
+// ORDER BY that disagrees with the keyset on direction shows up only within one kind, when a page
+// cuts that kind's rows in half. Paging one event at a time puts a cursor on both.
+func TestListPagesEventsSharingOneSecond(t *testing.T) {
+	s := prepareStream(t)
+	// One second past everything prepareStream wrote, so the collision is a block at the head of
+	// the stream and its internal order is entirely the tie-break under test.
+	at := streamBase + 100
+
+	newAction := func(message string) *activities_model.Action {
+		return &activities_model.Action{
+			UserID:      s.owner.ID,
+			ActUserID:   s.owner.ID,
+			RepoID:      s.repo.ID,
+			OpType:      activities_model.ActionCommitRepo,
+			RefName:     "main",
+			Content:     `{"Len":1,"Commits":[{"Message":"` + message + `"}]}`,
+			CreatedUnix: at,
+		}
+	}
+	newComment := func(content string) *issues_model.Comment {
+		return &issues_model.Comment{
+			Type:        issues_model.CommentTypeComment,
+			PosterID:    s.owner.ID,
+			IssueID:     1,
+			Content:     content,
+			CreatedUnix: at,
+		}
+	}
+	// A re-approval by the same reviewer supersedes the earlier one rather than removing it, so
+	// two published reviews at one second is a state the stream really reaches.
+	newReview := func(content string) *issues_model.Review {
+		return &issues_model.Review{
+			Type:        issues_model.ReviewTypeApprove,
+			ReviewerID:  s.owner.ID,
+			IssueID:     2,
+			Content:     content,
+			CreatedUnix: at,
+			UpdatedUnix: at,
+		}
+	}
+	newStatus := func(index int64, context string) *git_model.CommitStatus {
+		return &git_model.CommitStatus{
+			Index:       index,
+			RepoID:      s.repo.ID,
+			State:       commitstatus.CommitStatusSuccess,
+			SHA:         "1234123412341234123412341234123412341234",
+			TargetURL:   "https://example.com/builds/" + strconv.FormatInt(index, 10),
+			Description: "build in the shared second",
+			Context:     context,
+			CreatorID:   s.owner.ID,
+			CreatedUnix: at,
+		}
+	}
+	newAudit := func(eventID, path string) *agent_model.AuditEvent {
+		return &agent_model.AuditEvent{
+			RepoID:      s.repo.ID,
+			AgentUserID: s.owner.ID,
+			OwnerUserID: s.owner.ID,
+			AgentKeyID:  1,
+			EventID:     eventID,
+			PubKey:      "abababababababababababababababababababababababababababababababab",
+			Method:      "GET",
+			RequestURL:  "https://example.com/api/v1/repos/user2/repo1/" + path,
+			CreatedUnix: at,
+		}
+	}
+
+	firstAction, secondAction := newAction("first push"), newAction("second push")
+	firstComment, secondComment := newComment("first remark"), newComment("second remark")
+	firstReview, secondReview := newReview("first approval"), newReview("second approval")
+	firstStatus, secondStatus := newStatus(101, "ci/first"), newStatus(102, "ci/second")
+	firstAudit := newAudit("e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2", "pulls")
+	secondAudit := newAudit("e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3", "branches")
+	insertAt(t,
+		firstAction, secondAction,
+		firstComment, secondComment,
+		firstReview, secondReview,
+		firstStatus, secondStatus,
+		firstAudit, secondAudit,
+	)
+
+	options := func(cursor *Cursor, limit int) *ListOptions {
+		return &ListOptions{
+			Repo:       s.repo,
+			Doer:       s.owner,
+			Permission: repoPermission(t, s.repo, s.owner),
+			Since:      since(),
+			Cursor:     cursor,
+			Limit:      limit,
+		}
+	}
+
+	whole, next := listOrFail(t, options(nil, 50))
+	require.Nil(t, next)
+	require.Len(t, whole, 16, "ten rows sharing a second on top of the six prepareStream wrote")
+	// Nothing separates these ten but the tie-break: kind ascending, then source id descending.
+	require.Equal(t, []string{
+		key(KindAction, secondAction.ID),
+		key(KindAction, firstAction.ID),
+		key(KindAgentAudit, secondAudit.ID),
+		key(KindAgentAudit, firstAudit.ID),
+		key(KindComment, secondComment.ID),
+		key(KindComment, firstComment.ID),
+		key(KindReview, secondReview.ID),
+		key(KindReview, firstReview.ID),
+		key(KindStatus, secondStatus.ID),
+		key(KindStatus, firstStatus.ID),
+	}, keysOf(whole)[:10], "AllKinds order, then newest id, decides a shared second")
+
+	var paged []string
+	var cursor *Cursor
+	// One event per page puts a cursor on every position inside the shared second: the four
+	// boundaries between one kind and the next, and the split inside each kind's pair.
+	for range 40 {
+		events, next := listOrFail(t, options(cursor, 1))
+		require.LessOrEqual(t, len(events), 1)
+		paged = append(paged, keysOf(events)...)
+		if next == nil {
+			break
+		}
+		// A cursor a source refuses to advance past would page forever; the loop bound is what
+		// turns that into a failed assertion rather than a hung test.
+		cursor = next
+	}
+	assert.Equal(t, keysOf(whole), paged,
+		"paging one at a time visits every event exactly once, in AllKinds order")
+}
+
 // A cursor encoded by one page and decoded by the next is the round trip a client actually makes,
 // and the position it names has to survive it.
 func TestListResumesFromAnEncodedCursor(t *testing.T) {
