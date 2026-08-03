@@ -255,3 +255,29 @@ func (opts FindAuditEventsOptions) ToOrders() string {
 func FindAuditEvents(ctx context.Context, opts FindAuditEventsOptions) ([]*AuditEvent, int64, error) {
 	return db.FindAndCount[AuditEvent](ctx, opts)
 }
+
+// FindRepoAuditEventsAfter returns at most limit repository-scoped audit rows, newest first, with
+// an extra condition supplied by the caller.
+//
+// It exists next to FindAuditEvents rather than as an option on it because the two page
+// differently. FindAuditEvents serves an endpoint that counts and numbers its pages, so it orders
+// by id and takes an offset. The unified repository event stream cannot: it merges five tables
+// whose ids are unrelated, so it pages on (created_unix, id) as a key and has nothing to offset
+// from. Both narrow their rows through the same ToConds, which is the part that decides what a
+// caller may select; only the ordering and the paging differ.
+//
+// A repoID of 0 selects nothing rather than everything: rows with repo_id 0 are the requests that
+// were never repository-scoped, and no repository's stream may show them.
+func FindRepoAuditEventsAfter(ctx context.Context, repoID int64, cond builder.Cond, limit int) ([]*AuditEvent, error) {
+	if repoID <= 0 || limit <= 0 {
+		return nil, nil
+	}
+	full := FindAuditEventsOptions{RepoID: repoID}.ToConds()
+	if cond != nil {
+		full = full.And(cond)
+	}
+	rows := make([]*AuditEvent, 0, limit)
+	return rows, db.GetEngine(ctx).Where(full).
+		OrderBy("`agent_audit_event`.`created_unix` DESC, `agent_audit_event`.`id` DESC").
+		Limit(limit).Find(&rows)
+}

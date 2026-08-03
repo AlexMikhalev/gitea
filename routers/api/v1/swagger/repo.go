@@ -522,3 +522,10 @@ type swaggerMergeUpstreamResponse struct {
 	// in:body
 	Body api.MergeUpstreamResponse `json:"body"`
 }
+
+// RepoEventList
+// swagger:response RepoEventList
+type swaggerRepoEventList struct {
+	// in:body
+	Body api.RepoEventList `json:"body"`
+}
