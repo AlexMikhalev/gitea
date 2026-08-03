@@ -411,8 +411,19 @@ func reqUsersExploreEnabled() func(ctx *context.APIContext) {
 // standing access to a principal that already holds its own: adding a repository collaborator, an
 // organization team member or a repository to a team lets those accounts in with their own
 // passwords, PATs or SSH keys afterwards, and transferring a repository hands the whole of it over
-// the same way, so revoking the agent's key does not take the access away. Those four writes are
-// guarded; the matching DELETEs are not, because withdrawing access leaves nothing behind.
+// the same way, so revoking the agent's key does not take the access away. Widening an existing
+// team through PATCH /teams/{teamid} is the same grant made in bulk - Permission and
+// IncludesAllRepositories reach every current member and every current repository at once - so it
+// is guarded too. Those writes are guarded; the matching DELETEs are not, because withdrawing
+// access leaves nothing behind.
+//
+// A grant is guarded wherever it is reachable, not wherever it was first noticed: the
+// team-repository grant is exposed twice, at PUT /teams/{teamid}/repos/{org}/{reponame} and at
+// PUT /repos/{owner}/{repo}/teams/{team}, and both go through repo_service.TeamAddRepository, so
+// both carry the guard. Enumerating this policy route by route is what makes an alias easy to
+// miss, so TestAPIAgentAuthRouteCensus walks the whole registered v1 route table and fails on any
+// mutating route that is in neither the guarded set nor an explicit reviewed-exempt set - a new
+// alias breaks the suite instead of quietly widening the policy.
 //
 // Webhooks - repository, organization and system - are deliberately outside this set. One creates
 // a persistent outbound channel that does survive revocation, but it is neither a credential this
@@ -1442,8 +1453,17 @@ func Routes() *web.Router {
 				m.Get("/reviewers", reqToken(), reqAnyRepoReader(), repo.GetReviewers)
 				m.Group("/teams", func() {
 					m.Get("", reqAnyRepoReader(), repo.ListTeams)
+					// reqHumanAuth() on the PUT: this is the team-repository grant guarded at
+					// PUT /teams/{teamid}/repos/{org}/{reponame}, reached from the repository
+					// side - both land in repo_service.TeamAddRepository and hand the repository
+					// to every current member of the team. This path reaches it at a *lower* bar:
+					// write:repository plus reqAdmin() here, against organization scope plus
+					// reqTeamMembership() there. Guarding one alias and not the other leaves the
+					// grant open, so the guard follows the operation rather than the route - see
+					// TestAPIAgentAuthRouteCensus, which fails if a third path to it appears.
+					// The DELETE takes the team's access away and stays open.
 					m.Combo("/{team}").Get(reqAnyRepoReader(), repo.IsTeam).
-						Put(reqAdmin(), repo.AddTeam).
+						Put(reqAdmin(), reqHumanAuth(), repo.AddTeam).
 						Delete(reqAdmin(), repo.DeleteTeam)
 				}, reqToken())
 				m.Get("/raw/*", context.ReferencesGitRepo(), context.RepoRefForAPI, reqRepoReader(unit.TypeCode), repo.GetRawFile)
@@ -1898,8 +1918,18 @@ func Routes() *web.Router {
 			}, reqToken(), reqOrgOwnership())
 		}, tokenRequiresScopes(auth_model.AccessTokenScopeCategoryOrganization), orgAssignment(true), checkTokenPublicOnly())
 		m.Group("/teams/{teamid}", func() {
+			// reqHumanAuth() on the PATCH: EditTeam sets Permission and IncludesAllRepositories
+			// on a team that already has members, so a single request can hand every current
+			// member of that team admin over every current repository of the organization -
+			// strictly wider than either of the two writes guarded below, which grant one member
+			// or one repository at a time, and reached at the same reqOrgOwnership() bar. Those
+			// members then work through their own passwords, PATs and SSH keys, so revoking the
+			// agent's key takes none of it back. The whole PATCH is guarded rather than only the
+			// widening fields: a middleware cannot see the body, and renaming a team with an
+			// agent signature is not worth a handler-level exception. The DELETE removes a team,
+			// granting nothing, and stays open.
 			m.Combo("").Get(reqToken(), org.GetTeam).
-				Patch(reqToken(), reqOrgOwnership(), bind(api.EditTeamOption{}), org.EditTeam).
+				Patch(reqToken(), reqOrgOwnership(), reqHumanAuth(), bind(api.EditTeamOption{}), org.EditTeam).
 				Delete(reqToken(), reqOrgOwnership(), org.DeleteTeam)
 			m.Group("/members", func() {
 				m.Get("", reqToken(), org.GetTeamMembers)

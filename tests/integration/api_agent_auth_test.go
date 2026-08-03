@@ -15,6 +15,8 @@ import (
 
 	agent_model "code.gitea.io/gitea/models/agent"
 	auth_model "code.gitea.io/gitea/models/auth"
+	"code.gitea.io/gitea/models/organization"
+	"code.gitea.io/gitea/models/perm"
 	repo_model "code.gitea.io/gitea/models/repo"
 	"code.gitea.io/gitea/models/unittest"
 	user_model "code.gitea.io/gitea/models/user"
@@ -605,6 +607,37 @@ func TestAPIAgentCannotGrantStandingAccess(t *testing.T) {
 		MakeRequest(t, req, http.StatusForbidden)
 	})
 
+	// The same grant reached from the repository side. Both paths land in
+	// repo_service.TeamAddRepository, and this one asks for less to get there - write:repository
+	// plus reqAdmin() on the repository, rather than organization scope plus team membership - so
+	// guarding only the /teams path would have left the grant fully open at a lower bar. org3 owns
+	// repo21 and team1 does not have it yet, so this is a real grant rather than a no-op.
+	t.Run("adding a repository to a team from the repository side", func(t *testing.T) {
+		const path = "/api/v1/repos/org3/repo21/teams/team1"
+		req := NewRequestWithBody(t, "PUT", path, strings.NewReader("")).
+			SetHeader("Authorization", signNIP98(t, repoSecretKey, "PUT", path, "", time.Now(), "grant-repo-team"))
+		MakeRequest(t, req, http.StatusForbidden)
+		unittest.AssertNotExistsBean(t, &organization.TeamRepo{TeamID: 2, RepoID: 32})
+	})
+
+	// Widening an existing team is the same grant in bulk: PATCH /teams/{teamid} sets Permission
+	// and IncludesAllRepositories, which reach every current member and every current repository
+	// of the organization at once - strictly more than the two per-item grants above, at the same
+	// reqOrgOwnership() bar. team1 has two members and write on one repository, so an agent that
+	// got this through would have handed both of them admin over all of org3.
+	t.Run("widening an existing team", func(t *testing.T) {
+		const path = "/api/v1/teams/2"
+		body := `{"name":"team1","permission":"admin","includes_all_repositories":true}`
+		req := NewRequestWithBody(t, "PATCH", path, strings.NewReader(body)).
+			SetHeader("Content-Type", "application/json").
+			SetHeader("Authorization", signNIP98(t, orgSecretKey, "PATCH", path, body, time.Now(), "widen-team"))
+		MakeRequest(t, req, http.StatusForbidden)
+
+		// A refusal, not a 403 after the widening: the team must still be write-only and must
+		// still not include every repository.
+		unittest.AssertExistsAndLoadBean(t, &organization.Team{ID: 2, AccessMode: perm.AccessModeWrite, IncludesAllRepositories: false})
+	})
+
 	// Transferring the repository is the widest form of the same grant: it hands over contents,
 	// future writes and admin at once. org3 is an organization user2 can create repositories in,
 	// so StartRepositoryTransfer would complete it immediately rather than leaving a request the
@@ -648,6 +681,24 @@ func TestAPIAgentCannotGrantStandingAccess(t *testing.T) {
 		req := NewRequestWithJSON(t, "PUT", "/api/v1/repos/user2/repo1/collaborators/user4",
 			&api.AddCollaboratorOption{Permission: &permission}).AddTokenAuth(repoToken)
 		MakeRequest(t, req, http.StatusNoContent)
+	})
+
+	// Parity for the repository-side alias, which is what makes its refusal non-vacuous: the same
+	// request carrying the owner's own token goes through and makes the grant, so the 403 above
+	// was reqHumanAuth() rather than reqAdmin() or a missing repository.
+	t.Run("the owner's own credential still grants from the repository side", func(t *testing.T) {
+		req := NewRequest(t, "PUT", "/api/v1/repos/org3/repo21/teams/team1").AddTokenAuth(repoToken)
+		MakeRequest(t, req, http.StatusNoContent)
+		unittest.AssertExistsAndLoadBean(t, &organization.TeamRepo{TeamID: 2, RepoID: 32})
+	})
+
+	// And parity for the team edit, for the same reason: reqOrgOwnership() is satisfied either
+	// way, so a 403 that survived the token too would have meant the scope, not the guard.
+	t.Run("the owner's own credential still widens the team", func(t *testing.T) {
+		req := NewRequestWithJSON(t, "PATCH", "/api/v1/teams/2",
+			&api.EditTeamOption{Name: "team1", Permission: "admin"}).AddTokenAuth(orgToken)
+		MakeRequest(t, req, http.StatusOK)
+		unittest.AssertExistsAndLoadBean(t, &organization.Team{ID: 2, AccessMode: perm.AccessModeAdmin})
 	})
 
 	// The same parity for the transfer, and it is what makes the refusal above non-vacuous: the

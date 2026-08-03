@@ -181,6 +181,19 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	r.normalizeRequestPath(w, req, r.chiRouter)
 }
 
+// WalkRoutes calls fn once for every (method, pattern) pair registered on this router, including
+// the ones registered on sub-routers mounted into it. The pattern is the full path pattern with
+// its placeholders intact, e.g. "/repos/{username}/{reponame}/teams/{team}".
+//
+// It exists for tests that need to audit the route table as a whole rather than one route at a
+// time - asserting, for instance, that no route reaching a given operation was left out of a
+// security policy. Walking is O(routes) and allocates, so it is not for use on a request path.
+func (r *Router) WalkRoutes(fn func(method, pattern string) error) error {
+	return chi.Walk(r.chiRouter, func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
+		return fn(method, route)
+	})
+}
+
 // NotFound defines a handler to respond whenever a route could not be found.
 func (r *Router) NotFound(h http.HandlerFunc) {
 	r.chiRouter.NotFound(h)
