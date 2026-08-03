@@ -52,6 +52,7 @@ var (
 
 	ErrMalformedHeader = errors.New("malformed NIP-98 authorization header")
 	ErrInvalidEvent    = errors.New("invalid NIP-98 event")
+	ErrMissingNonce    = errors.New("authorization event has no `nonce` tag")
 	ErrWrongKind       = errors.New("authorization event is not kind 27235")
 	ErrURLMismatch     = errors.New("authorization event was signed for a different URL")
 	ErrMethodMismatch  = errors.New("authorization event was signed for a different method")
@@ -114,9 +115,9 @@ func parseHeader(header string) (payload string, ok bool) {
 }
 
 // VerifyCredential checks everything about a request's NIP-98 credential that can be decided
-// from the `Authorization` header alone: shape, kind, freshness, the `u` and `method` tags, and
-// the signature. It returns ErrNotApplicable when there is no such credential, which callers
-// must treat as "not my business" rather than as a rejection.
+// from the `Authorization` header alone: shape, kind, freshness, the `u`, `method` and `nonce`
+// tags, and the signature. It returns ErrNotApplicable when there is no such credential, which
+// callers must treat as "not my business" rather than as a rejection.
 //
 // It deliberately does not look at the request body. Verification is split in two because
 // buffering the body is the only step whose cost the caller controls, and a signature alone is
@@ -183,6 +184,20 @@ func VerifyCredential(req *http.Request, opts Options) (*SignedRequest, error) {
 	}
 	if !strings.EqualFold(signedMethod, req.Method) {
 		return nil, fmt.Errorf("%w: signed for %s", ErrMethodMismatch, signedMethod)
+	}
+
+	// `nonce` tag. NIP-98 calls this one optional; this server requires it, and the requirement
+	// is load-bearing rather than pedantic. The event id is a hash over
+	// (pubkey, created_at, kind, tags, content) and the caller spends each id exactly once, so
+	// for a client that omits the nonce the id is a pure function of the request: two identical
+	// requests issued inside the same wall-clock second mint the same id, and the second is
+	// refused by the replay guard - intermittently, and with the same opaque 401 a forged
+	// signature gets. Refusing the credential up front turns that into a deterministic failure
+	// with a reason the server log can name, which is the difference between a client bug that
+	// is found in a minute and one that reads like a clock or key problem for an afternoon.
+	// It is also symmetric with `u` and `method`, which are already required.
+	if tagValue(event.Tags, "nonce") == "" {
+		return nil, fmt.Errorf("%w: every signed request must carry a unique nonce", ErrMissingNonce)
 	}
 
 	// Signature last of the header-only checks: it is the expensive one, so a flood of events

@@ -176,10 +176,21 @@ func HasActiveKeyForAgent(ctx context.Context, agentUserID int64) (bool, error) 
 	return db.GetEngine(ctx).Where("agent_user_id = ? AND revoked_unix = 0", agentUserID).Exist(new(Key))
 }
 
-// ListKeysByOwner returns every key registered by a given human owner, newest first.
-func ListKeysByOwner(ctx context.Context, ownerUserID int64) ([]*Key, error) {
+// ListKeysVisibleToUser returns every key a user is entitled to see, newest first: the ones they
+// registered as the human owner, and the ones that authenticate *as* them.
+//
+// The second half matters because the two need not be the same person. A site admin may register
+// a key naming another user as the agent, which stores owner_user_id = admin; matching on
+// ownership alone would leave that user with no API path to discover that a credential signing on
+// their behalf exists at all, and reqHumanAuth() means they cannot look with the agent's own
+// signature either. Both columns are indexed, and the row carries no secret - a public key, its
+// npub, and the scope - so showing it to the account it speaks for gives away nothing that
+// account should not already know.
+func ListKeysVisibleToUser(ctx context.Context, userID int64) ([]*Key, error) {
 	keys := make([]*Key, 0, 8)
-	return keys, db.GetEngine(ctx).Where("owner_user_id = ?", ownerUserID).OrderBy("id DESC").Find(&keys)
+	return keys, db.GetEngine(ctx).
+		Where("owner_user_id = ?", userID).Or("agent_user_id = ?", userID).
+		OrderBy("id DESC").Find(&keys)
 }
 
 // GetKeyByID returns a registered key by its row id, revoked or not.

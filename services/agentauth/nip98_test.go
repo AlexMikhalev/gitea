@@ -43,10 +43,14 @@ func signedEvent(t *testing.T, kind int, createdAt time.Time, tags nostr.Tags) n
 	return event
 }
 
+// authTags builds the tag set a conformant client sends. The nonce is fixed rather than random:
+// this package never spends an event id, so uniqueness buys nothing here, and a stable tag set
+// keeps the signatures in these tests reproducible.
 func authTags(u, method, body string) nostr.Tags {
 	tags := nostr.Tags{
 		nostr.Tag{"u", u},
 		nostr.Tag{"method", method},
+		nostr.Tag{"nonce", "0123456789abcdef"},
 	}
 	if body != "" {
 		sum := sha256.Sum256([]byte(body))
@@ -261,6 +265,36 @@ func TestVerify(t *testing.T) {
 				return encodeHeader(t, signedEvent(t, EventKind, frozenNow, nostr.Tags{nostr.Tag{"u", testURL}}))
 			},
 			wantErr: ErrInvalidEvent,
+		},
+		// NIP-98 makes the nonce optional; this server does not. Without it the event id is a
+		// pure function of the request, so a client repeating one request inside a second mints
+		// the same id twice and the replay guard refuses the second - a 401 indistinguishable
+		// from a forged signature, arriving only sometimes. Refusing here makes it deterministic
+		// and gives the log a reason to name.
+		{
+			name:   "missing nonce tag",
+			method: "GET",
+			url:    testURL,
+			header: func(t *testing.T) string {
+				return encodeHeader(t, signedEvent(t, EventKind, frozenNow, nostr.Tags{
+					nostr.Tag{"u", testURL},
+					nostr.Tag{"method", "GET"},
+				}))
+			},
+			wantErr: ErrMissingNonce,
+		},
+		{
+			name:   "empty nonce tag",
+			method: "GET",
+			url:    testURL,
+			header: func(t *testing.T) string {
+				return encodeHeader(t, signedEvent(t, EventKind, frozenNow, nostr.Tags{
+					nostr.Tag{"u", testURL},
+					nostr.Tag{"method", "GET"},
+					nostr.Tag{"nonce", ""},
+				}))
+			},
+			wantErr: ErrMissingNonce,
 		},
 	}
 

@@ -86,5 +86,22 @@ PKGS="$(go list ./... | grep -v -E "$EXCLUDE_RE" | tr '\n' ' ')"
 # TestRoutes (routers/install, needs built frontend assets). Pre-existing
 # local-env failures, not regressions; fork CI covers them. Skipped BY NAME
 # so the rest of those packages still gate. DO NOT REMOVE when "fixing"
-# gates — removing it makes the gates red for unrelated reasons.
-make test-backend GO_TEST_PACKAGES="$PKGS" GOTESTFLAGS="-skip 'TestUserAvatarLink|TestTestHook|TestRoutes'"
+# gates — removing it makes the gates red for unrelated reasons. Keeping it
+# is what stops a red-for-the-environment run from being mistaken for a
+# red-for-the-code one; the fix for a genuine failure in one of these three
+# is to fix the test, not to widen this list.
+#
+# The pattern is anchored, and that is load-bearing. `go test -skip` matches
+# unanchored, so the bare alternative `TestTestHook` also swallows
+# TestTestHookValidation (routers/api/v1/utils) - a test that passes here and
+# was never one of the three verified above. Skipping it would silently
+# contradict the "BY NAME" contract this comment states. `^(...)$` pins each
+# alternative to a whole test name; subtests still run because -skip is
+# applied per name element, so anchoring never reaches a `Test/subtest` path
+# beyond the three named parents.
+#
+# The `$$` is not a typo. GOTESTFLAGS reaches `go test` through a make
+# variable, and make expands `$` followed by one character as a reference to a
+# variable of that name: a lone `$'` would expand to nothing and silently
+# unanchor the pattern again. `$$` is make's literal dollar.
+make test-backend GO_TEST_PACKAGES="$PKGS" GOTESTFLAGS="-skip '^(TestUserAvatarLink|TestTestHook|TestRoutes)\$\$'"

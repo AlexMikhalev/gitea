@@ -384,9 +384,13 @@ func reqUsersExploreEnabled() func(ctx *context.APIContext) {
 // NIP-98 request is signed in.
 //
 // The same argument covers every account-level credential, not just Nostr keys, which is why this
-// also guards /user/keys, /user/gpg_keys and /user/applications/oauth2: each of those outlives the
-// signing key that created it, so allowing an agent to plant one would make revoking its key a
-// half-undo. /users/{username}/tokens needs no guard here - it is already behind
+// also guards /user/keys, /user/gpg_keys, /user/applications/oauth2, /user/actions/secrets and
+// /user/actions/runners/registration-token: each of those outlives the signing key that created
+// it, so allowing an agent to plant one would make revoking its key a half-undo. The test for
+// membership of this set is not "does it look like a key" but "does a subsequent request, made
+// with no NIP-98 signature at all, get anything out of it" - an Actions secret is read by every
+// later workflow run and a runner registration token yields a second, independent credential, so
+// both qualify. /users/{username}/tokens needs no guard here - it is already behind
 // reqBasicOrRevProxyAuth(), which a signature cannot satisfy.
 //
 // What this does *not* contain is anything an agent's scopes legitimately permit inside a
@@ -848,7 +852,15 @@ func recordAgentAudit(next http.Handler) http.Handler {
 			if ctx.Repo != nil && ctx.Repo.Repository != nil {
 				repoID = ctx.Repo.Repository.ID
 			}
-			if err := agent_model.RecordAuditOutcome(ctx, audit.ID, repoID, ctx.Resp.WrittenStatus()); err != nil {
+			// Deliberately not ctx: an *APIContext delegates to the request's context, which
+			// net/http cancels the moment the client goes away. A long agent mutation whose
+			// caller times out and disconnects has still run - possibly having changed data -
+			// and writing its outcome on a cancelled context would fail, leaving
+			// response_status at 0, which the model defines as "the handler never completed".
+			// The row is written before the handler precisely so that nothing an agent does
+			// goes unlogged; the outcome half is worth the same care, so it is recorded
+			// against the server's lifetime instead of the client's patience.
+			if err := agent_model.RecordAuditOutcome(graceful.GetManager().ShutdownContext(), audit.ID, repoID, ctx.Resp.WrittenStatus()); err != nil {
 				// The identifying half of the row is already durable, so the trail is intact
 				// either way; only the outcome is missing, and it stays 0 to say so.
 				log.Error("RecordAuditOutcome(%d): %v", audit.ID, err)
@@ -1131,11 +1143,16 @@ func Routes() *web.Router {
 
 			// manage user-level actions features
 			m.Group("/actions", func() {
+				// reqHumanAuth(): a user-level Actions secret is handed to every subsequent
+				// workflow run for the account, so planting one is planting a credential that
+				// outlives - and is entirely unaffected by - revoking the agent key that
+				// planted it. Revocation has to be a whole undo, so an agent signature does
+				// not get to write here.
 				m.Group("/secrets", func() {
 					m.Combo("/{secretname}").
 						Put(bind(api.CreateOrUpdateSecretOption{}), user.CreateOrUpdateSecret).
 						Delete(user.DeleteSecret)
-				})
+				}, reqHumanAuth())
 
 				m.Group("/variables", func() {
 					m.Get("", user.ListVariables)
@@ -1148,8 +1165,15 @@ func Routes() *web.Router {
 
 				m.Group("/runners", func() {
 					m.Get("", reqToken(), user.ListRunners)
-					m.Get("/registration-token", reqToken(), user.GetRegistrationToken)
-					m.Post("/registration-token", reqToken(), user.CreateRegistrationToken)
+					// reqHumanAuth() on both registration-token routes: the token they
+					// hand out registers a runner against this account, and that runner
+					// then holds a long-lived credential of its own and executes workflow
+					// jobs. Revoking the agent key neither deregisters the runner nor
+					// invalidates its token, so this is the same half-undo /user/keys is
+					// guarded against. Reading the current token is as good as minting one,
+					// which is why the GET is guarded too.
+					m.Get("/registration-token", reqToken(), reqHumanAuth(), user.GetRegistrationToken)
+					m.Post("/registration-token", reqToken(), reqHumanAuth(), user.CreateRegistrationToken)
 					m.Get("/{runner_id}", reqToken(), user.GetRunner)
 					m.Delete("/{runner_id}", reqToken(), user.DeleteRunner)
 				})

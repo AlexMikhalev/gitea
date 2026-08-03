@@ -33,11 +33,12 @@ const agentTestSecretKey = "0000000000000000000000000000000000000000000000000000
 
 // signNIP98 builds an `Authorization: Nostr ...` value for one request.
 //
-// The salt tag makes every credential distinct even when the method, URL, body and second are
+// The nonce tag makes every credential distinct even when the method, URL, body and second are
 // identical. The server spends each event id exactly once, so without it two tests that signed
 // the same request would collide with each other's replay guard rather than testing what they
-// mean to test.
-func signNIP98(t *testing.T, secretKey, method, path, body string, createdAt time.Time, salt string) string {
+// mean to test. It is also mandatory - the server refuses an event that carries no nonce - so a
+// test passing an empty one is asking for that refusal.
+func signNIP98(t *testing.T, secretKey, method, path, body string, createdAt time.Time, nonce string) string {
 	t.Helper()
 
 	base := strings.TrimSuffix(setting.AppURL, "/")
@@ -49,8 +50,8 @@ func signNIP98(t *testing.T, secretKey, method, path, body string, createdAt tim
 		sum := sha256.Sum256([]byte(body))
 		tags = append(tags, nostr.Tag{"payload", hex.EncodeToString(sum[:])})
 	}
-	if salt != "" {
-		tags = append(tags, nostr.Tag{"salt", salt})
+	if nonce != "" {
+		tags = append(tags, nostr.Tag{"nonce", nonce})
 	}
 
 	event := nostr.Event{
@@ -331,6 +332,102 @@ func TestAPIAgentCannotEnrolOrRevokeKeysWithItsOwnSignature(t *testing.T) {
 	})
 }
 
+// A credential may only delegate what it already holds.
+//
+// TestAPIAgentKeyScopeIsEnforced pins that a key's scope constrains the key; this pins the other
+// half, that the *creation* of the key is itself constrained. Without it POST /agent/keys is a
+// scope-escalation primitive: a personal access token restricted to write:user could mint a
+// signing credential for the same account carrying write:repository, and the token would have
+// escalated itself. Gitea has already made this call for its own token endpoint, which sits
+// behind reqBasicOrRevProxyAuth() so that a token cannot mint a token.
+func TestAPIAgentKeyCannotExceedTheCallersScope(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+
+	// Deliberately narrow: enough to reach the endpoint, nothing more.
+	token := getUserToken(t, "user2", auth_model.AccessTokenScopeWriteUser)
+
+	t.Run("a scope the caller does not hold is refused", func(t *testing.T) {
+		req := NewRequestWithJSON(t, "POST", "/api/v1/agent/keys", &api.CreateAgentKeyOption{
+			PublicKey: agentPubKey(t, "000000000000000000000000000000000000000000000000000000000000002b"),
+			Scopes: []string{
+				string(auth_model.AccessTokenScopeWriteUser),
+				string(auth_model.AccessTokenScopeWriteRepository),
+			},
+		}).AddTokenAuth(token)
+		MakeRequest(t, req, http.StatusForbidden)
+	})
+
+	t.Run("a read scope does not authorize minting the matching write scope", func(t *testing.T) {
+		readToken := getUserToken(t, "user2", auth_model.AccessTokenScopeReadUser)
+		req := NewRequestWithJSON(t, "POST", "/api/v1/agent/keys", &api.CreateAgentKeyOption{
+			PublicKey: agentPubKey(t, "000000000000000000000000000000000000000000000000000000000000002d"),
+			Scopes:    []string{string(auth_model.AccessTokenScopeWriteUser)},
+		}).AddTokenAuth(readToken)
+		MakeRequest(t, req, http.StatusForbidden)
+	})
+
+	// The check constrains delegation, not registration: what the caller does hold still works,
+	// and so does anything narrower.
+	t.Run("what the caller holds is still delegable", func(t *testing.T) {
+		key := registerAgentKey(t, token, agentPubKey(t, "000000000000000000000000000000000000000000000000000000000000002f"),
+			string(auth_model.AccessTokenScopeWriteUser))
+		assert.Equal(t, []string{string(auth_model.AccessTokenScopeWriteUser)}, key.Scopes)
+
+		narrower := registerAgentKey(t, token, agentPubKey(t, "0000000000000000000000000000000000000000000000000000000000000031"),
+			string(auth_model.AccessTokenScopeReadUser))
+		assert.Equal(t, []string{string(auth_model.AccessTokenScopeReadUser)}, narrower.Scopes)
+	})
+}
+
+// reqHumanAuth() has to cover every endpoint that plants a credential outliving the signing key,
+// not just the ones that look like key management. An Actions secret is handed to every later
+// workflow run for the account, and a runner registration token yields a second, independent
+// credential that keeps working after the Nostr key is revoked - in both cases revocation would
+// be a half-undo.
+//
+// The pre-existing coverage tested the /agent group only, which is why these two were missed.
+func TestAPIAgentCannotPlantCredentialsUnderUserActions(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+
+	const secretKey = "0000000000000000000000000000000000000000000000000000000000000033"
+	token := getUserToken(t, "user2", auth_model.AccessTokenScopeWriteUser)
+	// write:user is exactly the scope that reaches these endpoints, so the refusals below are
+	// the guard's doing and not the scope's.
+	registerAgentKey(t, token, agentPubKey(t, secretKey), string(auth_model.AccessTokenScopeWriteUser))
+
+	t.Run("planting a user-level Actions secret", func(t *testing.T) {
+		const path = "/api/v1/user/actions/secrets/AGENT_PLANTED"
+		body := `{"data":"a value every later workflow run would receive"}`
+		req := NewRequestWithBody(t, "PUT", path, strings.NewReader(body)).
+			SetHeader("Content-Type", "application/json").
+			SetHeader("Authorization", signNIP98(t, secretKey, "PUT", path, body, time.Now(), "plant-secret"))
+		MakeRequest(t, req, http.StatusForbidden)
+	})
+
+	t.Run("minting a runner registration token", func(t *testing.T) {
+		const path = "/api/v1/user/actions/runners/registration-token"
+		req := NewRequestWithBody(t, "POST", path, strings.NewReader("")).
+			SetHeader("Authorization", signNIP98(t, secretKey, "POST", path, "", time.Now(), "mint-runner-token"))
+		MakeRequest(t, req, http.StatusForbidden)
+	})
+
+	// Reading the current registration token is as good as minting one: the value is what
+	// registers a runner, so the GET is guarded for the same reason as the POST.
+	t.Run("reading a runner registration token", func(t *testing.T) {
+		const path = "/api/v1/user/actions/runners/registration-token"
+		req := NewRequest(t, "GET", path).
+			SetHeader("Authorization", signNIP98(t, secretKey, "GET", path, "", time.Now(), "read-runner-token"))
+		MakeRequest(t, req, http.StatusForbidden)
+	})
+
+	// The guard is about the credential in the request, not about the endpoint being off
+	// limits: the human holding a token still gets through.
+	t.Run("the owner's own credential is unaffected", func(t *testing.T) {
+		req := NewRequest(t, "GET", "/api/v1/user/actions/runners/registration-token").AddTokenAuth(token)
+		MakeRequest(t, req, http.StatusOK)
+	})
+}
+
 // The owner, holding their own credential, must be able to do all three - otherwise revocation is
 // unreachable and the incident-response story is "edit the table by hand".
 func TestAPIAgentKeyLifecycle(t *testing.T) {
@@ -383,7 +480,10 @@ func TestAPIAgentKeyLifecycle(t *testing.T) {
 func TestAPIAgentKeyCannotBindAnotherUser(t *testing.T) {
 	defer tests.PrepareTestEnv(t)()
 
-	token := getUserToken(t, "user2", auth_model.AccessTokenScopeWriteUser)
+	// The token holds write:issue as well, so the refusal below can only be about the binding:
+	// a token that did not hold it would be refused for delegating a scope it lacks instead,
+	// and this test would pass without ever reaching the check it is named after.
+	token := getUserToken(t, "user2", auth_model.AccessTokenScopeWriteUser, auth_model.AccessTokenScopeWriteIssue)
 	pubKey := agentPubKey(t, "000000000000000000000000000000000000000000000000000000000000000f")
 
 	req := NewRequestWithJSON(t, "POST", "/api/v1/agent/keys", &api.CreateAgentKeyOption{
@@ -410,7 +510,9 @@ func TestAPIAgentKeyOwnerIsNotTheAgent(t *testing.T) {
 	// user1 is a site administrator in the fixtures; user2 is the account that will do the
 	// signing, and owns repo1.
 	const agentUserID int64 = 2
-	ownerToken := getUserToken(t, "user1", auth_model.AccessTokenScopeWriteUser)
+	// write:issue is on the owner's token because a credential may only delegate what it holds,
+	// and the key registered below is a write:issue key.
+	ownerToken := getUserToken(t, "user1", auth_model.AccessTokenScopeWriteUser, auth_model.AccessTokenScopeWriteIssue)
 	// Reading the audit trail needs repo admin, so this token carries the repository scope too.
 	agentOwnToken := getUserToken(t, "user2", auth_model.AccessTokenScopeWriteUser, auth_model.AccessTokenScopeReadRepository)
 
@@ -445,6 +547,21 @@ func TestAPIAgentKeyOwnerIsNotTheAgent(t *testing.T) {
 		require.NotEmpty(t, events)
 		assert.Equal(t, agentUserID, events[0].AgentUserID)
 		assert.EqualValues(t, 1, events[0].OwnerUserID, "the trail must name the human who vouched")
+	})
+
+	// Containment is not secrecy. The key row says which public key can authenticate as user2,
+	// and user2 is entitled to know that - listing only what the caller owns would leave the
+	// account with no way to discover a credential signing on its behalf, since reqHumanAuth()
+	// keeps it from looking with the agent's own signature either.
+	t.Run("the agent user can see the key registered for it", func(t *testing.T) {
+		req := NewRequest(t, "GET", "/api/v1/agent/keys").AddTokenAuth(agentOwnToken)
+		resp := MakeRequest(t, req, http.StatusOK)
+
+		var keys []*api.AgentKey
+		DecodeJSON(t, resp, &keys)
+		require.Len(t, keys, 1)
+		assert.Equal(t, key.ID, keys[0].ID)
+		assert.EqualValues(t, 1, keys[0].OwnerUserID, "it is still the owner's key, merely visible")
 	})
 
 	// The key lives on the agent's account but belongs to the owner. The agent holding its own
@@ -503,7 +620,7 @@ func TestAPIAgentKeyOwnerIsNotTheAgent(t *testing.T) {
 func TestAPIAgentKeyRejectsNonIndividualAgentUser(t *testing.T) {
 	defer tests.PrepareTestEnv(t)()
 
-	adminToken := getUserToken(t, "user1", auth_model.AccessTokenScopeWriteUser)
+	adminToken := getUserToken(t, "user1", auth_model.AccessTokenScopeWriteUser, auth_model.AccessTokenScopeWriteIssue)
 
 	// org3 is an organization in the fixtures; -1 is the Ghost system user.
 	cases := []struct {
@@ -531,16 +648,32 @@ func TestAPIAgentKeyRejectsNonIndividualAgentUser(t *testing.T) {
 func TestAPIAgentKeyRejectsDuplicates(t *testing.T) {
 	defer tests.PrepareTestEnv(t)()
 
-	token := getUserToken(t, "user2", auth_model.AccessTokenScopeWriteUser)
+	token := getUserToken(t, "user2", auth_model.AccessTokenScopeWriteUser, auth_model.AccessTokenScopeWriteIssue)
 	pubKey := agentPubKey(t, "0000000000000000000000000000000000000000000000000000000000000011")
 
-	registerAgentKey(t, token, pubKey, string(auth_model.AccessTokenScopeWriteIssue))
+	key := registerAgentKey(t, token, pubKey, string(auth_model.AccessTokenScopeWriteIssue))
 
 	req := NewRequestWithJSON(t, "POST", "/api/v1/agent/keys", &api.CreateAgentKeyOption{
 		PublicKey: pubKey,
 		Scopes:    []string{string(auth_model.AccessTokenScopeWriteIssue)},
 	}).AddTokenAuth(token)
-	MakeRequest(t, req, http.StatusUnprocessableEntity)
+	resp := MakeRequest(t, req, http.StatusUnprocessableEntity)
+	assert.Contains(t, resp.Body.String(), "already registered")
+
+	// Revoking does not free the keypair - pub_key is UNIQUE and revocation is deliberately
+	// terminal - but "already registered" would then describe the wrong situation and send an
+	// operator hunting for an active key the account does not have. The refusal is the same;
+	// the reason it gives is not.
+	req = NewRequest(t, "DELETE", "/api/v1/agent/keys/"+strconv.FormatInt(key.ID, 10)).AddTokenAuth(token)
+	MakeRequest(t, req, http.StatusNoContent)
+
+	req = NewRequestWithJSON(t, "POST", "/api/v1/agent/keys", &api.CreateAgentKeyOption{
+		PublicKey: pubKey,
+		Scopes:    []string{string(auth_model.AccessTokenScopeWriteIssue)},
+	}).AddTokenAuth(token)
+	resp = MakeRequest(t, req, http.StatusUnprocessableEntity)
+	assert.Contains(t, resp.Body.String(), "revoked")
+	assert.NotContains(t, resp.Body.String(), "already registered")
 }
 
 // A key with no scope would pass every scope check in the API, so registration has to refuse it.
@@ -627,7 +760,7 @@ func TestAPIAgentAuditRecordsRefusedRequests(t *testing.T) {
 	defer tests.PrepareTestEnv(t)()
 
 	const secretKey = "000000000000000000000000000000000000000000000000000000000000001d"
-	token := getUserToken(t, "user2", auth_model.AccessTokenScopeWriteUser, auth_model.AccessTokenScopeReadRepository)
+	token := getUserToken(t, "user2", auth_model.AccessTokenScopeWriteUser, auth_model.AccessTokenScopeWriteIssue, auth_model.AccessTokenScopeReadRepository)
 	registerAgentKey(t, token, agentPubKey(t, secretKey), string(auth_model.AccessTokenScopeWriteIssue))
 
 	// user30/repo51 is public and archived, so this resolves the repository - which is what puts

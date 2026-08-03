@@ -26,6 +26,16 @@ import (
 // refusal can roll the transaction back and still be reported as a 422 rather than a 500.
 var errDuplicateKey = errors.New("this public key is already registered")
 
+// errRevokedKey separates the one case where the pub_key row exists but authenticates nothing.
+//
+// Revocation is deliberately terminal: the row is never deleted, pub_key is UNIQUE and there is
+// no re-enrolment path, so a revoked keypair stays revoked for the account for good - which is
+// the property that makes "revoke the key" a complete answer to a leak. Reporting that as
+// "already registered" is accurate about the row and misleading about the situation: the operator
+// goes looking for an active key that the account does not have. Say which of the two it is; the
+// refusal is the same either way.
+var errRevokedKey = errors.New("this public key was revoked and cannot be re-registered; enrol a new keypair")
+
 // CreateKey registers a Nostr public key for an agent user.
 func CreateKey(ctx *context.APIContext) {
 	// swagger:operation POST /agent/keys agent agentCreateKey
@@ -67,6 +77,9 @@ func CreateKey(ctx *context.APIContext) {
 	}
 	if scope == "" {
 		ctx.APIError(http.StatusUnprocessableEntity, "an agent key must have a scope")
+		return
+	}
+	if !callerMayDelegateScope(ctx, scope) {
 		return
 	}
 
@@ -116,7 +129,10 @@ func CreateKey(ctx *context.APIContext) {
 	// leave a credential that can never authenticate and can never be re-registered either -
 	// pub_key is UNIQUE and there is no delete path, so the keypair would be burned for good.
 	err = db.WithTx(ctx, func(ctx gocontext.Context) error {
-		if _, err := agent_model.GetKeyByPubKey(ctx, pubKey); err == nil {
+		if existing, err := agent_model.GetKeyByPubKey(ctx, pubKey); err == nil {
+			if existing.IsRevoked() {
+				return errRevokedKey
+			}
 			return errDuplicateKey
 		} else if !agent_model.IsErrAgentKeyNotExist(err) {
 			return err
@@ -137,7 +153,7 @@ func CreateKey(ctx *context.APIContext) {
 		return nil
 	})
 	switch {
-	case errors.Is(err, errDuplicateKey):
+	case errors.Is(err, errDuplicateKey), errors.Is(err, errRevokedKey):
 		ctx.APIError(http.StatusUnprocessableEntity, err)
 		return
 	case errors.Is(err, util.ErrInvalidArgument):
@@ -151,11 +167,74 @@ func CreateKey(ctx *context.APIContext) {
 	ctx.JSON(http.StatusCreated, toAPIAgentKey(key))
 }
 
-// ListKeys lists the Nostr keys the authenticated user has registered.
+// callerMayDelegateScope refuses to mint a key whose scope exceeds the credential minting it,
+// writing the refusal onto ctx and returning false when it does.
+//
+// An agent key is a token in every respect that matters: services/auth sets ApiTokenScope from
+// key.Scope, so the key's scope is exactly what every tokenRequiresScopes guard in the API sees.
+// Without this check a personal access token limited to `write:user` could POST here and receive
+// back a credential for the same account carrying `write:repository,write:organization` - the
+// token would have escalated itself, and a leaked narrow token would be a worse starting position
+// than it is today. Gitea has already made this call for its own credential-minting endpoint:
+// /users/{username}/tokens sits behind reqBasicOrRevProxyAuth() so that a token cannot mint a
+// token. A token may only delegate what it already holds.
+//
+// A web session or a basic-auth password login carries no ApiTokenScope and is not constrained
+// here. That is the human's own full authority, which is precisely what the ownership chain is
+// rooted at; reqHumanAuth() has already excluded an agent's own signature from this endpoint.
+func callerMayDelegateScope(ctx *context.APIContext, requested auth_model.AccessTokenScope) bool {
+	callerScope, ok := ctx.Data["ApiTokenScope"].(auth_model.AccessTokenScope)
+	if !ok || callerScope == "" {
+		return true
+	}
+
+	// `public-only` narrows a credential rather than granting anything, so it is not something
+	// the caller must "hold" - but it does have to be inherited: a public-only token must not be
+	// able to mint a key that reaches private data.
+	callerPublicOnly, err := callerScope.PublicOnly()
+	if err != nil {
+		ctx.APIErrorInternal(err)
+		return false
+	}
+	if callerPublicOnly {
+		requestedPublicOnly, err := requested.PublicOnly()
+		if err != nil {
+			ctx.APIErrorInternal(err)
+			return false
+		}
+		if !requestedPublicOnly {
+			ctx.APIError(http.StatusForbidden, "a public-only credential may only register a public-only agent key")
+			return false
+		}
+	}
+
+	for _, want := range requested.StringSlice() {
+		if auth_model.AccessTokenScope(want) == auth_model.AccessTokenScopePublicOnly {
+			continue
+		}
+		has, err := callerScope.HasScope(auth_model.AccessTokenScope(want))
+		if err != nil {
+			ctx.APIErrorInternal(err)
+			return false
+		}
+		if !has {
+			ctx.APIError(http.StatusForbidden, "an agent key cannot be granted a scope the calling credential does not hold: "+want)
+			return false
+		}
+	}
+	return true
+}
+
+// ListKeys lists the Nostr keys the authenticated user registered, plus any registered for them.
+//
+// The second half is what makes the answer trustworthy as "what can sign as me": a site admin may
+// enrol a key naming another user as the agent, and that key is owned by the admin. Listing only
+// what the caller owns would answer a question nobody asked and quietly omit the credential the
+// caller most needs to know about.
 func ListKeys(ctx *context.APIContext) {
 	// swagger:operation GET /agent/keys agent agentListKeys
 	// ---
-	// summary: List the Nostr keys the authenticated user has registered
+	// summary: List the Nostr keys the authenticated user registered, and those registered for them
 	// produces:
 	// - application/json
 	// responses:
@@ -164,7 +243,7 @@ func ListKeys(ctx *context.APIContext) {
 	//   "403":
 	//     "$ref": "#/responses/forbidden"
 
-	keys, err := agent_model.ListKeysByOwner(ctx, ctx.Doer.ID)
+	keys, err := agent_model.ListKeysVisibleToUser(ctx, ctx.Doer.ID)
 	if err != nil {
 		ctx.APIErrorInternal(err)
 		return

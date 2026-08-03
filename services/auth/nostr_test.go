@@ -47,16 +47,17 @@ func nostrTestRequest(t *testing.T, method, path, body, authHeader string) *http
 
 // nostrSignedHeader signs a NIP-98 event for the given request and returns the header value.
 //
-// Every call produces a distinct event, because created_at moves and, when it does not, the salt
+// Every call produces a distinct event, because created_at moves and, when it does not, the nonce
 // tag does: the server spends each event id exactly once, so two tests that signed byte-identical
 // events would see the second one rejected as a replay for reasons that have nothing to do with
-// what they are testing.
+// what they are testing. The nonce is also mandatory - VerifyCredential refuses an event without
+// one - so passing an empty one is how a test asks for that refusal.
 func nostrSignedHeader(t *testing.T, secretKey, method, rawURL, body string) string {
 	t.Helper()
-	return nostrSignedHeaderSalted(t, secretKey, method, rawURL, body, t.Name())
+	return nostrSignedHeaderNonced(t, secretKey, method, rawURL, body, t.Name())
 }
 
-func nostrSignedHeaderSalted(t *testing.T, secretKey, method, rawURL, body, salt string) string {
+func nostrSignedHeaderNonced(t *testing.T, secretKey, method, rawURL, body, nonce string) string {
 	t.Helper()
 	tags := nostr.Tags{
 		nostr.Tag{"u", rawURL},
@@ -66,8 +67,8 @@ func nostrSignedHeaderSalted(t *testing.T, secretKey, method, rawURL, body, salt
 		sum := sha256.Sum256([]byte(body))
 		tags = append(tags, nostr.Tag{"payload", hex.EncodeToString(sum[:])})
 	}
-	if salt != "" {
-		tags = append(tags, nostr.Tag{"salt", salt})
+	if nonce != "" {
+		tags = append(tags, nostr.Tag{"nonce", nonce})
 	}
 	event := nostr.Event{Kind: agentauth.EventKind, CreatedAt: nostr.Now(), Tags: tags}
 	require.NoError(t, event.Sign(secretKey))
@@ -213,7 +214,7 @@ func TestNostrVerify(t *testing.T) {
 	// The half of replay protection that the URL binding cannot provide: the identical request,
 	// sent twice, inside the freshness window.
 	t.Run("the same event replayed verbatim is rejected", func(t *testing.T) {
-		header := nostrSignedHeaderSalted(t, nostrTestSecretKey, "POST", fullURL, body, "verbatim-replay")
+		header := nostrSignedHeaderNonced(t, nostrTestSecretKey, "POST", fullURL, body, "verbatim-replay")
 
 		first := nostrTestRequest(t, "POST", path, body, header)
 		u, err := (&Nostr{}).Verify(first, nil, reqctx.ContextData{}, nil)
@@ -384,7 +385,7 @@ func TestNostrVerifyOwnerIsNotTheAgent(t *testing.T) {
 	const path = "/api/v1/repos/user2/repo1/issues"
 	const body = "signed by an agent its owner does not share an account with"
 	req := nostrTestRequest(t, "POST", path, body,
-		nostrSignedHeaderSalted(t, secretKey, "POST", "http://localhost:3000"+path, body, "split-ownership"))
+		nostrSignedHeaderNonced(t, secretKey, "POST", "http://localhost:3000"+path, body, "split-ownership"))
 
 	u, err := (&Nostr{}).Verify(req, nil, reqctx.ContextData{}, nil)
 	require.NoError(t, err)

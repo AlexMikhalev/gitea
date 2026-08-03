@@ -86,9 +86,22 @@ func TestRegisterAndLookupKey(t *testing.T) {
 	_, err = GetKeyByPubKey(ctx, strings.Repeat("a", 64))
 	assert.True(t, IsErrAgentKeyNotExist(err), "got %v", err)
 
-	keys, err := ListKeysByOwner(ctx, 1)
+	keys, err := ListKeysVisibleToUser(ctx, 1)
 	require.NoError(t, err)
 	assert.Len(t, keys, 1)
+
+	// The agent the key authenticates as can see it too, even though it does not own it: an
+	// admin-registered key is owned by the admin, and the account it signs for has to be able
+	// to find out that it exists.
+	keys, err = ListKeysVisibleToUser(ctx, 2)
+	require.NoError(t, err)
+	require.Len(t, keys, 1)
+	assert.Equal(t, key.ID, keys[0].ID)
+
+	// Nobody else sees it.
+	keys, err = ListKeysVisibleToUser(ctx, 3)
+	require.NoError(t, err)
+	assert.Empty(t, keys)
 
 	// Revocation is a flag, never a delete: the audit rows must keep pointing at a live row.
 	require.NoError(t, RevokeKey(ctx, key.ID))
