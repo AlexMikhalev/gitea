@@ -14,10 +14,12 @@ import (
 	agent_model "code.gitea.io/gitea/models/agent"
 	auth_model "code.gitea.io/gitea/models/auth"
 	"code.gitea.io/gitea/models/db"
+	git_model "code.gitea.io/gitea/models/git"
 	issues_model "code.gitea.io/gitea/models/issues"
 	repo_model "code.gitea.io/gitea/models/repo"
 	"code.gitea.io/gitea/models/unittest"
 	user_model "code.gitea.io/gitea/models/user"
+	"code.gitea.io/gitea/modules/commitstatus"
 	api "code.gitea.io/gitea/modules/structs"
 	"code.gitea.io/gitea/modules/timeutil"
 	"code.gitea.io/gitea/tests"
@@ -56,11 +58,14 @@ func writeEventStreamRows(t *testing.T) string {
 			CreatedUnix: eventStreamBase + 20,
 		},
 		&issues_model.Review{
-			Type:        issues_model.ReviewTypeApprove,
-			ReviewerID:  2,
-			IssueID:     2, // repo1, a pull request
-			Content:     "published review",
+			Type:       issues_model.ReviewTypeApprove,
+			ReviewerID: 2,
+			IssueID:    2, // repo1, a pull request
+			Content:    "a hedgehog reviewed this",
+			// A review event is stamped by updated_unix - the second it was submitted,
+			// not the second its author started drafting it.
 			CreatedUnix: eventStreamBase + 30,
+			UpdatedUnix: eventStreamBase + 30,
 		},
 		&agent_model.AuditEvent{
 			RepoID:      1,
@@ -72,6 +77,21 @@ func writeEventStreamRows(t *testing.T) string {
 			Method:      "GET",
 			RequestURL:  "https://example.com/api/v1/repos/user2/repo1/issues",
 			CreatedUnix: eventStreamBase + 40,
+		},
+		// The commit status is here for ?q=. Its searchable text is split across two columns
+		// and the Postgres branch matches them through a single two-column to_tsvector
+		// expression, which is the most fragile of the four and the only one no other test
+		// makes match a row.
+		&git_model.CommitStatus{
+			Index:       200,
+			RepoID:      1,
+			State:       commitstatus.CommitStatusSuccess,
+			SHA:         "1234123412341234123412341234123412341234",
+			TargetURL:   "https://example.com/builds/200",
+			Description: "the hedgehog build passed",
+			Context:     "ci/hedgehog",
+			CreatorID:   2,
+			CreatedUnix: eventStreamBase + 50,
 		},
 	}
 	for _, row := range rows {
@@ -97,6 +117,14 @@ func eventKeys(list *api.RepoEventList) []string {
 	return keys
 }
 
+func eventKinds(list *api.RepoEventList) []string {
+	kinds := make([]string, 0, len(list.Data))
+	for _, event := range list.Data {
+		kinds = append(kinds, event.Kind)
+	}
+	return kinds
+}
+
 // TestAPIRepoEventStream drives the endpoint end to end: the five queries run against a real
 // schema, through the router's permission middleware, and their union is paged by the cursor the
 // previous response handed back.
@@ -116,12 +144,11 @@ func TestAPIRepoEventStream(t *testing.T) {
 		var list api.RepoEventList
 		DecodeJSON(t, resp, &list)
 		assert.Empty(t, list.NextCursor, "the stream is exhausted, so there is no next page")
-		require.Len(t, list.Data, 4)
-		assert.Equal(t, []string{"agent_audit", "review", "comment", "action"}, []string{
-			list.Data[0].Kind, list.Data[1].Kind, list.Data[2].Kind, list.Data[3].Kind,
-		})
+		require.Len(t, list.Data, 5)
+		assert.Equal(t, []string{"status", "agent_audit", "review", "comment", "action"},
+			eventKinds(&list))
 		assert.Equal(t, repo.ID, list.Data[0].RepoID)
-		assert.Equal(t, "a hedgehog on the issue", list.Data[2].Payload["content"])
+		assert.Equal(t, "a hedgehog on the issue", list.Data[3].Payload["content"])
 	})
 
 	t.Run("the cursor pages every event exactly once", func(t *testing.T) {
@@ -166,6 +193,16 @@ func TestAPIRepoEventStream(t *testing.T) {
 		assert.Equal(t, "action", list.Data[1].Kind)
 	})
 
+	// This is the only suite that runs against PostgreSQL with the full-text indexes built -
+	// repoevent.Init runs here (tests/test_utils.go, InitWebInstalled) and flips ?q= onto the
+	// to_tsvector branch, where the builder-level assertions in services/repoevent cannot follow
+	// it. So every source that has an index is made to match a row rather than merely to have
+	// its expression sent: an expression that is a type error, that Postgres refuses as
+	// non-immutable, or that simply matches nothing is only distinguishable from here.
+	//
+	// `hedgehog` is a whole word, not a stop word and not a substring of anything else in the
+	// window, which is what makes the expected set the same on both search paths - the two do
+	// not otherwise match the same rows, and the endpoint documents that.
 	t.Run("q searches each kind's own text", func(t *testing.T) {
 		resp := MakeRequest(t, NewRequest(t, "GET",
 			eventStreamURL(t, owner.Name, repo.Name, url.Values{"since": {since}, "q": {"hedgehog"}}),
@@ -173,8 +210,22 @@ func TestAPIRepoEventStream(t *testing.T) {
 
 		var list api.RepoEventList
 		DecodeJSON(t, resp, &list)
-		assert.Equal(t, []string{"comment", "action"}, []string{list.Data[0].Kind, list.Data[1].Kind})
-		assert.Len(t, list.Data, 2)
+		assert.Equal(t, []string{"status", "review", "comment", "action"}, eventKinds(&list))
+		assert.Len(t, list.Data, 4)
+	})
+
+	// The audit trail has no index and takes the LIKE path on every dialect, so a search that
+	// only it can answer must return it on Postgres too rather than falling into the full-text
+	// branch of a source that has one.
+	t.Run("q reaches the sources that have no index", func(t *testing.T) {
+		resp := MakeRequest(t, NewRequest(t, "GET",
+			eventStreamURL(t, owner.Name, repo.Name,
+				url.Values{"since": {since}, "q": {"/repos/user2/repo1/"}}),
+		).AddTokenAuth(token), http.StatusOK)
+
+		var list api.RepoEventList
+		DecodeJSON(t, resp, &list)
+		assert.Equal(t, []string{"agent_audit"}, eventKinds(&list))
 	})
 
 	t.Run("an unknown actor is an empty stream, not a 404", func(t *testing.T) {

@@ -79,6 +79,8 @@ var adapters = []adapter{
 // rows. The condition keeps `user_id = act_user_id`, the original, which is why an event appears
 // once here rather than once per watcher.
 //
+// unreportedActionCond drops the other duplication, the one across kinds; see it for the reasoning.
+//
 // One caveat about `?q=` here, documented on the endpoint too: `action`.content is not prose. For a
 // push it is serialized JSON ({"Len":..,"Commits":[..]}), so a search matches against that JSON's
 // text - keys and punctuation included - rather than against a message a person wrote. That is the
@@ -98,14 +100,18 @@ func fetchActions(ctx context.Context, opts *fetchOptions) ([]*Event, error) {
 		return nil, err
 	}
 	cond = cond.And(keysetCond(opts.Cursor, KindAction, "`action`.created_unix", "`action`.id")).
-		And(rangeCond(opts.Since, opts.Until, "`action`.created_unix"))
+		And(rangeCond(opts.Since, opts.Until, "`action`.created_unix")).
+		And(unreportedActionCond(opts))
 	if opts.ActorID > 0 {
 		cond = cond.And(builder.Eq{"`action`.act_user_id": opts.ActorID})
 	}
 	cond = cond.And(searchCond(opts.Query, TSVectorExpr("`action`.content"), "`action`.content"))
 
 	var rows []*activities_model.Action
-	if err := db.GetEngine(ctx).Where(cond).
+	if err := db.GetEngine(ctx).Table("action").
+		Join("LEFT", "comment", "`comment`.id = `action`.comment_id").
+		Select("`action`.*").
+		Where(cond).
 		OrderBy("`action`.created_unix DESC, `action`.id DESC").
 		Limit(opts.Limit).Find(&rows); err != nil {
 		return nil, err
@@ -118,6 +124,11 @@ func fetchActions(ctx context.Context, opts *fetchOptions) ([]*Event, error) {
 			payload["ref_name"] = row.RefName
 		}
 		setText(payload, "content", row.Content)
+		// The `comment` row this activity was recorded against, when there is one. After
+		// unreportedActionCond it is never a comment this stream reports - that action row is
+		// gone - so it names a system comment: the CommentTypeClose an issue was closed with,
+		// the CommentTypeDismissReview a dismissal wrote (services/feed/notifier.go). It is a
+		// key into the comments API, not into this stream, and the endpoint says so.
 		if row.CommentID != 0 {
 			payload["comment_id"] = strconv.FormatInt(row.CommentID, 10)
 		}
@@ -139,7 +150,9 @@ func fetchActions(ctx context.Context, opts *fetchOptions) ([]*Event, error) {
 // CommentType counts from 0, so the zero value is a real plain comment and not "unset". Everything
 // else in that enum - label changes, milestone changes, branch deletions, the whole system-comment
 // range - is a record of something already reported by the `action` row next to it, and surfacing
-// both would report every state change twice.
+// both would report every state change twice. The types listed here have an `action` row beside
+// them too, and unreportedActionCond is the other half of that same rule: there the comment is the
+// copy kept and the action row is the one dropped.
 //
 // CommentTypeReview is in the list but is usually filtered out again by submittedReviewCond, which
 // is where the reasoning for that lives.
@@ -174,6 +187,60 @@ func submittedReviewCond() builder.Cond {
 		builder.Neq{"`comment`.type": issues_model.CommentTypeReview},
 		builder.IsNull{"`review`.id"},
 	)
+}
+
+// unreportedActionCond drops the `action` row Gitea writes beside a comment or a submitted review.
+//
+// It is submittedReviewCond's rule reached from the third side. Writing a plain comment writes both
+// a `comment` row and an ActionCommentIssue/ActionCommentPull row; submitting a review writes a
+// `review` row, a CommentTypeReview `comment` row *and* an ActionApprovePullRequest,
+// ActionRejectPullRequest or ActionCommentPull row, plus one more per line comment
+// (services/feed/notifier.go). The system comment types are excluded from this stream precisely
+// because "the `action` row next to it already reports it" - but for the content-bearing types the
+// same mechanism reports the same act twice, once as `action` and once as `comment` or `review`.
+// Without this, `?kinds=action,comment` shows every comment twice, and the action row's
+// payload.comment_id names a `(kind=comment, source_id=N)` that no page of the stream would ever
+// return, because submittedReviewCond had already dropped exactly that comment.
+//
+// Which copy is kept is decided the same way as there: the richer one. The `comment` and `review`
+// rows carry the full text, the issue, its index, the comment or review type; the `action` row
+// carries an op type and the first line of the content. So `action` is the copy that goes, and a
+// client asking for `kinds=action` alone no longer sees comments - the same shape of answer
+// `kinds=comment` alone already gives for a submitted review.
+//
+// It is dropped only when the counterpart is actually there to report it. `comment` is LEFT-joined
+// on action.comment_id, so an action whose comment was deleted, or which never named one, joins to
+// NULL and stays - the branches are spelled out positively rather than as a NOT for the reason
+// publishedReviewCond gives: NOT(NULL) is NULL, which is not true, and every ordinary push, branch
+// and repository action has a NULL here.
+//
+// The unit checks are the last branch. Visibility on this endpoint is per kind, and the `action`
+// kind is deliberately not filtered by unit: a reader who can reach the repository but not its
+// issues still gets its activity rows. For such a reader the comment kind reports nothing, so there
+// is no duplicate to drop and the action row is the only report there is - dropping it would turn a
+// deduplication into a deletion. Only the unit the doer cannot read needs naming, which is why the
+// common case (both readable) adds no subquery at all.
+func unreportedActionCond(opts *fetchOptions) builder.Cond {
+	canIssues := opts.Permission.CanRead(unit.TypeIssues)
+	canPulls := opts.Permission.CanRead(unit.TypePullRequests)
+	if !canIssues && !canPulls {
+		return builder.NewCond()
+	}
+
+	keep := builder.Or(
+		builder.Eq{"`action`.comment_id": 0},
+		builder.IsNull{"`comment`.id"},
+		builder.NotIn("`comment`.type", contentBearingCommentTypes),
+	)
+	switch {
+	case !canIssues:
+		keep = keep.Or(builder.In("`comment`.issue_id",
+			builder.Select("id").From("issue").Where(builder.Eq{"repo_id": opts.Repo.ID, "is_pull": false})))
+	case !canPulls:
+		keep = keep.Or(builder.In("`comment`.issue_id",
+			builder.Select("id").From("issue").Where(builder.Eq{"repo_id": opts.Repo.ID, "is_pull": true})))
+	}
+	return keep
 }
 
 // fetchComments reads issue and pull request comments.
@@ -255,6 +322,32 @@ func fetchComments(ctx context.Context, opts *fetchOptions) ([]*Event, error) {
 	return events, nil
 }
 
+// reviewTimeCol is the column a review event is stamped, ordered, paged and range-filtered by.
+//
+// It is updated_unix rather than created_unix because a `review` row is not created when the review
+// happens. Gitea writes it as ReviewTypePending the moment its author types their first draft line
+// comment (services/pull/review.go), and SubmitReview later flips the type in place with
+// Cols("content, type, official, commit_id, stale") - created_unix is never touched
+// (models/issues/review.go). The row therefore becomes visible to this endpoint, by ceasing to be
+// pending, at a second that may be hours or days in the past.
+//
+// Stamping that second would put a submitted review behind a position every reader has already
+// walked past: `?since=` would never return it and a cursor walk would visit it never rather than
+// once - the one thing the paging contract on the endpoint promises. updated_unix is the second the
+// row became the thing this stream reports, which is what every other source's created_unix already
+// means. The dedup below makes this the only copy there is: the CommentTypeReview comment written
+// at submit time, which does carry the right instant, is the one dropped.
+//
+// The keyset, the range filter and the ORDER BY all name this same column, because a page whose
+// sort key is not the key its cursor was cut from repeats rows or skips them. `review`.updated_unix
+// is indexed (models/issues/review.go), so the ordering stays an index scan.
+//
+// One review mutation moves it again: DismissReview updates the row through xorm, which restamps
+// updated_unix, so a dismissal re-reports the review at its new position carrying dismissed=true.
+// That is a duplicate a client can see and act on, and it is the direction worth failing in -
+// created_unix fails by making the event unreachable instead.
+const reviewTimeCol = "`review`.updated_unix"
+
 // fetchReviews reads published pull request reviews.
 //
 // ReviewType counts from 0 and ReviewTypePending is that zero: a pending review is a draft the
@@ -269,6 +362,10 @@ func fetchComments(ctx context.Context, opts *fetchOptions) ([]*Event, error) {
 // performed. The human action is the CommentTypeReviewRequest comment, which this package drops as
 // a system comment; the request row is also hard-deleted when the request is withdrawn, so an event
 // built from it would disappear from a stream a client had already read.
+//
+// The instant a review event carries is reviewTimeCol, not `review`.created_unix, and that
+// difference is the difference between an event a client sees and one it never does; see the
+// constant for why.
 func fetchReviews(ctx context.Context, opts *fetchOptions) ([]*Event, error) {
 	if !opts.Permission.CanRead(unit.TypePullRequests) {
 		return nil, nil
@@ -276,8 +373,8 @@ func fetchReviews(ctx context.Context, opts *fetchOptions) ([]*Event, error) {
 	cond := builder.Eq{"issue.repo_id": opts.Repo.ID}.
 		And(builder.Eq{"issue.is_pull": true}).
 		And(builder.NotIn("`review`.type", issues_model.ReviewTypePending, issues_model.ReviewTypeRequest)).
-		And(keysetCond(opts.Cursor, KindReview, "`review`.created_unix", "`review`.id")).
-		And(rangeCond(opts.Since, opts.Until, "`review`.created_unix"))
+		And(keysetCond(opts.Cursor, KindReview, reviewTimeCol, "`review`.id")).
+		And(rangeCond(opts.Since, opts.Until, reviewTimeCol))
 	if opts.ActorID > 0 {
 		cond = cond.And(builder.Eq{"`review`.reviewer_id": opts.ActorID})
 	}
@@ -288,7 +385,7 @@ func fetchReviews(ctx context.Context, opts *fetchOptions) ([]*Event, error) {
 		Join("INNER", "issue", "issue.id = `review`.issue_id").
 		Select("`review`.*").
 		Where(cond).
-		OrderBy("`review`.created_unix DESC, `review`.id DESC").
+		OrderBy(reviewTimeCol + " DESC, `review`.id DESC").
 		Limit(opts.Limit).Find(&rows); err != nil {
 		return nil, err
 	}
@@ -323,7 +420,7 @@ func fetchReviews(ctx context.Context, opts *fetchOptions) ([]*Event, error) {
 			Kind:        KindReview,
 			SourceID:    row.ID,
 			ActorID:     row.ReviewerID,
-			CreatedUnix: row.CreatedUnix,
+			CreatedUnix: row.UpdatedUnix,
 			RepoID:      opts.Repo.ID,
 			Title:       title,
 			Payload:     payload,

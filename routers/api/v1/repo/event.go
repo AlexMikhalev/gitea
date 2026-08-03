@@ -32,11 +32,25 @@ func ListRepoEvents(ctx *context.APIContext) {
 	//   `<key>_truncated: "true"` and the full text must be read from the endpoint that owns
 	//   the row.
 	//
-	//   One action is one event. Submitting a review writes both a review row and a comment row
-	//   in Gitea, and only the review one is reported - so a submitted review is a single event
-	//   of kind `review`, never also a `comment`, and asking for `kinds=comment` alone will not
-	//   show it. The line comments of a review are separate events, each carrying that review's
-	//   id as `review_id` in its payload so that they can be grouped with it.
+	//   One act is one event, across kinds. Gitea records a comment or a submitted review in
+	//   more than one table - a comment row, for a review also a review row, and an activity row
+	//   beside either - and exactly one of them is reported. A submitted review is a single
+	//   event of kind `review`; a comment is a single event of kind `comment`; neither is also
+	//   an `action`. So a kind filter narrows the stream without splitting an act in two:
+	//   `kinds=comment` alone will not show a submitted review, and `kinds=action` alone will
+	//   not show comments or reviews. The line comments of a review are separate events, each
+	//   carrying that review's id as `review_id` in its payload so that they can be grouped
+	//   with it.
+	//
+	//   An `action` event's `payload.comment_id`, where present, names the system comment the
+	//   activity was recorded against - the one written when an issue was closed or a review
+	//   dismissed. Those are not events of this stream; read them from the comments API.
+	//
+	//   A `review` event's `created` is the second the review was submitted, not the second its
+	//   author began drafting it - Gitea writes the row when the first draft line comment is
+	//   typed and publishes it later, and a stream ordered by the earlier second would place a
+	//   review behind a position readers had already passed. Dismissing a review reports it
+	//   again, at the dismissal's second, with `dismissed` set.
 	//
 	//   Visibility is per kind. Comments, reviews and statuses are filtered by the repository
 	//   unit they belong to (issues, pull requests, code), and the agent audit trail is

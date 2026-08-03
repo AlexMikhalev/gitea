@@ -98,12 +98,16 @@ func prepareStream(t *testing.T) *stream {
 		Content:     "a remark on the pull request",
 		CreatedUnix: streamBase + 30,
 	}
+	// A review is stamped by updated_unix, the second it was submitted; a row written straight
+	// to the table has never been anything else, so the two are the same second here. The rows
+	// where they differ are what TestListStampsAReviewWithItsSubmission is about.
 	review := &issues_model.Review{
 		Type:        issues_model.ReviewTypeApprove,
 		ReviewerID:  s.owner.ID,
 		IssueID:     2,
 		Content:     "published review",
 		CreatedUnix: streamBase + 40,
+		UpdatedUnix: streamBase + 40,
 	}
 	draftReview := &issues_model.Review{
 		Type:        issues_model.ReviewTypePending,
@@ -111,6 +115,7 @@ func prepareStream(t *testing.T) *stream {
 		IssueID:     2,
 		Content:     "unsubmitted draft",
 		CreatedUnix: streamBase + 50,
+		UpdatedUnix: streamBase + 50,
 	}
 	commitStatus := &git_model.CommitStatus{
 		Index:       100,
@@ -567,6 +572,77 @@ func TestListReportsASubmittedReviewOnce(t *testing.T) {
 		"a review comment with no review row left is the only report of it there is")
 }
 
+// A review event is stamped with the second the review was *submitted*, and only SubmitReview can
+// tell whether it is: it is the one path that leaves created_unix and updated_unix disagreeing.
+//
+// Gitea writes the `review` row as ReviewTypePending the moment its author types their first draft
+// line comment, and SubmitReview flips the type in place hours or days later without touching
+// created_unix. Every other fixture in this file inserts a row that was already submitted, so a
+// regression to created_unix passes all of them - the row only becomes reportable at a second the
+// stream never sees if the two differ, which is what this test manufactures.
+func TestListStampsAReviewWithItsSubmission(t *testing.T) {
+	s := prepareStream(t)
+
+	// The reviewer is user4 rather than user1, who already has a pending review on issue 2 in
+	// the shipped fixtures; GetCurrentReview would find that one instead of this one.
+	reviewer := s.outsider
+	issue := unittest.AssertExistsAndLoadBean(t, &issues_model.Issue{ID: 2})
+	require.NoError(t, issue.LoadRepo(t.Context()))
+
+	// The draft, typed long ago. It has to predate the wall clock rather than streamBase,
+	// because SubmitReview stamps updated_unix with the current second and streamBase is a
+	// second in 2033 - the whole point is that the submission lands after the draft.
+	draftedAt := timeutil.TimeStamp(1_000_000_000)
+	insertAt(t, &issues_model.Review{
+		Type:        issues_model.ReviewTypePending,
+		ReviewerID:  reviewer.ID,
+		IssueID:     issue.ID,
+		Content:     "",
+		CreatedUnix: draftedAt,
+		UpdatedUnix: draftedAt,
+	})
+
+	// The submission. Called rather than simulated: what is under test is precisely which of
+	// the columns SubmitReview writes, and a hand-built row would encode this test's belief
+	// about that rather than check it.
+	review, _, err := issues_model.SubmitReview(t.Context(), reviewer, issue,
+		issues_model.ReviewTypeComment, "submitted long after the draft was started", "", false, nil)
+	require.NoError(t, err)
+
+	submitted := unittest.AssertExistsAndLoadBean(t, &issues_model.Review{ID: review.ID})
+	require.Equal(t, draftedAt, submitted.CreatedUnix,
+		"SubmitReview leaves created_unix at the draft's second - if this ever stops being true the finding this test guards is gone, not the test")
+	require.Greater(t, submitted.UpdatedUnix, submitted.CreatedUnix)
+
+	// The client that reads the stream between the two seconds and then polls forward. With
+	// created_unix the submission lands behind `since` and is never returned at all.
+	after := submitted.CreatedUnix + 1
+	events, _ := listOrFail(t, &ListOptions{
+		Repo: s.repo, Doer: s.owner, Permission: repoPermission(t, s.repo, s.owner),
+		Since: &after, Limit: MaxLimit,
+	})
+
+	var stamped *Event
+	for _, e := range events {
+		if e.Kind == KindReview && e.SourceID == review.ID {
+			stamped = e
+		}
+	}
+	require.NotNil(t, stamped, "a review submitted after `since` never reached the stream")
+	assert.Equal(t, submitted.UpdatedUnix, stamped.CreatedUnix,
+		"the event carries the second the review was submitted, not the second the draft was started")
+
+	// And the comment SubmitReview writes beside it - the copy that did carry the right instant -
+	// is still the one dropped, so the submission is one event and not two.
+	for _, e := range events {
+		if e.Kind == KindComment {
+			comment := unittest.AssertExistsAndLoadBean(t, &issues_model.Comment{ID: e.SourceID})
+			assert.NotEqual(t, review.ID, comment.ReviewID,
+				"one submission reached the stream as two events")
+		}
+	}
+}
+
 // The pair is in the shipped fixtures on its own, without this file writing anything: `review` 20
 // and `comment` 9 (review_id 20) are one submission at 946684810, and `review` 21 and `comment` 10
 // (review_id 21) are another. A window-scoped test cannot catch a regression here, because the rows
@@ -587,6 +663,96 @@ func TestListDeduplicatesFixtureReviewSubmissions(t *testing.T) {
 		assert.Contains(t, got, key(KindReview, pair.review))
 		assert.NotContains(t, got, key(KindComment, pair.comment))
 	}
+}
+
+// One act is one event across kinds, not only within one. Gitea writes an `action` row beside every
+// comment and every submitted review, so without the second half of the dedup the stream reports
+// each of them twice under two kinds - and the action row's payload.comment_id names the very
+// comment the review/comment dedup had already dropped, a reference no page could ever resolve.
+func TestListReportsACommentedActOnce(t *testing.T) {
+	s := prepareStream(t)
+
+	// The CommentTypeReview row SubmitReview writes beside a review, and the action row the
+	// feed notifier writes beside both - the case where comment_id pointed at nothing.
+	submission := &issues_model.Comment{
+		Type:        issues_model.CommentTypeReview,
+		PosterID:    s.owner.ID,
+		IssueID:     2,
+		ReviewID:    s.review,
+		Content:     "published review",
+		CreatedUnix: streamBase + 40,
+	}
+	// A system comment is not an event of this stream, so the action recorded against it is
+	// that act's only report and has to stay.
+	closure := &issues_model.Comment{
+		Type:        issues_model.CommentTypeClose,
+		PosterID:    s.owner.ID,
+		IssueID:     1,
+		CreatedUnix: streamBase + 25,
+	}
+	insertAt(t, submission, closure)
+
+	action := func(opType activities_model.ActionType, commentID int64, at timeutil.TimeStamp) *activities_model.Action {
+		return &activities_model.Action{
+			UserID:      s.owner.ID,
+			ActUserID:   s.owner.ID,
+			RepoID:      s.repo.ID,
+			OpType:      opType,
+			CommentID:   commentID,
+			Content:     "2|a hedgehog on the issue",
+			CreatedUnix: at,
+		}
+	}
+	commented := action(activities_model.ActionCommentIssue, s.issueComment, streamBase+21)
+	reviewed := action(activities_model.ActionApprovePullRequest, submission.ID, streamBase+41)
+	// An action whose comment was deleted out from under it still records something that
+	// happened, and is the case the "comment joined to nothing" branch keeps.
+	orphan := action(activities_model.ActionCommentIssue, 9_999_999, streamBase+22)
+	closed := action(activities_model.ActionCloseIssue, closure.ID, streamBase+26)
+	insertAt(t, commented, reviewed, orphan, closed)
+
+	got := keysOf(mustList(t, s, s.owner, repoPermission(t, s.repo, s.owner)))
+
+	assert.NotContains(t, got, key(KindAction, commented.ID),
+		"a comment reached the stream as two events, once as `comment` and once as `action`")
+	assert.Contains(t, got, key(KindComment, s.issueComment),
+		"the comment is the copy that is kept - it carries the full text, the issue and its index")
+
+	assert.NotContains(t, got, key(KindAction, reviewed.ID),
+		"a submitted review reached the stream as two events")
+	assert.Contains(t, got, key(KindReview, s.review))
+	assert.NotContains(t, got, key(KindComment, submission.ID))
+
+	assert.Contains(t, got, key(KindAction, orphan.ID),
+		"an action whose comment is gone is the only report of it there is")
+	assert.Contains(t, got, key(KindAction, closed.ID),
+		"a close is recorded against a system comment this stream does not report")
+
+	// The action kind is deliberately not filtered by unit. For a reader the comment kind
+	// reports nothing to, there is no duplicate to drop - and dropping it anyway would turn the
+	// deduplication into a deletion.
+	t.Run("a reader who cannot see comments keeps the action row", func(t *testing.T) {
+		got := keysOf(mustList(t, s, s.outsider, unitPermission(s.repo.ID, unit.TypeCode)))
+		assert.Contains(t, got, key(KindAction, commented.ID))
+		assert.NotContains(t, got, key(KindComment, s.issueComment))
+	})
+
+	t.Run("a pull-requests-only reader keeps the issue comment's action row", func(t *testing.T) {
+		got := keysOf(mustList(t, s, s.outsider, unitPermission(s.repo.ID, unit.TypePullRequests)))
+		assert.Contains(t, got, key(KindAction, commented.ID),
+			"the issue comment is invisible to this reader, so its action row is the only report")
+		assert.NotContains(t, got, key(KindAction, reviewed.ID),
+			"the review is visible to this reader, so its action row is still a duplicate")
+	})
+}
+
+// mustList reads the whole written window for one doer and permission.
+func mustList(t *testing.T, s *stream, doer *user_model.User, permission *access_model.Permission) []*Event {
+	t.Helper()
+	events, _ := listOrFail(t, &ListOptions{
+		Repo: s.repo, Doer: doer, Permission: permission, Since: since(), Limit: MaxLimit,
+	})
+	return events
 }
 
 // A line comment is not a duplicate of the review it belongs to - it is a remark of its own, at its
