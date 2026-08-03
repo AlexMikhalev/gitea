@@ -26,8 +26,10 @@ func ListRepoEvents(ctx *context.APIContext) {
 	//   Returns activity rows, issue and pull request comments, published reviews, commit
 	//   statuses and - for repository admins - the agent audit trail, merged newest first.
 	//   Paging is by the opaque next_cursor rather than by page number, so following it visits
-	//   every event exactly once even while new events are being written. Events the requesting
-	//   user may not see are absent from the stream rather than reported as forbidden.
+	//   every event exactly once even while new events are being written - with one exception,
+	//   a review dismissed while the walk is in progress, described under `review` below. Events
+	//   the requesting user may not see are absent from the stream rather than reported as
+	//   forbidden.
 	//
 	//   Free-text payload values are truncated; when a value was cut, the payload also carries
 	//   `<key>_truncated: "true"` and the full text must be read from the endpoint that owns
@@ -50,10 +52,13 @@ func ListRepoEvents(ctx *context.APIContext) {
 	//   A `review` event's `created` is the second the review was submitted, not the second its
 	//   author began drafting it - Gitea writes the row when the first draft line comment is
 	//   typed and publishes it later, and a stream ordered by the earlier second would place a
-	//   review behind a position readers had already passed. Dismissing a review reports it
-	//   again, at the dismissal's second, with `dismissed` set. A review superseded by a later
-	//   one from the same reviewer is not reported again: it keeps its submission position and
-	//   its `dismissed` flag is set where it stands.
+	//   review behind a position readers had already passed. Dismissing a review *moves* it to
+	//   the dismissal's second, with `dismissed` set; it is not also reported at its submission
+	//   position. A walk that has already paged past the dismissal's second therefore meets that
+	//   review at neither position and loses it, so a client that must not lose reviews should
+	//   re-read from the top rather than rely on the cursor alone. A review superseded by a later
+	//   one from the same reviewer does not move: it keeps its submission position and its
+	//   `dismissed` flag is set where it stands.
 	//
 	//   Visibility is per kind. Comments, reviews and statuses are filtered by the repository
 	//   unit they belong to (issues, pull requests, code), and the agent audit trail is
@@ -104,8 +109,10 @@ func ListRepoEvents(ctx *context.APIContext) {
 	//
 	//     How the match is made depends on the instance's database. On PostgreSQL it is a
 	//     full-text match, which stems words, ignores case and skips stop words: `running`
-	//     matches "runs" and `the` matches nothing. On MySQL and SQLite it is a
-	//     case-insensitive substring match: `fix` matches "prefix". Callers that must behave
+	//     matches "runs" and `the` matches nothing. The agent_audit kind is the exception: it
+	//     matches a request URL, which full-text indexing would chop into tokens, so it uses the
+	//     substring match on every database. On MySQL and SQLite it is a case-insensitive
+	//     substring match everywhere: `fix` matches "prefix". Callers that must behave
 	//     identically everywhere should not depend on either one's extra matches.
 	//
 	//     The term is matched literally either way. `%` and `_` are searched for as themselves

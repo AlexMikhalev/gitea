@@ -343,9 +343,15 @@ func fetchComments(ctx context.Context, opts *fetchOptions) ([]*Event, error) {
 // is indexed (models/issues/review.go), so the ordering stays an index scan.
 //
 // One review mutation moves it again: DismissReview updates the row through xorm, which restamps
-// updated_unix, so a dismissal re-reports the review at its new position carrying dismissed=true.
-// That is a duplicate a client can see and act on, and it is the direction worth failing in -
-// created_unix fails by making the event unreachable instead.
+// updated_unix. Because updated_unix is the sort key rather than a second row, that dismissal
+// *moves* the review to the dismissal's second - it is not re-reported alongside the copy at its
+// submission position, and a client walking a cursor backwards past that second will not meet it at
+// either position. So a backfill in progress can miss a review dismissed underneath it, and a client
+// that must not lose reviews has to re-read from the top rather than rely on the cursor alone.
+//
+// That is still the direction worth failing in, because it is bounded to reviews dismissed during a
+// walk: created_unix would put every submitted review behind a position readers had already passed,
+// unreachable from the moment it is published.
 //
 // The other mutation that could have moved it does not. CreateReview marks every earlier approve or
 // reject by the same reviewer on the same issue as dismissed when a new one is submitted
