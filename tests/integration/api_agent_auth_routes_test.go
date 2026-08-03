@@ -178,7 +178,6 @@ var agentAuthGuardedRoutes = map[string]string{
 // reqHumanAuth(), with the reason. The constants above carry the reasoning; grouping the
 // routes by constant is what makes a misfiled one visible.
 var agentAuthExemptRoutes = map[string]string{
-
 	// Removes
 	"DELETE /admin/actions/runners/{runner_id}":                                       exemptRemoves,
 	"DELETE /admin/hooks/{id}":                                                        exemptRemoves,
