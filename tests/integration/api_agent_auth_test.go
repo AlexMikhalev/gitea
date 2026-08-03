@@ -7,7 +7,9 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
@@ -1216,4 +1218,112 @@ func TestAPIAgentAuditRecordsRefusedRequests(t *testing.T) {
 	require.NotEmpty(t, events, "a refused agent request left no trace")
 	assert.Equal(t, resp.Code, events[0].ResponseStatus,
 		"the trail must record the refusal, not imply the request was accepted")
+}
+
+// A body over the operator's ceiling is the one authentication failure that is not "your
+// credential was refused": the key, the signature and the clock are all fine and the *request* is
+// the problem. services/auth returns it as ErrUserAuthStatus{413} and routers/api/v1.apiAuth
+// answers with that status instead of the blanket 401, so that an operator reads "the body was too
+// big" rather than going looking for a key or clock problem they do not have.
+//
+// The whole path only exists for that distinction, so the assertions below are on the status *and*
+// the message: collapsing ErrUserAuthStatus back into the generic refusal - by reordering the two
+// branches in apiAuth, or by dropping the ErrBodyTooLarge wrap in services/auth.Nostr - leaves an
+// over-limit request answering 401 with everything else still green.
+func TestAPIAgentOversizedSignedBodyAnswers413(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+
+	// The shipping default is MiB-scale. The branch under test compares the body against whatever
+	// this holds, so shrinking it exercises the same code without moving 32 MiB through the suite.
+	const maxBodySize = 512
+	defer test.MockVariableValue(&setting.Agent.MaxRequestBodySize, int64(maxBodySize))()
+
+	const secretKey = "000000000000000000000000000000000000000000000000000000000000002d"
+	token := getUserToken(t, "user2", auth_model.AccessTokenScopeWriteUser, auth_model.AccessTokenScopeWriteIssue)
+	registerAgentKey(t, token, agentPubKey(t, secretKey), string(auth_model.AccessTokenScopeWriteIssue))
+
+	const issuePath = "/api/v1/repos/user2/repo1/issues"
+	const oversizedTitle = "oversized-" // the padding below is what carries the body over the cap
+	oversized := `{"title":"` + oversizedTitle + strings.Repeat("t", maxBodySize) + `"}`
+	require.Greater(t, len(oversized), maxBodySize)
+
+	// 413 happens in step 3 of authentication, before the event id is spent and before the audit
+	// insert, so a request refused for its size must leave no row - the same rule every other
+	// refusal follows.
+	rowsBefore := unittest.GetCount(t, &agent_model.AuditEvent{})
+
+	assert413 := func(t *testing.T, resp *httptest.ResponseRecorder) {
+		t.Helper()
+		assert.Contains(t, resp.Body.String(), "request body is too large to authorize with NIP-98",
+			"413 was answered, but not with the reason - so the caller is still being misdirected")
+		assert.NotContains(t, resp.Body.String(), "invalid username, password or token",
+			"an over-limit body was described as a rejected credential")
+	}
+
+	// The verifier bounds the body twice, and only the first bound is reachable from a well-behaved
+	// client; both have to answer the same way or the status would depend on how the caller framed
+	// the request rather than on how big it was.
+	t.Run("a declared Content-Length over the cap", func(t *testing.T) {
+		header := signNIP98(t, secretKey, "POST", issuePath, oversized, time.Now(), "oversized-declared")
+		req := NewRequestWithBody(t, "POST", issuePath, strings.NewReader(oversized)).
+			SetHeader("Content-Type", "application/json").
+			SetHeader("Authorization", header)
+		require.Positive(t, req.ContentLength, "strings.Reader should have declared its length")
+		assert413(t, MakeRequest(t, req, http.StatusRequestEntityTooLarge))
+	})
+
+	t.Run("an undeclared body over the cap", func(t *testing.T) {
+		header := signNIP98(t, secretKey, "POST", issuePath, oversized, time.Now(), "oversized-undeclared")
+		// http.NewRequest only fills in ContentLength for readers whose size it knows, so wrapping
+		// the same bytes in a plain ReadCloser is what makes the length unknown - the case the
+		// declared-length check above cannot catch.
+		req := NewRequestWithBody(t, "POST", issuePath, io.NopCloser(strings.NewReader(oversized))).
+			SetHeader("Content-Type", "application/json").
+			SetHeader("Authorization", header)
+		require.LessOrEqual(t, req.ContentLength, int64(0), "the body should have arrived with no declared length")
+		assert413(t, MakeRequest(t, req, http.StatusRequestEntityTooLarge))
+	})
+
+	// Size is checked *after* the signature and the key lookup, deliberately: a stranger must not
+	// be able to tell a registered key's limits from an unregistered one's, and must not be able to
+	// make the server describe its configuration at all.
+	t.Run("an unregistered key over the cap is still 401", func(t *testing.T) {
+		const strangerKey = "000000000000000000000000000000000000000000000000000000000000003d"
+		req := NewRequestWithBody(t, "POST", issuePath, strings.NewReader(oversized)).
+			SetHeader("Content-Type", "application/json").
+			SetHeader("Authorization", signNIP98(t, strangerKey, "POST", issuePath, oversized, time.Now(), "oversized-stranger"))
+		resp := MakeRequest(t, req, http.StatusUnauthorized)
+		assert.NotContains(t, resp.Body.String(), "too large",
+			"an unregistered caller learned the server's body limit")
+	})
+
+	t.Run("nothing was authorized and nothing was written", func(t *testing.T) {
+		assert.Equal(t, rowsBefore, unittest.GetCount(t, &agent_model.AuditEvent{}),
+			"a request refused for its size was recorded as an accepted credential")
+
+		req := NewRequest(t, "GET", issuePath+"?state=all").AddTokenAuth(token)
+		resp := MakeRequest(t, req, http.StatusOK)
+		var issues []*api.Issue
+		DecodeJSON(t, resp, &issues)
+		for _, issue := range issues {
+			assert.False(t, strings.HasPrefix(issue.Title, oversizedTitle),
+				"the oversized request was performed anyway")
+		}
+	})
+
+	// And the 413 is the size and nothing else: the identical credential shape under the cap is
+	// still accepted, so a regression that started refusing every signed body would fail here.
+	t.Run("the same request under the cap is accepted", func(t *testing.T) {
+		body := `{"title":"under the cap"}`
+		require.Less(t, len(body), maxBodySize)
+
+		req := NewRequestWithBody(t, "POST", issuePath, strings.NewReader(body)).
+			SetHeader("Content-Type", "application/json").
+			SetHeader("Authorization", signNIP98(t, secretKey, "POST", issuePath, body, time.Now(), "under-the-cap"))
+		resp := MakeRequest(t, req, http.StatusCreated)
+
+		issue := new(api.Issue)
+		DecodeJSON(t, resp, issue)
+		assert.Equal(t, "under the cap", issue.Title)
+	})
 }
