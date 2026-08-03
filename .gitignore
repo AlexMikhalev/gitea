@@ -124,3 +124,7 @@ prime/
 
 # A Makefile for custom make targets
 Makefile.local
+
+# Issue metadata scraped from a running instance by local tooling. It carries whatever the API
+# returned, including reporter email addresses, so it must never be committed by a `git add -A`.
+/.adf-issue.json

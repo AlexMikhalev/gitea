@@ -4,6 +4,7 @@
 package util
 
 import (
+	"errors"
 	"net/url"
 	"path"
 	"strings"
@@ -47,4 +48,40 @@ func SanitizeURL(s string) (string, error) {
 	}
 	u.User = nil
 	return u.String(), nil
+}
+
+// NormalizeAbsoluteURL renders an absolute URL in a form that can be compared byte-for-byte:
+// lower-case scheme and host, no default port, non-empty path. It deliberately does not touch the
+// query - parameter order is meaningful to anything that signed over the URL.
+//
+// It lives here rather than next to its caller because two layers need the same answer: the
+// NIP-98 verifier in services/agentauth compares a signed `u` tag against the server's own URL,
+// and models/agent re-runs that comparison when an auditor asks whether a stored row still
+// matches the signature it was written from. Two normalizers that drifted apart would make a
+// truthful row look forged.
+func NormalizeAbsoluteURL(raw string) (string, error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return "", err
+	}
+	scheme := strings.ToLower(u.Scheme)
+	host := strings.ToLower(u.Host)
+	if scheme == "" || host == "" {
+		return "", errors.New("url is not absolute")
+	}
+	switch {
+	case scheme == "http" && strings.HasSuffix(host, ":80"):
+		host = strings.TrimSuffix(host, ":80")
+	case scheme == "https" && strings.HasSuffix(host, ":443"):
+		host = strings.TrimSuffix(host, ":443")
+	}
+	urlPath := u.EscapedPath()
+	if urlPath == "" {
+		urlPath = "/"
+	}
+	out := scheme + "://" + host + urlPath
+	if u.RawQuery != "" {
+		out += "?" + u.RawQuery
+	}
+	return out, nil
 }

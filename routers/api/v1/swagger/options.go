@@ -18,6 +18,9 @@ type swaggerParameterBodies struct {
 	AddCollaboratorOption api.AddCollaboratorOption
 
 	// in:body
+	CreateAgentKeyOption api.CreateAgentKeyOption
+
+	// in:body
 	CreateEmailOption api.CreateEmailOption
 	// in:body
 	DeleteEmailOption api.DeleteEmailOption

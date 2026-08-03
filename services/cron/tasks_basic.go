@@ -8,11 +8,14 @@ import (
 	"time"
 
 	"code.gitea.io/gitea/models"
+	agent_model "code.gitea.io/gitea/models/agent"
 	git_model "code.gitea.io/gitea/models/git"
 	user_model "code.gitea.io/gitea/models/user"
 	"code.gitea.io/gitea/models/webhook"
 	"code.gitea.io/gitea/modules/git/gitcmd"
+	"code.gitea.io/gitea/modules/log"
 	"code.gitea.io/gitea/modules/setting"
+	"code.gitea.io/gitea/modules/timeutil"
 	"code.gitea.io/gitea/services/auth"
 	"code.gitea.io/gitea/services/migrations"
 	mirror_service "code.gitea.io/gitea/services/mirror"
@@ -166,6 +169,25 @@ func registerSyncRepoLicenses() {
 	})
 }
 
+func registerCleanupAgentUsedEvents() {
+	// The NIP-98 replay guard writes one row per signed request and those rows are dead as soon
+	// as the event they name is too stale to be accepted anyway. Without this the table would
+	// be the one part of the agent feature that grows without bound; hourly keeps it to roughly
+	// an hour of agent traffic.
+	RegisterTaskFatal("cleanup_agent_used_events", &BaseConfig{
+		Enabled:    true,
+		RunAtStart: false,
+		Schedule:   "@every 1h",
+	}, func(ctx context.Context, _ *user_model.User, _ Config) error {
+		removed, err := agent_model.PruneUsedEvents(ctx, timeutil.TimeStampNow())
+		if err != nil {
+			return err
+		}
+		log.Trace("Cron[cleanup_agent_used_events]: removed %d spent NIP-98 event ids", removed)
+		return nil
+	})
+}
+
 func initBasicTasks() {
 	if setting.Mirror.Enabled {
 		registerUpdateMirrorTask()
@@ -183,4 +205,5 @@ func initBasicTasks() {
 		registerCleanupPackages()
 	}
 	registerSyncRepoLicenses()
+	registerCleanupAgentUsedEvents()
 }

@@ -12,6 +12,7 @@ import (
 
 	actions_model "code.gitea.io/gitea/models/actions"
 	activities_model "code.gitea.io/gitea/models/activities"
+	agent_model "code.gitea.io/gitea/models/agent"
 	asymkey_model "code.gitea.io/gitea/models/asymkey"
 	auth_model "code.gitea.io/gitea/models/auth"
 	"code.gitea.io/gitea/models/db"
@@ -98,6 +99,62 @@ func deleteUser(ctx context.Context, u *user_model.User, purge bool) (err error)
 	); err != nil {
 		return fmt.Errorf("deleteBeans: %w", err)
 	}
+
+	// ***** START: Agent keys *****
+	// Both ends of the NIP-98 ownership chain go with the account, alongside the access tokens
+	// and SSH keys above: a key this user vouched for is a credential they are accountable for,
+	// and a key that signs *as* this user would otherwise outlive the user itself.
+	//
+	// Authentication is not what this is for - services/auth.Nostr already refuses a key whose
+	// agent user or owner cannot be loaded. It is that a key row is never otherwise deleted, so
+	// leaving these behind would park a public key in the `pub_key` UNIQUE index with no path
+	// left that can clear it, burning that keypair for the instance permanently.
+	//
+	// The audit trail is deliberately kept, and does not need these rows: every row carries the
+	// whole signed event, and models/agent.VerifyEvent re-derives its id and re-checks its
+	// signature without consulting agent_key at all.
+	agentUserIDs, err := db.FindIDs(ctx, "agent_key", "agent_key.agent_user_id",
+		builder.Eq{"agent_key.owner_user_id": u.ID})
+	if err != nil {
+		return fmt.Errorf("find agent keys owned by user: %w", err)
+	}
+	if _, err = db.DeleteByBean(ctx, &agent_model.Key{OwnerUserID: u.ID}); err != nil {
+		return fmt.Errorf("deleteOwnedAgentKeys: %w", err)
+	}
+	if _, err = db.DeleteByBean(ctx, &agent_model.Key{AgentUserID: u.ID}); err != nil {
+		return fmt.Errorf("deleteAgentKeys: %w", err)
+	}
+	// An agent account this user vouched for may now hold no key at all, and `is_agent` is only
+	// earned by holding one - the revoke endpoint takes the flag away on the last key for exactly
+	// this reason. Leaving it set would keep the account enrolled as an agent with nothing behind
+	// it, which is the half-undo revocation is written to avoid.
+	for _, agentUserID := range agentUserIDs {
+		if agentUserID == u.ID {
+			continue // deleted below with the user itself
+		}
+		stillActive, err := agent_model.HasActiveKeyForAgent(ctx, agentUserID)
+		if err != nil {
+			return fmt.Errorf("HasActiveKeyForAgent: %w", err)
+		}
+		if stillActive {
+			continue
+		}
+		agentUser, err := user_model.GetUserByID(ctx, agentUserID)
+		if err != nil {
+			if user_model.IsErrUserNotExist(err) {
+				continue
+			}
+			return fmt.Errorf("GetUserByID: %w", err)
+		}
+		if !agentUser.IsAgent {
+			continue
+		}
+		agentUser.IsAgent = false
+		if err := user_model.UpdateUserCols(ctx, agentUser, "is_agent"); err != nil {
+			return fmt.Errorf("clear is_agent: %w", err)
+		}
+	}
+	// ***** END: Agent keys *****
 
 	if err := auth_model.DeleteOAuth2RelictsByUserID(ctx, u.ID); err != nil {
 		return err

@@ -130,6 +130,11 @@ type User struct {
 	// true: the user is not allowed to log in Web UI. Git/SSH access could still be allowed (please refer to Git/SSH access related code/documents)
 	ProhibitLogin bool `xorm:"NOT NULL DEFAULT false"`
 
+	// true: the user acts on behalf of a human owner and may authenticate with a NIP-98 signed
+	// event (see services/agentauth). It is an additive flag rather than a UserType, so it composes
+	// with UserTypeBot and does not change the meaning of any existing user type.
+	IsAgent bool `xorm:"NOT NULL DEFAULT false"`
+
 	// Avatar
 	Avatar          string `xorm:"VARCHAR(2048) NOT NULL"`
 	AvatarEmail     string `xorm:"NOT NULL"`

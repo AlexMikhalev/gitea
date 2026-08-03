@@ -70,6 +70,7 @@ import (
 	"net/http"
 	"strings"
 
+	agent_model "code.gitea.io/gitea/models/agent"
 	auth_model "code.gitea.io/gitea/models/auth"
 	"code.gitea.io/gitea/models/organization"
 	"code.gitea.io/gitea/models/perm"
@@ -85,6 +86,7 @@ import (
 	"code.gitea.io/gitea/modules/web"
 	"code.gitea.io/gitea/routers/api/v1/activitypub"
 	"code.gitea.io/gitea/routers/api/v1/admin"
+	"code.gitea.io/gitea/routers/api/v1/agent"
 	"code.gitea.io/gitea/routers/api/v1/misc"
 	"code.gitea.io/gitea/routers/api/v1/notify"
 	"code.gitea.io/gitea/routers/api/v1/org"
@@ -369,6 +371,95 @@ func reqUsersExploreEnabled() func(ctx *context.APIContext) {
 	return func(ctx *context.APIContext) {
 		if setting.Service.Explore.DisableUsersPage {
 			ctx.APIErrorNotFound()
+		}
+	}
+}
+
+// reqHumanAuth refuses a request that authenticated with an agent's own NIP-98 signature.
+//
+// It guards the endpoints that mint or withdraw credentials. Enrolling a signing key is a human
+// act: if an agent could enrol keys with the key it is already holding, then a single leaked key
+// would let its holder create unlimited siblings, and revoking the leaked one would accomplish
+// nothing. reqToken() cannot express this - it only asks whether *someone* is signed in, and a
+// NIP-98 request is signed in.
+//
+// The same argument covers every account-level credential, not just Nostr keys, which is why this
+// also guards /user/keys, /user/gpg_keys, /user/applications/oauth2, /user/actions/secrets and
+// /user/actions/runners/registration-token: each of those outlives the signing key that created
+// it, so allowing an agent to plant one would make revoking its key a half-undo. The test for
+// membership of this set is not "does it look like a key" but "does a subsequent request, made
+// with no NIP-98 signature at all, get anything out of it" - an Actions secret is read by every
+// later workflow run and a runner registration token yields a second, independent credential, so
+// both qualify. /users/{username}/tokens needs no guard here - it is already behind
+// reqBasicOrRevProxyAuth(), which a signature cannot satisfy.
+//
+// That test is about the *artifact*, not about which path reaches it, so the guard follows the
+// artifact classes wherever they are exposed rather than stopping at /user/*. The identical
+// classes are reachable one level down and are guarded there too:
+//
+//   - repository and organization Actions secrets, variables and runner registration tokens
+//     (addActionsRoutes), which are the same objects as their /user/* counterparts;
+//   - repository deploy keys, which are an SSH credential carrying repository write;
+//   - PATCH on a repository git hook, which is a shell script the server executes on every later
+//     push as its own process user, with no signature involved;
+//   - /admin/users and /admin/users/{username}/keys, which mint an account and an SSH key, and
+//     PATCH /admin/users/{username}, which sets the password, primary email, login source,
+//     site-admin flag and AllowGitHook on an account that already exists;
+//   - /admin/actions/runners/registration-token and /admin/runners/registration-token.
+//
+// The same test also catches artifacts that are not credentials this instance issued but grants of
+// standing access to a principal that already holds its own: adding a repository collaborator, an
+// organization team member or a repository to a team lets those accounts in with their own
+// passwords, PATs or SSH keys afterwards, and transferring a repository hands the whole of it over
+// the same way, so revoking the agent's key does not take the access away. Widening an existing
+// team through PATCH /teams/{teamid} is the same grant made in bulk - Permission and
+// IncludesAllRepositories reach every current member and every current repository at once - so it
+// is guarded too. Those writes are guarded; the matching DELETEs are not, because withdrawing
+// access leaves nothing behind.
+//
+// A field that moves the *authorization gate* on a guarded grant is guarded on the same footing as
+// the grant itself, which is why PATCH /orgs/{org} is in the set: EditOrgOption is mostly
+// disclosure, but RepoAdminChangeTeamAccess is what changeRepoTeam checks before letting a
+// repository admin who is not an org owner add a team to a repository. Setting it opens the
+// team-repository grant to every repository admin in the organization, and the setting outlives
+// the key that made it.
+//
+// A grant is guarded wherever it is reachable, not wherever it was first noticed: the
+// team-repository grant is exposed twice, at PUT /teams/{teamid}/repos/{org}/{reponame} and at
+// PUT /repos/{owner}/{repo}/teams/{team}, and both go through repo_service.TeamAddRepository, so
+// both carry the guard. Enumerating this policy route by route is what makes an alias easy to
+// miss, so TestAPIAgentAuthRouteCensus walks the whole registered v1 route table and fails on any
+// mutating route that is in neither the guarded set nor an explicit reviewed-exempt set - a new
+// alias breaks the suite instead of quietly widening the policy.
+//
+// Webhooks - repository, organization and system - are deliberately outside this set. One creates
+// a persistent outbound channel that does survive revocation, but it is neither a credential this
+// instance issued nor standing access for a principal, so it fails the test as stated; a change
+// that decided to guard them would be widening the policy, not filling a gap in it.
+//
+// Leaving those open would have made revocation complete only for account-level credentials: a
+// leaked key scoped write:repository for a user with admin on a repository could install a deploy
+// key, and revoking the Nostr key would not take it away again. "A correctly-scoped agent may do
+// what its scope allows" does not distinguish these from /user/keys, which write:user allows just
+// as legitimately - so it cannot be the line.
+//
+// On the Actions routes the line is drawn at planting rather than at reading: a GET is guarded
+// only where reading is equivalent to minting (a runner registration token is usable by whoever
+// reads it), while listing variables or secret names leaves nothing behind that outlives
+// revocation and stays open. The key groups are guarded wholesale instead, following the
+// precedent /user/keys already set: they are small, and the read tells an agent which credentials
+// it would have to displace.
+//
+// None of this narrows a personal access token: the guard tests the authentication method, so a
+// PAT or session with the same scopes reaches every one of these endpoints exactly as before.
+// What it does *not* contain is anything else an agent's scopes legitimately permit inside a
+// repository or organization - containment here is about credentials, not about limiting what a
+// correctly-scoped agent may do.
+func reqHumanAuth() func(ctx *context.APIContext) {
+	return func(ctx *context.APIContext) {
+		if method, _ := ctx.Data["AuthedMethod"].(string); method == auth.NostrMethodName {
+			ctx.APIError(http.StatusForbidden, "an agent signature cannot be used here; this endpoint needs the owner's own credential")
+			return
 		}
 	}
 }
@@ -754,6 +845,13 @@ func buildAuthGroup() *auth.Group {
 	group := auth.NewGroup(
 		&auth.OAuth2{},
 		&auth.HTTPSign{},
+		// Nostr's position in this list is not load-bearing, which is worth saying because it
+		// looks as if it should be. It claims only `Authorization: Nostr ...` and returns
+		// (nil, nil) for everything else; Basic reads the same header but
+		// httpauth.ParseAuthorizationHeader recognises `basic`, `token` and `bearer` only, so
+		// Basic already declines a Nostr credential. Neither method can shadow the other in
+		// either order.
+		&auth.Nostr{},
 		&auth.Basic{}, // FIXME: this should be removed once we don't allow basic auth in API
 	)
 	if setting.Service.EnableReverseProxyAuthAPI {
@@ -771,6 +869,12 @@ func apiAuth(authMethod auth.Method) func(*context.APIContext) {
 	return func(ctx *context.APIContext) {
 		ar, err := common.AuthShared(ctx.Base, nil, authMethod)
 		if err != nil {
+			// A few failures are not "your credential was refused" and must not be described
+			// as one; those carry the status to answer with.
+			if status, ok := auth.ErrAsUserAuthStatus(err); ok {
+				ctx.APIError(status.Status, status.Message)
+				return
+			}
 			msg, ok := auth.ErrAsUserAuthMessage(err)
 			msg = util.Iif(ok, msg, "invalid username, password or token")
 			ctx.APIError(http.StatusUnauthorized, msg)
@@ -780,6 +884,49 @@ func apiAuth(authMethod auth.Method) func(*context.APIContext) {
 		ctx.IsSigned = ar.Doer != nil
 		ctx.IsBasicAuth = ar.IsBasicAuth
 	}
+}
+
+// recordAgentAudit attaches the outcome of a NIP-98 authenticated request to the audit row that
+// services/auth wrote when it accepted the credential.
+//
+// The row has to exist before the handler runs, so that a signed request can never be performed
+// without a trace, but that means its bare existence records only that the credential was
+// accepted - not that the request was authorized, and not that it worked. Everything after
+// authentication is observable only here, once the handler has returned and written its status.
+// A request that 403s on a repository permission, or 422s on a malformed body, is therefore
+// distinguishable in the trail from one that succeeded.
+//
+// This is also where the repository comes from: the router has already resolved
+// `/repos/{owner}/{repo}/...` by now, so the audit trail reuses that answer instead of parsing
+// the path a second time and issuing its own lookup on the authentication hot path.
+func recordAgentAudit(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
+		ctx := context.GetAPIContext(req)
+		defer func() {
+			audit, ok := ctx.Data[auth.AgentAuditPendingKey].(*agent_model.AuditEvent)
+			if !ok {
+				return // not a NIP-98 request; this middleware costs nothing
+			}
+			var repoID int64
+			if ctx.Repo != nil && ctx.Repo.Repository != nil {
+				repoID = ctx.Repo.Repository.ID
+			}
+			// Deliberately not ctx: an *APIContext delegates to the request's context, which
+			// net/http cancels the moment the client goes away. A long agent mutation whose
+			// caller times out and disconnects has still run - possibly having changed data -
+			// and writing its outcome on a cancelled context would fail, leaving
+			// response_status at 0, which the model defines as "the handler never completed".
+			// The row is written before the handler precisely so that nothing an agent does
+			// goes unlogged; the outcome half is worth the same care, so it is recorded
+			// against the server's lifetime instead of the client's patience.
+			if err := agent_model.RecordAuditOutcome(graceful.GetManager().ShutdownContext(), audit.ID, repoID, ctx.Resp.WrittenStatus()); err != nil {
+				// The identifying half of the row is already durable, so the trail is intact
+				// either way; only the outcome is missing, and it stays 0 to say so.
+				log.Error("RecordAuditOutcome(%d): %v", audit.ID, err)
+			}
+		}()
+		next.ServeHTTP(resp, req)
+	})
 }
 
 // verifyAuthWithOptions checks authentication according to options
@@ -889,6 +1036,10 @@ func Routes() *web.Router {
 	// Get user from session if logged in.
 	m.Use(apiAuth(buildAuthGroup()))
 
+	// Immediately after authentication, so that it observes everything a signed request goes
+	// on to do, including the authorization checks below.
+	m.Use(recordAgentAudit)
+
 	m.Use(verifyAuthWithOptions(&common.VerifyOptions{
 		SignInRequired: setting.Service.RequireSignInViewStrict,
 	}))
@@ -898,27 +1049,34 @@ func Routes() *web.Router {
 		reqChecker func(ctx *context.APIContext),
 		act actions.API,
 	) {
+		// reqHumanAuth() on the writes below: these routes are registered for both repositories
+		// and organizations, and the objects they manage are the same artifact classes that are
+		// kept out of an agent signature's reach at /user/actions (see reqHumanAuth). A secret or
+		// a variable planted here is handed to every subsequent workflow run of that repository or
+		// organization, and a runner registration token yields an independent long-lived
+		// credential - none of which revoking the agent key undoes. The reads are left alone
+		// except for the registration token, where reading is minting.
 		m.Group("/actions", func() {
 			m.Group("/secrets", func() {
 				m.Get("", reqToken(), reqChecker, act.ListActionsSecrets)
 				m.Combo("/{secretname}").
-					Put(reqToken(), reqChecker, bind(api.CreateOrUpdateSecretOption{}), act.CreateOrUpdateSecret).
-					Delete(reqToken(), reqChecker, act.DeleteSecret)
+					Put(reqToken(), reqChecker, reqHumanAuth(), bind(api.CreateOrUpdateSecretOption{}), act.CreateOrUpdateSecret).
+					Delete(reqToken(), reqChecker, reqHumanAuth(), act.DeleteSecret)
 			})
 
 			m.Group("/variables", func() {
 				m.Get("", reqToken(), reqChecker, act.ListVariables)
 				m.Combo("/{variablename}").
 					Get(reqToken(), reqChecker, act.GetVariable).
-					Delete(reqToken(), reqChecker, act.DeleteVariable).
-					Post(reqToken(), reqChecker, bind(api.CreateVariableOption{}), act.CreateVariable).
-					Put(reqToken(), reqChecker, bind(api.UpdateVariableOption{}), act.UpdateVariable)
+					Delete(reqToken(), reqChecker, reqHumanAuth(), act.DeleteVariable).
+					Post(reqToken(), reqChecker, reqHumanAuth(), bind(api.CreateVariableOption{}), act.CreateVariable).
+					Put(reqToken(), reqChecker, reqHumanAuth(), bind(api.UpdateVariableOption{}), act.UpdateVariable)
 			})
 
 			m.Group("/runners", func() {
 				m.Get("", reqToken(), reqChecker, act.ListRunners)
-				m.Get("/registration-token", reqToken(), reqChecker, act.GetRegistrationToken)
-				m.Post("/registration-token", reqToken(), reqChecker, act.CreateRegistrationToken)
+				m.Get("/registration-token", reqToken(), reqChecker, reqHumanAuth(), act.GetRegistrationToken)
+				m.Post("/registration-token", reqToken(), reqChecker, reqHumanAuth(), act.CreateRegistrationToken)
 				m.Get("/{runner_id}", reqToken(), reqChecker, act.GetRunner)
 				m.Delete("/{runner_id}", reqToken(), reqChecker, act.DeleteRunner)
 			})
@@ -972,6 +1130,19 @@ func Routes() *web.Router {
 				m.Get("/repository", settings.GetGeneralRepoSettings)
 			})
 		})
+
+		// Agent identity: register, list and revoke the Nostr keys that agents sign their
+		// requests with. reqHumanAuth() puts the whole group out of reach of a NIP-98
+		// credential, so a leaked agent key cannot enrol a replacement for itself or revoke
+		// the key an operator is using to contain it.
+		m.Group("/agent", func() {
+			m.Combo("/keys").Get(agent.ListKeys).
+				Post(bind(api.CreateAgentKeyOption{}), agent.CreateKey)
+			m.Delete("/keys/{id}", agent.RevokeKey)
+			// The owner's view of the trail. The repo-scoped endpoint below can only show
+			// requests that reached a repository; this is where everything else lands.
+			m.Get("/audit", agent.ListOwnedAudit)
+		}, reqToken(), reqHumanAuth(), tokenRequiresScopes(auth_model.AccessTokenScopeCategoryUser))
 
 		// Notifications (requires 'notifications' scope)
 		m.Group("/notifications", func() {
@@ -1031,32 +1202,59 @@ func Routes() *web.Router {
 				m.Get("", user.GetUserSettings)
 				m.Patch("", bind(api.UserSettingsOptions{}), user.UpdateUserSettings)
 			}, reqToken())
+			// reqHumanAuth() on the POST: an added email address is an account-recovery
+			// path, which is a login by another name. services/user.AddEmailAddresses stores
+			// it with IsActivated set from !REGISTER_EMAIL_CONFIRM - false by default - and
+			// models/user.GetUserByEmail resolves any activated alternative address to its
+			// user, which is what the forgot-password flow walks. So a write:user signature
+			// could plant an address it controls and still reset the account's password after
+			// the Nostr key is revoked: the same half-undo /user/keys is guarded against, and
+			// a stronger one than the GPG-key case below. Listing leaves nothing behind and
+			// deleting only removes, so both stay open.
 			m.Combo("/emails").
 				Get(user.ListEmails).
-				Post(bind(api.CreateEmailOption{}), user.AddEmail).
+				Post(reqHumanAuth(), bind(api.CreateEmailOption{}), user.AddEmail).
 				Delete(bind(api.DeleteEmailOption{}), user.DeleteEmail)
 
 			// manage user-level actions features
 			m.Group("/actions", func() {
+				// reqHumanAuth(): a user-level Actions secret is handed to every subsequent
+				// workflow run for the account, so planting one is planting a credential that
+				// outlives - and is entirely unaffected by - revoking the agent key that
+				// planted it. Revocation has to be a whole undo, so an agent signature does
+				// not get to write here.
 				m.Group("/secrets", func() {
 					m.Combo("/{secretname}").
 						Put(bind(api.CreateOrUpdateSecretOption{}), user.CreateOrUpdateSecret).
 						Delete(user.DeleteSecret)
-				})
+				}, reqHumanAuth())
 
+				// reqHumanAuth() on the writes for the same reason as /secrets above: the
+				// difference between a user-level Actions variable and a user-level Actions
+				// secret is confidentiality, not persistence, and persistence is what this
+				// guard is about. A variable written here is read by every subsequent workflow
+				// run for the account and survives revoking the key that wrote it. Reading one
+				// leaves nothing behind, so the GETs stay open.
 				m.Group("/variables", func() {
 					m.Get("", user.ListVariables)
 					m.Combo("/{variablename}").
 						Get(user.GetVariable).
-						Delete(user.DeleteVariable).
-						Post(bind(api.CreateVariableOption{}), user.CreateVariable).
-						Put(bind(api.UpdateVariableOption{}), user.UpdateVariable)
+						Delete(reqHumanAuth(), user.DeleteVariable).
+						Post(reqHumanAuth(), bind(api.CreateVariableOption{}), user.CreateVariable).
+						Put(reqHumanAuth(), bind(api.UpdateVariableOption{}), user.UpdateVariable)
 				})
 
 				m.Group("/runners", func() {
 					m.Get("", reqToken(), user.ListRunners)
-					m.Get("/registration-token", reqToken(), user.GetRegistrationToken)
-					m.Post("/registration-token", reqToken(), user.CreateRegistrationToken)
+					// reqHumanAuth() on both registration-token routes: the token they
+					// hand out registers a runner against this account, and that runner
+					// then holds a long-lived credential of its own and executes workflow
+					// jobs. Revoking the agent key neither deregisters the runner nor
+					// invalidates its token, so this is the same half-undo /user/keys is
+					// guarded against. Reading the current token is as good as minting one,
+					// which is why the GET is guarded too.
+					m.Get("/registration-token", reqToken(), reqHumanAuth(), user.GetRegistrationToken)
+					m.Post("/registration-token", reqToken(), reqHumanAuth(), user.CreateRegistrationToken)
 					m.Get("/{runner_id}", reqToken(), user.GetRunner)
 					m.Delete("/{runner_id}", reqToken(), user.DeleteRunner)
 				})
@@ -1076,14 +1274,19 @@ func Routes() *web.Router {
 			})
 
 			// (admin:public_key scope)
+			// reqHumanAuth() for the same reason it guards /agent/keys: an SSH key outlives
+			// the Nostr key that added it, so without this a leaked agent key holding
+			// write:user could plant a credential that revoking the agent key does not remove.
 			m.Group("/keys", func() {
 				m.Combo("").Get(user.ListMyPublicKeys).
 					Post(bind(api.CreateKeyOption{}), user.CreatePublicKey)
 				m.Combo("/{id}").Get(user.GetPublicKey).
 					Delete(user.DeletePublicKey)
-			})
+			}, reqHumanAuth())
 
 			// (admin:application scope)
+			// reqHumanAuth(): an OAuth2 application mints tokens, and those tokens survive
+			// revoking the signing key that registered the application.
 			m.Group("/applications", func() {
 				m.Combo("/oauth2").
 					Get(user.ListOauth2Applications).
@@ -1092,17 +1295,19 @@ func Routes() *web.Router {
 					Delete(user.DeleteOauth2Application).
 					Patch(bind(api.CreateOAuth2ApplicationOptions{}), user.UpdateOauth2Application).
 					Get(user.GetOauth2Application)
-			})
+			}, reqHumanAuth())
 
 			// (admin:gpg_key scope)
+			// reqHumanAuth(): a GPG key does not grant access, but it does let anything the
+			// key signs show as verified under this account, and it too outlives revocation.
 			m.Group("/gpg_keys", func() {
 				m.Combo("").Get(user.ListMyGPGKeys).
 					Post(bind(api.CreateGPGKeyOption{}), user.CreateGPGKey)
 				m.Combo("/{id}").Get(user.GetGPGKey).
 					Delete(user.DeleteGPGKey)
-			})
+			}, reqHumanAuth())
 			m.Get("/gpg_key_token", user.GetVerificationToken)
-			m.Post("/gpg_key_verify", bind(api.VerifyGPGKeyOption{}), user.VerifyUserGPGKey)
+			m.Post("/gpg_key_verify", reqHumanAuth(), bind(api.VerifyGPGKeyOption{}), user.VerifyUserGPGKey)
 
 			// (repo scope)
 			m.Combo("/repos", tokenRequiresScopes(auth_model.AccessTokenScopeCategoryRepository)).Get(user.ListMyRepos).
@@ -1170,8 +1375,23 @@ func Routes() *web.Router {
 					Delete(reqToken(), reqOwner(), repo.Delete).
 					Patch(reqToken(), reqAdmin(), bind(api.EditRepoOption{}), repo.Edit)
 				m.Post("/generate", reqToken(), reqRepoReader(unit.TypeCode), bind(api.GenerateRepoOption{}), repo.Generate)
+				// Repo admin, not any reader: the trail exposes every URL an agent touched
+				// in this repository, query strings included, which is more than read access
+				// to the repository's contents implies.
+				m.Get("/agent-audit", reqToken(), reqAdmin(), agent.ListRepoAudit)
+				// reqHumanAuth() on the POST for the same reason as the collaborator and team
+				// grants below: a transfer hands the whole repository - contents, future writes
+				// and admin - to a different principal, and when the new owner is an organization
+				// the doer can create repositories in, StartRepositoryTransfer completes it
+				// immediately. Every owner-team member then reaches it with their own password,
+				// PAT or SSH key, and revoking the agent's Nostr key takes none of that back; it
+				// is the widest standing-access grant in the API rather than a narrower one.
+				// reqOwner() cannot draw the line, for the same reason reqAdmin() cannot at
+				// :1398: it asks whether the *agent user* may transfer, which a correctly-scoped
+				// agent for a repository owner may. Accept and reject stay open - they answer a
+				// grant some other owner already offered, and neither creates one.
 				m.Group("/transfer", func() {
-					m.Post("", reqOwner(), bind(api.TransferRepoOption{}), repo.Transfer)
+					m.Post("", reqOwner(), reqHumanAuth(), bind(api.TransferRepoOption{}), repo.Transfer)
 					m.Post("/accept", repo.AcceptTransfer)
 					m.Post("/reject", repo.RejectTransfer)
 				}, reqToken())
@@ -1191,11 +1411,21 @@ func Routes() *web.Router {
 					m.Get("/{job_id}/logs", repo.DownloadActionsRunJobLogs)
 				}, reqToken(), reqRepoReader(unit.TypeActions))
 
+				// reqHumanAuth() on the PATCH: it writes a shell script that the server runs on
+				// every subsequent push, as the Gitea process user, with no NIP-98 signature
+				// anywhere in sight - the plainest case of "does a later unsigned request get
+				// anything out of it", and strictly more durable than the deploy key guarded
+				// below. The PATCH /admin/users guard already counts AllowGitHook among the things
+				// too durable for an agent signature to set; this is the endpoint that actually
+				// writes the hook body. reqGitHook() does not substitute: it gates on
+				// IsAdmin || AllowGitHook, which asks whether the *agent user* may edit git hooks,
+				// not whether a human authorized this request. The GET and the DELETE stay open -
+				// reading a hook plants nothing and deleting one takes a hook away.
 				m.Group("/hooks/git", func() {
 					m.Combo("").Get(repo.ListGitHooks)
 					m.Group("/{id}", func() {
 						m.Combo("").Get(repo.GetGitHook).
-							Patch(bind(api.EditGitHookOption{}), repo.EditGitHook).
+							Patch(reqHumanAuth(), bind(api.EditGitHookOption{}), repo.EditGitHook).
 							Delete(repo.DeleteGitHook)
 					})
 				}, reqToken(), reqAdmin(), reqGitHook(), context.ReferencesGitRepo(true))
@@ -1212,8 +1442,16 @@ func Routes() *web.Router {
 				m.Group("/collaborators", func() {
 					m.Get("", reqAnyRepoReader(), repo.ListCollaborators)
 					m.Group("/{collaborator}", func() {
+						// reqHumanAuth() for the same reason as the deploy keys below: adding a
+						// collaborator grants a *different account* standing access to this
+						// repository, up to admin. That account reaches it with its own password,
+						// PAT or SSH key, none of which revoking the agent's Nostr key touches -
+						// the half-undo the deploy-key guard exists to prevent, reached at a lower
+						// bar. reqAdmin() cannot draw the line: it asks whether the agent user may
+						// manage collaborators, which a correctly-scoped agent for a repository
+						// admin may. Removing one grants nothing and stays open.
 						m.Combo("").Get(reqAnyRepoReader(), repo.IsCollaborator).
-							Put(reqAdmin(), bind(api.AddCollaboratorOption{}), repo.AddOrUpdateCollaborator).
+							Put(reqAdmin(), reqHumanAuth(), bind(api.AddCollaboratorOption{}), repo.AddOrUpdateCollaborator).
 							Delete(reqAdmin(), repo.DeleteCollaborator)
 						m.Get("/permission", repo.GetRepoPermissions)
 					})
@@ -1222,8 +1460,17 @@ func Routes() *web.Router {
 				m.Get("/reviewers", reqToken(), reqAnyRepoReader(), repo.GetReviewers)
 				m.Group("/teams", func() {
 					m.Get("", reqAnyRepoReader(), repo.ListTeams)
+					// reqHumanAuth() on the PUT: this is the team-repository grant guarded at
+					// PUT /teams/{teamid}/repos/{org}/{reponame}, reached from the repository
+					// side - both land in repo_service.TeamAddRepository and hand the repository
+					// to every current member of the team. This path reaches it at a *lower* bar:
+					// write:repository plus reqAdmin() here, against organization scope plus
+					// reqTeamMembership() there. Guarding one alias and not the other leaves the
+					// grant open, so the guard follows the operation rather than the route - see
+					// TestAPIAgentAuthRouteCensus, which fails if a third path to it appears.
+					// The DELETE takes the team's access away and stays open.
 					m.Combo("/{team}").Get(reqAnyRepoReader(), repo.IsTeam).
-						Put(reqAdmin(), repo.AddTeam).
+						Put(reqAdmin(), reqHumanAuth(), repo.AddTeam).
 						Delete(reqAdmin(), repo.DeleteTeam)
 				}, reqToken())
 				m.Get("/raw/*", context.ReferencesGitRepo(), context.RepoRefForAPI, reqRepoReader(unit.TypeCode), repo.GetRawFile)
@@ -1282,12 +1529,17 @@ func Routes() *web.Router {
 					})
 					m.Get("/artifacts/{artifact_id}/zip", repo.DownloadArtifact)
 				}, reqRepoReader(unit.TypeActions), context.ReferencesGitRepo(true))
+				// reqHumanAuth() for the same reason it guards /user/keys: a deploy key is an SSH
+				// credential with write access to this repository, and it outlives the Nostr key
+				// that installed it - revoking the agent key leaves the deploy key working.
+				// reqAdmin() does not substitute for this: it asks whether the *agent user* may
+				// manage deploy keys, which a correctly-scoped agent for a repository admin may.
 				m.Group("/keys", func() {
 					m.Combo("").Get(repo.ListDeployKeys).
 						Post(bind(api.CreateKeyOption{}), repo.CreateDeployKey)
 					m.Combo("/{id}").Get(repo.GetDeployKey).
 						Delete(repo.DeleteDeploykey)
-				}, reqToken(), reqAdmin())
+				}, reqToken(), reqAdmin(), reqHumanAuth())
 				m.Group("/times", func() {
 					m.Combo("").Get(repo.ListTrackedTimesByRepository)
 					m.Combo("/{timetrackingusername}").Get(repo.ListTrackedTimesByUser)
@@ -1616,8 +1868,19 @@ func Routes() *web.Router {
 		m.Post("/orgs", tokenRequiresScopes(auth_model.AccessTokenScopeCategoryOrganization), reqToken(), bind(api.CreateOrgOption{}), org.Create)
 		m.Get("/orgs", org.GetAll, tokenRequiresScopes(auth_model.AccessTokenScopeCategoryOrganization))
 		m.Group("/orgs/{org}", func() {
+			// reqHumanAuth() on the PATCH: most of EditOrgOption is description, location and
+			// visibility - disclosure, which the policy leaves alone - but it also carries
+			// RepoAdminChangeTeamAccess, and that field is the authorization gate on a grant this
+			// policy does guard. changeRepoTeam (routers/api/v1/repo/teams.go) refuses a caller
+			// who is neither the repository's owner nor an org owner unless it is set, so turning
+			// it on lets every repository admin in the organization make the team-repository
+			// grant that PUT /repos/{owner}/{repo}/teams/{team} and
+			// PUT /teams/{teamid}/repos/{org}/{reponame} are both guarded for. That is standing
+			// access handed to principals who reach it with their own credentials afterwards, so
+			// revoking the agent's key does not put the gate back. The DELETE removes the
+			// organization outright and stays open.
 			m.Combo("").Get(org.Get).
-				Patch(reqToken(), reqOrgOwnership(), bind(api.EditOrgOption{}), org.Edit).
+				Patch(reqToken(), reqOrgOwnership(), reqHumanAuth(), bind(api.EditOrgOption{}), org.Edit).
 				Delete(reqToken(), reqOrgOwnership(), org.Delete)
 			m.Post("/rename", reqToken(), reqOrgOwnership(), bind(api.RenameOrgOption{}), org.Rename)
 			m.Combo("/repos").Get(user.ListOrgRepos).
@@ -1673,20 +1936,39 @@ func Routes() *web.Router {
 			}, reqToken(), reqOrgOwnership())
 		}, tokenRequiresScopes(auth_model.AccessTokenScopeCategoryOrganization), orgAssignment(true), checkTokenPublicOnly())
 		m.Group("/teams/{teamid}", func() {
+			// reqHumanAuth() on the PATCH: EditTeam sets Permission and IncludesAllRepositories
+			// on a team that already has members, so a single request can hand every current
+			// member of that team admin over every current repository of the organization -
+			// strictly wider than either of the two writes guarded below, which grant one member
+			// or one repository at a time, and reached at the same reqOrgOwnership() bar. Those
+			// members then work through their own passwords, PATs and SSH keys, so revoking the
+			// agent's key takes none of it back. The whole PATCH is guarded rather than only the
+			// widening fields: a middleware cannot see the body, and renaming a team with an
+			// agent signature is not worth a handler-level exception. The DELETE removes a team,
+			// granting nothing, and stays open.
 			m.Combo("").Get(reqToken(), org.GetTeam).
-				Patch(reqToken(), reqOrgOwnership(), bind(api.EditTeamOption{}), org.EditTeam).
+				Patch(reqToken(), reqOrgOwnership(), reqHumanAuth(), bind(api.EditTeamOption{}), org.EditTeam).
 				Delete(reqToken(), reqOrgOwnership(), org.DeleteTeam)
 			m.Group("/members", func() {
 				m.Get("", reqToken(), org.GetTeamMembers)
+				// reqHumanAuth() on the PUT for the same reason as repository collaborators:
+				// team membership is standing access for a different account, held through that
+				// account's own credentials, and it survives revoking the key that granted it.
 				m.Combo("/{username}").
 					Get(reqToken(), org.GetTeamMember).
-					Put(reqToken(), reqOrgOwnership(), org.AddTeamMember).
+					Put(reqToken(), reqOrgOwnership(), reqHumanAuth(), org.AddTeamMember).
 					Delete(reqToken(), reqOrgOwnership(), org.RemoveTeamMember)
 			})
 			m.Group("/repos", func() {
 				m.Get("", reqToken(), org.GetTeamRepos)
+				// reqHumanAuth() on the PUT for the third time, and for the same reason as the
+				// two grants above: adding a repository to a team hands standing access to it
+				// to every current member of that team - separate accounts, reaching it with
+				// their own passwords, PATs and SSH keys - and revoking the agent key that
+				// granted it removes none of that. The DELETE takes access away, so it stays
+				// open.
 				m.Combo("/{org}/{reponame}").
-					Put(reqToken(), org.AddTeamRepository).
+					Put(reqToken(), reqHumanAuth(), org.AddTeamRepository).
 					Delete(reqToken(), org.RemoveTeamRepository).
 					Get(reqToken(), org.GetTeamRepo)
 			})
@@ -1701,14 +1983,26 @@ func Routes() *web.Router {
 			m.Get("/orgs", admin.GetAllOrgs)
 			m.Group("/users", func() {
 				m.Get("", admin.SearchUsers)
-				m.Post("", bind(api.CreateUserOption{}), admin.CreateUser)
+				// reqHumanAuth(): creating a user creates a whole independent login, which is
+				// the most durable credential on the instance and is entirely unaffected by
+				// revoking the agent key that created it.
+				m.Post("", reqHumanAuth(), bind(api.CreateUserOption{}), admin.CreateUser)
 				m.Group("/{username}", func() {
-					m.Combo("").Patch(bind(api.EditUserOption{}), admin.EditUser).
+					// reqHumanAuth() on the PATCH for a stronger form of the same reason: it
+					// sets the password, the primary email, LoginName/LoginSource, IsAdmin and
+					// AllowGitHook on an *existing* account. Every one of those is a durable
+					// independent login that revoking the agent key does not take away - and
+					// taking over an existing administrator is strictly more than creating a
+					// fresh account, so guarding only the POST one line up would buy nothing.
+					// The DELETE stays open: it destroys, it does not leave a credential behind.
+					m.Combo("").Patch(reqHumanAuth(), bind(api.EditUserOption{}), admin.EditUser).
 						Delete(admin.DeleteUser)
+					// reqHumanAuth() for the same reason as /user/keys, one level up: this
+					// plants an SSH credential on an arbitrary account.
 					m.Group("/keys", func() {
 						m.Post("", bind(api.CreateKeyOption{}), admin.CreatePublicKey)
 						m.Delete("/{id}", admin.DeleteUserPublicKey)
-					})
+					}, reqHumanAuth())
 					m.Get("/orgs", org.ListUserOrgs)
 					m.Post("/orgs", bind(api.CreateOrgOption{}), admin.CreateOrg)
 					m.Post("/repos", bind(api.CreateRepoOption{}), admin.CreateRepo)
@@ -1734,10 +2028,15 @@ func Routes() *web.Router {
 					Patch(bind(api.EditHookOption{}), admin.EditHook).
 					Delete(admin.DeleteHook)
 			})
+			// reqHumanAuth() on both registration-token routes, for the reason given at
+			// /user/actions/runners: the token registers a runner that holds a long-lived
+			// credential of its own and executes workflow jobs, and an instance-level runner
+			// executes them for every repository. Reading the current token is as good as
+			// minting one, so the GET is guarded too.
 			m.Group("/actions", func() {
 				m.Group("/runners", func() {
 					m.Get("", admin.ListRunners)
-					m.Post("/registration-token", admin.CreateRegistrationToken)
+					m.Post("/registration-token", reqHumanAuth(), admin.CreateRegistrationToken)
 					m.Get("/{runner_id}", admin.GetRunner)
 					m.Delete("/{runner_id}", admin.DeleteRunner)
 				})
@@ -1745,7 +2044,7 @@ func Routes() *web.Router {
 				m.Get("/jobs", admin.ListWorkflowJobs)
 			})
 			m.Group("/runners", func() {
-				m.Get("/registration-token", admin.GetRegistrationToken)
+				m.Get("/registration-token", reqHumanAuth(), admin.GetRegistrationToken)
 			})
 		}, tokenRequiresScopes(auth_model.AccessTokenScopeCategoryAdmin), reqToken(), reqSiteAdmin())
 

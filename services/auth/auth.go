@@ -54,6 +54,30 @@ func ErrAsUserAuthMessage(err error) (string, bool) {
 	return "", false
 }
 
+// ErrUserAuthStatus is an authentication failure that has to be reported with a status other
+// than 401, because "your credential was refused" would be a misleading description of it.
+//
+// It exists for the case where the credential itself is fine and the *request* is the problem -
+// a NIP-98 signed body over the size the verifier will hash, say. Collapsing that into the same
+// opaque 401 as a forged signature sends the caller looking for a key problem they do not have.
+type ErrUserAuthStatus struct {
+	Status  int
+	Message string
+}
+
+func (e ErrUserAuthStatus) Error() string {
+	return e.Message
+}
+
+// ErrAsUserAuthStatus reports whether err carries an explicit status to answer with.
+func ErrAsUserAuthStatus(err error) (ErrUserAuthStatus, bool) {
+	var status ErrUserAuthStatus
+	if errors.As(err, &status) {
+		return status, true
+	}
+	return ErrUserAuthStatus{}, false
+}
+
 // Init should be called exactly once when the application starts to allow plugins
 // to allocate necessary resources
 func Init() {
