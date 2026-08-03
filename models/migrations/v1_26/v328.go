@@ -31,14 +31,22 @@ var repoEventFTSIndexes = []string{
 }
 
 // AddRepoEventFullTextIndexes creates the Postgres full-text indexes the unified repository event
-// stream searches through.
+// stream searches through, on installs that upgrade into this version.
+//
+// It is half of the story and cannot be the whole of it: Gitea skips every migration when the
+// version record is absent, because a fresh database gets its schema from the xorm structs
+// instead (migrations.go: "it is a fresh installation, and we can skip all migrations"). Raw DDL
+// in a migration body therefore never runs on a new install. services/repoevent.Init issues the
+// same four statements at startup for that reason, and IF NOT EXISTS is what makes the two
+// harmless to each other. This one still exists because an upgrade is where a multi-minute index
+// build on a mature `action` table belongs - inside a window the operator scheduled - rather than
+// at the first boot after it.
 //
 // It is a no-op on every other dialect, and deliberately so: GIN and to_tsvector are Postgres
 // features, and MySQL and SQLite have no equivalent that is worth a schema change here. Those
-// installs answer ?q= through db.BuildCaseInsensitiveLike instead - the same rows, at the cost of a
-// scan. What must not happen is a migration that fails an upgrade on the two dialects that cannot
-// run it, so the dialect test comes before any SQL is issued rather than being left to an error
-// handler afterwards.
+// installs answer ?q= through db.BuildCaseInsensitiveLike instead. What must not happen is a
+// migration that fails an upgrade on the two dialects that cannot run it, so the dialect test
+// comes before any SQL is issued rather than being left to an error handler afterwards.
 //
 // Re-running is safe: IF NOT EXISTS makes each statement idempotent, which matters because a
 // migration that half-applied and was retried must converge rather than fail on the first index it
@@ -49,13 +57,21 @@ var repoEventFTSIndexes = []string{
 // tables on a mature instance, so on an install with tens of millions of rows the four builds
 // together can run for minutes to hours, and the instance is down for writes for that whole time.
 //
-// CONCURRENTLY would avoid the lock, and is deliberately not used: it cannot run inside a
-// transaction, and Gitea's migration runner wraps each migration in one. Using it would mean either
-// unwrapping the transaction - and then a failure part-way leaves the schema half-migrated with an
-// INVALID index behind - or splitting the index build out of migrations entirely. Neither is worth
-// it for a step that runs once, at a startup the operator has already scheduled as downtime. An
-// operator who cannot afford the pause can create these four indexes CONCURRENTLY by hand before
-// upgrading; IF NOT EXISTS then makes this migration a no-op.
+// CONCURRENTLY would avoid the lock, and could be used here - the runner hands each migration the
+// *xorm.Engine and wraps nothing in a transaction (migrations.go: `func (m *migration) Migrate` is
+// a call to m.migrate and nothing else), and these statements go out through x.Exec, so the one
+// thing CONCURRENTLY cannot tolerate is absent. It is still not used, for a different reason: a
+// concurrent build that fails leaves the index behind marked INVALID, the planner ignores an
+// INVALID index, and IF NOT EXISTS then skips it on every subsequent run - so the failure mode is
+// an index that exists, is never used and is never rebuilt, which is exactly the silent
+// degradation this migration exists to prevent. A blocking build either succeeds or leaves
+// nothing. That trade is worth it for a step that runs once, at a startup the operator has already
+// scheduled as downtime.
+//
+// An operator who cannot afford the pause can create these four indexes CONCURRENTLY by hand
+// before upgrading; IF NOT EXISTS then makes this migration a no-op. If one of those builds fails,
+// REINDEX INDEX <name> is the repair - and until it is run, services/repoevent notices the INVALID
+// index at startup and keeps searching through LIKE rather than through a plan that cannot use it.
 func AddRepoEventFullTextIndexes(x *xorm.Engine) error {
 	if !setting.Database.Type.IsPostgreSQL() {
 		return nil

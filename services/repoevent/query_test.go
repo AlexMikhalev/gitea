@@ -100,6 +100,7 @@ func TestSearchCondFallsBackToCaseInsensitiveLike(t *testing.T) {
 
 func TestSearchCondUsesFullTextOnPostgres(t *testing.T) {
 	defer withDatabaseType(t, "postgres")()
+	defer withFullTextIndexes(t, true)()
 	require.True(t, UsesFullTextSearch())
 
 	sql, args := sqlOf(t, searchCond("hello world", TSVectorExpr("content"), "content"))
@@ -114,6 +115,7 @@ func TestSearchCondUsesFullTextOnPostgres(t *testing.T) {
 // rows come back, they just cost a scan.
 func TestSearchCondWithoutIndexStillFiltersOnPostgres(t *testing.T) {
 	defer withDatabaseType(t, "postgres")()
+	defer withFullTextIndexes(t, true)()
 
 	sql, args := sqlOf(t, searchCond("/api/v1/repos", "", "request_url"))
 	assert.Contains(t, sql, "LOWER(request_url) LIKE ?")

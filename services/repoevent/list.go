@@ -5,6 +5,7 @@ package repoevent
 
 import (
 	"context"
+	"slices"
 	"sort"
 
 	access_model "code.gitea.io/gitea/models/perm/access"
@@ -42,12 +43,7 @@ func (opts *ListOptions) wants(k Kind) bool {
 	if len(opts.Kinds) == 0 {
 		return true
 	}
-	for _, want := range opts.Kinds {
-		if want == k {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(opts.Kinds, k)
 }
 
 // List returns one page of a repository's event stream and the cursor for the next page, or nil

@@ -88,7 +88,7 @@ func TestMergeEventsPagesExactlyOnce(t *testing.T) {
 
 	seen := map[string]int{}
 	var cursor *Cursor
-	for page := 0; page < 10; page++ {
+	for range 10 {
 		sources := [][]*Event{
 			after(all, KindAction, cursor, 2),
 			after(all, KindComment, cursor, 2),

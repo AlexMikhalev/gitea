@@ -102,6 +102,8 @@ func (c Cursor) Encode() string {
 // start of the stream - and yields a nil Cursor.
 func DecodeCursor(s string) (*Cursor, error) {
 	if s == "" {
+		//nolint:nilnil // no cursor is the first page, not a failure: every caller passes the
+		// result straight into ListOptions.Cursor, where nil already means "from the top".
 		return nil, nil
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(s)

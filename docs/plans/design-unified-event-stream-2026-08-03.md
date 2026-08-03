@@ -20,9 +20,14 @@ only**: one cursor-paginated union endpoint plus optional FTS — no new storage
    Every adapter filters to what the requesting doer may see; private rows must not leak through the union.
 5. `models/migrations/v1_26/v328.go` + `migrations.go:405` — `newMigration(328, ...)`; 327 (`AddAgentIdentity`) is the
    current max. Guarded: create the GIN index only when `setting.Database.Type.IsPostgreSQL()`
-   (modules/setting/database.go:223), else no-op — it must not fail an install on MySQL/SQLite. `?q=` uses
-   `to_tsquery` when that index exists and `db.BuildCaseInsensitiveLike` (models/db/common.go:19) when it does not:
-   same results contract, different cost. Never silently drop `q`.
+   (modules/setting/database.go:223), else no-op — it must not fail an install on MySQL/SQLite. A migration only
+   reaches installs that *upgrade*: `migrations.go` skips every one of them on a fresh database, so
+   `services/repoevent.Init` (called from `routers/init.go`) issues the same `CREATE INDEX IF NOT EXISTS`
+   statements at startup, and decides the search path from whether the indexes are actually there rather than
+   from the dialect alone. `?q=` uses `plainto_tsquery` when they exist and `db.BuildCaseInsensitiveLike`
+   (models/db/common.go:19) when they do not. Never silently drop `q` — but the two paths do not match the same
+   rows (stemmed lexemes vs raw substrings), which is a documented, deployment-dependent behaviour of the `q`
+   parameter rather than an equivalence.
 6. `cmd/gitea-robot/main.go` — `events` subcommand in the `switch command` dispatch (:167-181) and `printUsage()`,
    plus an `events` MCP tool beside `triage`/`ready`/`graph`/`add_dep` (:603-662).
 
@@ -41,8 +46,10 @@ only**: one cursor-paginated union endpoint plus optional FTS — no new storage
 - Paging by `next_cursor` yields every event exactly once — no duplicates, no skips — including when rows are
   inserted between pages.
 - `?q=` returns matches on Postgres (index path) and on SQLite/MySQL (ILIKE path).
-- Rows a doer cannot see are absent; an unreadable repo returns 404.
-- Migration 328 applies cleanly on all three dialects and is idempotent on re-run.
+- Rows a doer cannot see are absent; an unreadable repo returns 404. Asserted against a database, per gate, not
+  as rendered SQL: `services/repoevent/list_db_test.go` and `tests/integration/api_repo_event_test.go`.
+- Migration 328 applies cleanly on all three dialects and is idempotent on re-run; a *fresh* Postgres install,
+  which never runs it, still ends up with the four indexes through `repoevent.Init`.
 - `gitea-robot events` and the `events` MCP tool return the same data as the endpoint.
 
 ## Non-goals

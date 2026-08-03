@@ -8214,6 +8214,90 @@
         }
       }
     },
+    "/repos/{owner}/{repo}/events": {
+      "get": {
+        "description": "Returns activity rows, issue and pull request comments, published reviews, commit\nstatuses and - for repository admins - the agent audit trail, merged newest first.\nPaging is by the opaque next_cursor rather than by page number, so following it visits\nevery event exactly once even while new events are being written. Events the requesting\nuser may not see are absent from the stream rather than reported as forbidden.\n\nFree-text payload values are truncated; when a value was cut, the payload also carries\n`\u003ckey\u003e_truncated: \"true\"` and the full text must be read from the endpoint that owns\nthe row.\n\nVisibility is per kind. Comments, reviews and statuses are filtered by the repository\nunit they belong to (issues, pull requests, code), and the agent audit trail is\nrepository admins only. The action kind is filtered the way\n`/repos/{owner}/{repo}/activities/feeds` filters it - by access to the repository and by\nthe actor's own activity-privacy setting - and not by unit, so a reader with access to\nonly some units still sees this repository's activity rows.",
+        "produces": [
+          "application/json"
+        ],
+        "tags": [
+          "repository"
+        ],
+        "summary": "List a repository's unified event stream",
+        "operationId": "repoListEvents",
+        "parameters": [
+          {
+            "type": "string",
+            "description": "owner of the repo",
+            "name": "owner",
+            "in": "path",
+            "required": true
+          },
+          {
+            "type": "string",
+            "description": "name of the repo",
+            "name": "repo",
+            "in": "path",
+            "required": true
+          },
+          {
+            "type": "string",
+            "description": "comma-separated kinds to include (action, agent_audit, comment, review, status); all when omitted",
+            "name": "kinds",
+            "in": "query"
+          },
+          {
+            "type": "string",
+            "format": "date-time",
+            "description": "only events created at or after this time (RFC 3339)",
+            "name": "since",
+            "in": "query"
+          },
+          {
+            "type": "string",
+            "format": "date-time",
+            "description": "only events created at or before this time (RFC 3339)",
+            "name": "until",
+            "in": "query"
+          },
+          {
+            "type": "string",
+            "description": "only events whose actor is this username",
+            "name": "actor",
+            "in": "query"
+          },
+          {
+            "type": "string",
+            "description": "only events whose text matches this search. Matching is against each kind's own text\ncolumn, which for the action kind is action.content - serialized JSON for push events\nrather than prose, so a search there matches the JSON's text.\n\nHow the match is made depends on the instance's database. On PostgreSQL it is a\nfull-text match, which stems words, ignores case and skips stop words: `running`\nmatches \"runs\" and `the` matches nothing. On MySQL and SQLite it is a\ncase-insensitive substring match: `fix` matches \"prefix\". Callers that must behave\nidentically everywhere should not depend on either one's extra matches.",
+            "name": "q",
+            "in": "query"
+          },
+          {
+            "type": "string",
+            "description": "opaque next_cursor from the previous page",
+            "name": "cursor",
+            "in": "query"
+          },
+          {
+            "type": "integer",
+            "description": "page size of results",
+            "name": "limit",
+            "in": "query"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/responses/RepoEventList"
+          },
+          "404": {
+            "$ref": "#/responses/notFound"
+          },
+          "422": {
+            "$ref": "#/responses/validationError"
+          }
+        }
+      }
+    },
     "/repos/{owner}/{repo}/file-contents": {
       "get": {
         "description": "See the POST method. This GET method supports using JSON encoded request body in query parameter.",
@@ -28415,6 +28499,71 @@
       },
       "x-go-package": "code.gitea.io/gitea/modules/structs"
     },
+    "RepoEvent": {
+      "description": "The stream is a union of five tables with five shapes, so the fields here are only the ones all\nfive have: what kind of thing it was, which row of that kind, who did it and when. Everything\nthat is specific to one kind lives in Payload rather than as a field that is empty for the other\nfour.",
+      "type": "object",
+      "title": "RepoEvent is one entry of a repository's unified event stream.",
+      "properties": {
+        "actor_id": {
+          "type": "integer",
+          "format": "int64",
+          "x-go-name": "ActorID"
+        },
+        "created": {
+          "type": "string",
+          "format": "date-time",
+          "x-go-name": "Created"
+        },
+        "kind": {
+          "description": "Kind is the source the event was read from: action, agent_audit, comment, review or status.",
+          "type": "string",
+          "x-go-name": "Kind"
+        },
+        "payload": {
+          "description": "Payload carries the fields specific to this kind. Its keys depend on Kind and are not a\nfixed set.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "x-go-name": "Payload"
+        },
+        "repo_id": {
+          "type": "integer",
+          "format": "int64",
+          "x-go-name": "RepoID"
+        },
+        "source_id": {
+          "description": "SourceID is the row's primary key within Kind, and is only unique together with it.",
+          "type": "integer",
+          "format": "int64",
+          "x-go-name": "SourceID"
+        },
+        "title": {
+          "type": "string",
+          "x-go-name": "Title"
+        }
+      },
+      "x-go-package": "code.gitea.io/gitea/modules/structs"
+    },
+    "RepoEventList": {
+      "description": "NextCursor is opaque and empty at the end of the stream. It is a position in the stream rather\nthan a page number, so a client that keeps following it sees every event exactly once even while\nnew ones are being written.",
+      "type": "object",
+      "title": "RepoEventList is a page of a repository's event stream.",
+      "properties": {
+        "data": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/RepoEvent"
+          },
+          "x-go-name": "Data"
+        },
+        "next_cursor": {
+          "type": "string",
+          "x-go-name": "NextCursor"
+        }
+      },
+      "x-go-package": "code.gitea.io/gitea/modules/structs"
+    },
     "RepoTopicOptions": {
       "description": "RepoTopicOptions a collection of repo topic names",
       "type": "object",
@@ -30634,6 +30783,12 @@
       "description": "RepoCollaboratorPermission",
       "schema": {
         "$ref": "#/definitions/RepoCollaboratorPermission"
+      }
+    },
+    "RepoEventList": {
+      "description": "RepoEventList",
+      "schema": {
+        "$ref": "#/definitions/RepoEventList"
       }
     },
     "RepoIssueConfig": {

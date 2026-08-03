@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/modules/setting"
 	"code.gitea.io/gitea/modules/timeutil"
 
 	"xorm.io/builder"
@@ -64,20 +63,21 @@ func rangeCond(since, until *timeutil.TimeStamp, createdCol string) builder.Cond
 	return cond
 }
 
-// UsesFullTextSearch reports whether ?q= runs as a Postgres full-text match rather than as a
-// case-insensitive LIKE. It follows the same test migration 328 used to decide whether to create
-// the GIN indexes, so the two cannot disagree about which path exists.
-func UsesFullTextSearch() bool {
-	return setting.Database.Type.IsPostgreSQL()
-}
-
 // searchCond builds the ?q= filter for one source.
 //
 // ftsExpr is the indexed expression from migration 328 - it must be written character for character
 // as the migration writes it. Passing an empty ftsExpr says this source has no index and always
 // takes the LIKE path; that is a per-source decision, not a way to drop the filter. `q` is never
-// ignored: on a dialect or a source without an index the same rows come back, they just cost a
-// scan instead of an index lookup.
+// ignored: whichever path is taken, it narrows the rows.
+//
+// The two paths do not, however, match the same rows, and the endpoint documents that as a
+// deployment-dependent behaviour rather than pretending otherwise. plainto_tsquery stems, folds and
+// drops stop words and matches whole lexemes; db.BuildCaseInsensitiveLike matches raw substrings.
+// So `?q=fix` finds "prefix" through LIKE and not through full text, `?q=running` finds "runs"
+// through full text and not through LIKE, and `?q=the` finds every row through LIKE and none
+// through full text. Both are defensible answers to "search this text"; what would not be
+// defensible is a reader believing they are interchangeable and writing a test that only passes on
+// one dialect.
 //
 // plainto_tsquery rather than to_tsquery, because to_tsquery parses its argument as a tsquery
 // expression and raises a syntax error on ordinary prose - `?q=a b` would be a 500 rather than a

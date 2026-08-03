@@ -31,6 +31,13 @@ func ListRepoEvents(ctx *context.APIContext) {
 	//   Free-text payload values are truncated; when a value was cut, the payload also carries
 	//   `<key>_truncated: "true"` and the full text must be read from the endpoint that owns
 	//   the row.
+	//
+	//   Visibility is per kind. Comments, reviews and statuses are filtered by the repository
+	//   unit they belong to (issues, pull requests, code), and the agent audit trail is
+	//   repository admins only. The action kind is filtered the way
+	//   `/repos/{owner}/{repo}/activities/feeds` filters it - by access to the repository and by
+	//   the actor's own activity-privacy setting - and not by unit, so a reader with access to
+	//   only some units still sees this repository's activity rows.
 	// produces:
 	// - application/json
 	// parameters:
@@ -68,6 +75,12 @@ func ListRepoEvents(ctx *context.APIContext) {
 	//     only events whose text matches this search. Matching is against each kind's own text
 	//     column, which for the action kind is action.content - serialized JSON for push events
 	//     rather than prose, so a search there matches the JSON's text.
+	//
+	//     How the match is made depends on the instance's database. On PostgreSQL it is a
+	//     full-text match, which stems words, ignores case and skips stop words: `running`
+	//     matches "runs" and `the` matches nothing. On MySQL and SQLite it is a
+	//     case-insensitive substring match: `fix` matches "prefix". Callers that must behave
+	//     identically everywhere should not depend on either one's extra matches.
 	//   type: string
 	// - name: cursor
 	//   in: query
@@ -185,6 +198,8 @@ func parseKinds(raw string) ([]repoevent.Kind, error) {
 func parseEventTime(raw string) (*timeutil.TimeStamp, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
+		//nolint:nilnil // an absent parameter is not a failure, and nil is how the rest of
+		// this package says "the caller did not give a bound" - see rangeCond.
 		return nil, nil
 	}
 	t, err := time.Parse(time.RFC3339, raw)

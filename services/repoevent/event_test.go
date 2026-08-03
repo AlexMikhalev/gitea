@@ -4,6 +4,7 @@
 package repoevent
 
 import (
+	"slices"
 	"sort"
 	"testing"
 
@@ -63,7 +64,7 @@ func TestCompareEventsBreaksTiesTotally(t *testing.T) {
 func TestAllKindsIsInComparisonOrder(t *testing.T) {
 	sorted := make([]Kind, len(AllKinds))
 	copy(sorted, AllKinds)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	slices.Sort(sorted)
 	assert.Equal(t, sorted, AllKinds, "AllKinds must be listed in the order Kind values compare")
 }
 

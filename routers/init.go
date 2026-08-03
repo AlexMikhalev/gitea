@@ -49,6 +49,7 @@ import (
 	"code.gitea.io/gitea/services/oauth2_provider"
 	pull_service "code.gitea.io/gitea/services/pull"
 	release_service "code.gitea.io/gitea/services/release"
+	"code.gitea.io/gitea/services/repoevent"
 	repo_service "code.gitea.io/gitea/services/repository"
 	"code.gitea.io/gitea/services/repository/archiver"
 	"code.gitea.io/gitea/services/task"
@@ -149,6 +150,10 @@ func InitWebInstalled(ctx context.Context) {
 	mustInitCtx(ctx, models.Init)
 	mustInitCtx(ctx, authmodel.Init)
 	mustInitCtx(ctx, repo_service.Init)
+	// After the engine has synced the schema, because it creates indexes on tables that a
+	// fresh install has only just had created for it - migration 328 cannot reach those, as
+	// migrations are skipped entirely on a new database.
+	mustInitCtx(ctx, repoevent.Init)
 
 	// Booting long running goroutines.
 	mustInit(indexer_service.Init)
