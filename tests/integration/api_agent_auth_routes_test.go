@@ -5,11 +5,19 @@ package integration
 
 import (
 	"net/http"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	auth_model "code.gitea.io/gitea/models/auth"
 	"code.gitea.io/gitea/modules/setting"
+	"code.gitea.io/gitea/modules/test"
+	"code.gitea.io/gitea/modules/web"
 	v1 "code.gitea.io/gitea/routers/api/v1"
+	"code.gitea.io/gitea/tests"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -29,13 +37,18 @@ import (
 // already guarded elsewhere - belongs to neither set, so it fails here instead of quietly
 // widening what an agent signature can reach.
 //
-// Two things this deliberately does not do:
+// Two things the walk itself deliberately does not do:
 //
 //   - It does not assert that a guarded route still has the middleware attached. chi bakes
 //     per-route middlewares into a closure chain, so the walk cannot see them, and identifying
-//     them by code pointer would be reading the implementation rather than the behaviour. The
-//     behavioural tests in api_agent_auth_test.go cover that half: each one signs a real request
-//     and requires a 403. The census covers the other half - that no route escaped the question.
+//     them by code pointer would be reading the implementation rather than the behaviour. That
+//     half is behavioural, and it is driven from the same map:
+//     TestAPIAgentGuardedRoutesRefuseASignedRequest below signs a real request at every entry of
+//     agentAuthGuardedRoutes and requires reqHumanAuth's own 403. The two halves cannot drift,
+//     because adding a route to the map is what adds its behavioural test. The hand-written cases
+//     in api_agent_auth_test.go stay: they assert the *consequences* a status code cannot - that
+//     the refusal wrote nothing, and that the owner's own token still gets through, which is what
+//     makes each 403 the guard's doing rather than a permission check's.
 //   - It does not enumerate reads. A GET plants nothing, which is the policy stated at
 //     reqHumanAuth, and listing ~250 read routes would bury the mutating ones. The one read class
 //     that is equivalent to minting - a runner registration token, which is usable by whoever
@@ -78,9 +91,11 @@ const (
 		"signature rather than acting for the caller"
 	exemptPathGroupCatchAll = "an artifact of web.Router.PathGroup, which registers the pattern for every " +
 		"HTTP method at the chi level and then dispatches inside RouterPathGroup.ServeHTTP against " +
-		"the matchers declared in it. Every matcher under /commits/* is a GET, so a request arriving " +
-		"here with any other method falls through to the not-found handler and never reaches a " +
-		"handler at all. The census sees these because chi does; they are not endpoints"
+		"the matchers declared in it. Every matcher under this pattern is a GET or a HEAD, so a " +
+		"request arriving here with any other method falls through to the not-found handler and " +
+		"never reaches a handler at all. The census sees these because chi does; they are not " +
+		"endpoints. That claim is not taken on trust: the subtest below reads the matchers back " +
+		"out of the group and fails if one of them accepts a mutating method"
 )
 
 // agentAuthGuardedRoutes is every route carrying reqHumanAuth(). The reasoning for each class is
@@ -150,6 +165,7 @@ var agentAuthGuardedRoutes = map[string]string{
 	"PUT /teams/{teamid}/members/{username}":                        "grants a different account standing access",
 	"PUT /teams/{teamid}/repos/{org}/{reponame}":                    "grants a team standing access",
 	"PATCH /teams/{teamid}":                                         "widens an existing team over every member and repository at once",
+	"PATCH /orgs/{org}":                                             "sets repo_admin_change_team_access, the authorization gate on the team-repository grant guarded above",
 
 	// Whole logins on other accounts.
 	"POST /admin/users":                        "creates an independent login",
@@ -355,7 +371,6 @@ var agentAuthExemptRoutes = map[string]string{
 	"POST /repos/{username}/{reponame}/push_mirrors-sync":                          exemptRunsExistingCode,
 
 	// Visibility
-	"PATCH /orgs/{org}":                            exemptVisibility,
 	"DELETE /orgs/{org}/public_members/{username}": exemptVisibility,
 	"PUT /orgs/{org}/public_members/{username}":    exemptVisibility,
 	"PATCH /repos/{username}/{reponame}":           exemptVisibility,
@@ -444,6 +459,55 @@ func TestAPIAgentAuthRouteCensus(t *testing.T) {
 		}
 	})
 
+	// The one shape the walk above cannot see. web.Router.PathGroup registers its pattern with
+	// r.Any(), so chi's table holds all nine methods for it whatever the group dispatches, and the
+	// matchers that decide what actually reaches a handler live in RouterPathGroup and are
+	// consulted in its ServeHTTP. That is what exemptPathGroupCatchAll asserts about /commits/*,
+	// and until this subtest existed it asserted it in prose: adding one mutating MatchPath inside
+	// the group would leave chi's route table byte-identical, so the new endpoint would be born
+	// exempt with nothing to notice it. WalkPathGroups reads the matchers back out, so the
+	// exemption now stands or falls on what the group dispatches.
+	t.Run("nothing mutating hides inside a path group catch-all", func(t *testing.T) {
+		catchAllPatterns := map[string]bool{}
+		for route, reason := range agentAuthExemptRoutes {
+			if reason != exemptPathGroupCatchAll {
+				continue
+			}
+			_, pattern, _ := strings.Cut(route, " ")
+			catchAllPatterns[pattern] = true
+		}
+		require.NotEmpty(t, catchAllPatterns, "no pattern is exempt as a path-group catch-all any more; "+
+			"if PathGroup is gone from v1 this subtest and exemptPathGroupCatchAll should go with it")
+
+		walked := map[string]bool{}
+		require.NoError(t, v1.Routes().WalkPathGroups(func(pattern string, matchers []web.PathGroupMatcher) error {
+			walked[pattern] = true
+			if !catchAllPatterns[pattern] {
+				// Not exempt as a catch-all, so the walk above already required each of its
+				// methods to be classified on its own.
+				return nil
+			}
+			assert.NotEmpty(t, matchers, "%s dispatches no matcher at all", pattern)
+			for _, matcher := range matchers {
+				for _, method := range matcher.Methods {
+					assert.Contains(t, []string{http.MethodGet, http.MethodHead}, method,
+						"%s %s%s reaches a handler, but %s is classified as an unreachable "+
+							"path-group catch-all. A mutating matcher inside a PathGroup is invisible "+
+							"to chi's route table: classify this endpoint - guard it with reqHumanAuth() "+
+							"if a later unsigned request would get anything out of it - rather than "+
+							"leaving the catch-all exemption to cover it.",
+						method, pattern, matcher.Pattern, pattern)
+				}
+			}
+			return nil
+		}))
+
+		for pattern := range catchAllPatterns {
+			assert.True(t, walked[pattern], "%s is exempt as a path-group catch-all but no path group "+
+				"is registered there any more", pattern)
+		}
+	})
+
 	// The reverse direction: a listed route that no longer exists means a route moved and took its
 	// classification with it, which is exactly how an alias goes unnoticed.
 	t.Run("no classification is stale", func(t *testing.T) {
@@ -467,4 +531,101 @@ func TestAPIAgentAuthRouteCensus(t *testing.T) {
 			assert.True(t, registered[route], "%s should be registered when federation is enabled", route)
 		}
 	})
+}
+
+// agentAuthRouteParams gives every path placeholder that appears in agentAuthGuardedRoutes a value
+// from the fixtures, so that the behavioural test below can turn a route pattern into a request.
+//
+// The values only have to survive whatever runs *before* reqHumanAuth() - repository, organization
+// and user assignment, and the permission checks - because a guarded route never reaches its
+// handler in this test. That is why {reponame} is one repository for every route: PUT
+// /teams/{teamid}/repos/{org}/{reponame} resolves org3/repo1 inside its handler, which the refusal
+// happens before. A placeholder with no value here is a failure rather than a skip; a new guarded
+// route that introduced one would otherwise silently lose its behavioural half.
+var agentAuthRouteParams = map[string]string{
+	"username":     "user2", // a repository owner, an account under /admin/users, a team member
+	"reponame":     "repo1", // owned by user2
+	"org":          "org3",  // an organization in the fixtures
+	"teamid":       "2",     // team1 of org3
+	"team":         "team1",
+	"collaborator": "user4",
+	"id":           "1",
+	"secretname":   "CENSUS_SECRET",
+	"variablename": "CENSUS_VARIABLE",
+}
+
+var agentAuthRoutePlaceholder = regexp.MustCompile(`\{[^}]+\}`)
+
+// agentAuthRoutePath substitutes agentAuthRouteParams into a route pattern.
+func agentAuthRoutePath(t *testing.T, pattern string) string {
+	t.Helper()
+
+	return agentAuthRoutePlaceholder.ReplaceAllStringFunc(pattern, func(placeholder string) string {
+		name, _, _ := strings.Cut(strings.Trim(placeholder, "{}"), ":")
+		value, ok := agentAuthRouteParams[name]
+		require.True(t, ok, "no fixture value for the %s path parameter of %s; add one to "+
+			"agentAuthRouteParams so this route gets a behavioural test", placeholder, pattern)
+		return value
+	})
+}
+
+// The behavioural half of the census: every route listed in agentAuthGuardedRoutes gets a real
+// NIP-98-signed request and has to answer reqHumanAuth's 403.
+//
+// The census next door asks whether a route was classified; it explicitly cannot ask whether the
+// middleware is still attached, because chi bakes per-route middlewares into a closure chain. So
+// dropping reqHumanAuth() from, say, m.Group("/keys", ..., reqHumanAuth()) used to pass the whole
+// suite: the route is still registered, still classified, and nothing signed a request at it.
+// Driving this from the map itself is what makes the two halves undriftable - a route added to
+// agentAuthGuardedRoutes without a working guard fails here, and one removed from the map fails
+// the census.
+//
+// Two things make each 403 the guard's and not something else's:
+//
+//   - The agent is user1, the site administrator, holding a key scoped "all". Every check that
+//     runs ahead of reqHumanAuth() - reqSiteAdmin, reqAdmin, reqOwner, reqOrgOwnership,
+//     reqTeamMembership, reqGitHook and tokenRequiresScopes - is therefore satisfied, so none of
+//     them is what answers.
+//   - The response body has to carry reqHumanAuth's own message. A 403 from any other check reads
+//     differently, so a route that started refusing for a different reason fails here rather than
+//     passing quietly.
+func TestAPIAgentGuardedRoutesRefuseASignedRequest(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+	// PATCH /repos/{username}/{reponame}/hooks/git/{id} sits behind reqGitHook(), which refuses
+	// everyone while git hooks are disabled - the default. Without this the 403 for that one route
+	// would come from reqGitHook() and the message assertion below would catch it.
+	defer test.MockVariableValue(&setting.DisableGitHooks, false)()
+
+	const secretKey = "000000000000000000000000000000000000000000000000000000000000004d"
+	// "all" is deliberate: the point is to reach reqHumanAuth() on every route rather than to be
+	// stopped by a scope, and a credential may only delegate what it holds, so the token needs it
+	// too. user1 is the site administrator in the fixtures.
+	token := getUserToken(t, "user1", auth_model.AccessTokenScopeAll)
+	registerAgentKey(t, token, agentPubKey(t, secretKey), string(auth_model.AccessTokenScopeAll))
+
+	routes := make([]string, 0, len(agentAuthGuardedRoutes))
+	for route := range agentAuthGuardedRoutes {
+		routes = append(routes, route)
+	}
+	sort.Strings(routes)
+	require.NotEmpty(t, routes)
+
+	for i, route := range routes {
+		t.Run(route, func(t *testing.T) {
+			method, pattern, _ := strings.Cut(route, " ")
+			path := "/api/v1" + agentAuthRoutePath(t, pattern)
+
+			// The nonce is what keeps the server's replay guard from rejecting the second of two
+			// otherwise identical requests; the index makes it distinct per route without
+			// depending on the route string's length.
+			nonce := "census-" + strconv.Itoa(i)
+			req := NewRequestWithBody(t, method, path, strings.NewReader("")).
+				SetHeader("Authorization", signNIP98(t, secretKey, method, path, "", time.Now(), nonce))
+			resp := MakeRequest(t, req, http.StatusForbidden)
+
+			assert.Contains(t, resp.Body.String(), "an agent signature cannot be used here",
+				"%s answered 403, but not with reqHumanAuth's refusal - so the guard is not what "+
+					"stopped it, and whether the route is guarded is still untested", route)
+		})
+	}
 }

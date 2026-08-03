@@ -233,6 +233,49 @@ func TestRouter(t *testing.T) {
 	})
 }
 
+// WalkPathGroups is what lets a route-table audit see inside a PathGroup, and the contrast with
+// WalkRoutes at the end is the reason it has to exist: PathGroup registers its pattern with Any(),
+// so chi's table lists every HTTP method for it whatever the group dispatches. A caller reading
+// that table alone cannot tell a group that only serves reads from one holding a mutating matcher.
+func TestWalkPathGroups(t *testing.T) {
+	h := func(resp http.ResponseWriter, req *http.Request) {}
+
+	r := NewRouter()
+	m := NewRouter()
+	r.Mount("/api/v1", m)
+	m.Group("/repos/{username}/{reponame}", func() {
+		m.Group("/commits", func() {
+			m.PathGroup("/*", func(g *RouterPathGroup) {
+				g.MatchPath("GET", "/<ref:*>/status", h)
+				g.MatchPath("HEAD,GET", "/<sha>/pull", h)
+			})
+		})
+	})
+
+	walked := map[string][]PathGroupMatcher{}
+	assert.NoError(t, r.WalkPathGroups(func(pattern string, matchers []PathGroupMatcher) error {
+		walked[pattern] = matchers
+		return nil
+	}))
+	// The pattern is the full one, including the prefix the sub-router was mounted at: a census
+	// matching these against chi's route table has to be comparing the same strings.
+	assert.Equal(t, map[string][]PathGroupMatcher{
+		"/api/v1/repos/{username}/{reponame}/commits/*": {
+			{Methods: []string{"GET"}, Pattern: "/<ref:*>/status"},
+			{Methods: []string{"GET", "HEAD"}, Pattern: "/<sha>/pull"},
+		},
+	}, walked)
+
+	methods := map[string]bool{}
+	assert.NoError(t, r.WalkRoutes(func(method, pattern string) error {
+		if strings.HasSuffix(pattern, "/commits/*") {
+			methods[method] = true
+		}
+		return nil
+	}))
+	assert.True(t, methods["POST"], "chi lists POST for a group that dispatches nothing but GET and HEAD")
+}
+
 func TestRouteNormalizePath(t *testing.T) {
 	type paths struct {
 		EscapedPath, RawPath, Path string

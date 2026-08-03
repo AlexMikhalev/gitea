@@ -417,6 +417,13 @@ func reqUsersExploreEnabled() func(ctx *context.APIContext) {
 // is guarded too. Those writes are guarded; the matching DELETEs are not, because withdrawing
 // access leaves nothing behind.
 //
+// A field that moves the *authorization gate* on a guarded grant is guarded on the same footing as
+// the grant itself, which is why PATCH /orgs/{org} is in the set: EditOrgOption is mostly
+// disclosure, but RepoAdminChangeTeamAccess is what changeRepoTeam checks before letting a
+// repository admin who is not an org owner add a team to a repository. Setting it opens the
+// team-repository grant to every repository admin in the organization, and the setting outlives
+// the key that made it.
+//
 // A grant is guarded wherever it is reachable, not wherever it was first noticed: the
 // team-repository grant is exposed twice, at PUT /teams/{teamid}/repos/{org}/{reponame} and at
 // PUT /repos/{owner}/{repo}/teams/{team}, and both go through repo_service.TeamAddRepository, so
@@ -1861,8 +1868,19 @@ func Routes() *web.Router {
 		m.Post("/orgs", tokenRequiresScopes(auth_model.AccessTokenScopeCategoryOrganization), reqToken(), bind(api.CreateOrgOption{}), org.Create)
 		m.Get("/orgs", org.GetAll, tokenRequiresScopes(auth_model.AccessTokenScopeCategoryOrganization))
 		m.Group("/orgs/{org}", func() {
+			// reqHumanAuth() on the PATCH: most of EditOrgOption is description, location and
+			// visibility - disclosure, which the policy leaves alone - but it also carries
+			// RepoAdminChangeTeamAccess, and that field is the authorization gate on a grant this
+			// policy does guard. changeRepoTeam (routers/api/v1/repo/teams.go) refuses a caller
+			// who is neither the repository's owner nor an org owner unless it is set, so turning
+			// it on lets every repository admin in the organization make the team-repository
+			// grant that PUT /repos/{owner}/{repo}/teams/{team} and
+			// PUT /teams/{teamid}/repos/{org}/{reponame} are both guarded for. That is standing
+			// access handed to principals who reach it with their own credentials afterwards, so
+			// revoking the agent's key does not put the gate back. The DELETE removes the
+			// organization outright and stays open.
 			m.Combo("").Get(org.Get).
-				Patch(reqToken(), reqOrgOwnership(), bind(api.EditOrgOption{}), org.Edit).
+				Patch(reqToken(), reqOrgOwnership(), reqHumanAuth(), bind(api.EditOrgOption{}), org.Edit).
 				Delete(reqToken(), reqOrgOwnership(), org.Delete)
 			m.Post("/rename", reqToken(), reqOrgOwnership(), bind(api.RenameOrgOption{}), org.Rename)
 			m.Combo("/repos").Get(user.ListOrgRepos).

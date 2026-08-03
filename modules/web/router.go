@@ -44,6 +44,21 @@ type Router struct {
 	chiRouter      *chi.Mux
 	curGroupPrefix string
 	curMiddlewares []any
+
+	// pathGroups and mountedRouters exist only so that WalkPathGroups can reach what chi's route
+	// table does not hold; nothing on a request path reads them.
+	pathGroups     []registeredPathGroup
+	mountedRouters []mountedRouter
+}
+
+type registeredPathGroup struct {
+	pattern string
+	group   *RouterPathGroup
+}
+
+type mountedRouter struct {
+	prefix string
+	router *Router
 }
 
 // NewRouter creates a new route
@@ -137,7 +152,9 @@ func (r *Router) Methods(methods, pattern string, h ...any) {
 // Mount attaches another Router along ./pattern/*
 func (r *Router) Mount(pattern string, subRouter *Router) {
 	subRouter.Use(r.curMiddlewares...)
-	r.chiRouter.Mount(r.getPattern(pattern), subRouter.chiRouter)
+	prefix := r.getPattern(pattern)
+	r.chiRouter.Mount(prefix, subRouter.chiRouter)
+	r.mountedRouters = append(r.mountedRouters, mountedRouter{prefix: prefix, router: subRouter})
 }
 
 // Any delegate requests for all methods
@@ -192,6 +209,33 @@ func (r *Router) WalkRoutes(fn func(method, pattern string) error) error {
 	return chi.Walk(r.chiRouter, func(method, route string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
 		return fn(method, route)
 	})
+}
+
+// WalkPathGroups calls fn once for every RouterPathGroup registered on this router, including the
+// ones registered on sub-routers mounted into it, with the full path pattern the group occupies
+// and the matchers declared inside it.
+//
+// It exists because a PathGroup is invisible to WalkRoutes as anything but a catch-all: PathGroup
+// registers its pattern with Any(), so chi's table holds an entry for every HTTP method whatever
+// the group actually dispatches, and the matchers are consulted only in
+// RouterPathGroup.ServeHTTP. A test auditing the route table for which methods can reach a
+// handler therefore has to ask the group itself - see TestAPIAgentAuthRouteCensus, which uses
+// this to check that nothing mutating hides behind a catch-all it has classified as unreachable.
+// Like WalkRoutes, it is for tests rather than for a request path.
+func (r *Router) WalkPathGroups(fn func(pattern string, matchers []PathGroupMatcher) error) error {
+	for _, registered := range r.pathGroups {
+		if err := fn(registered.pattern, registered.group.Matchers()); err != nil {
+			return err
+		}
+	}
+	for _, mounted := range r.mountedRouters {
+		if err := mounted.router.WalkPathGroups(func(pattern string, matchers []PathGroupMatcher) error {
+			return fn(mounted.prefix+pattern, matchers)
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // NotFound defines a handler to respond whenever a route could not be found.
@@ -267,5 +311,6 @@ func (r *Router) Combo(pattern string, h ...any) *Combo {
 func (r *Router) PathGroup(pattern string, fn func(g *RouterPathGroup), h ...any) {
 	g := &RouterPathGroup{r: r, pathParam: "*"}
 	fn(g)
+	r.pathGroups = append(r.pathGroups, registeredPathGroup{pattern: r.getPattern(pattern), group: g})
 	r.Any(pattern, append(h, g.ServeHTTP)...)
 }

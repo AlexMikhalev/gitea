@@ -38,6 +38,27 @@ func (g *RouterPathGroup) ServeHTTP(resp http.ResponseWriter, req *http.Request)
 	g.r.chiRouter.NotFoundHandler().ServeHTTP(resp, req)
 }
 
+// PathGroupMatcher describes one matcher declared inside a RouterPathGroup: the HTTP methods it
+// accepts, and the pattern it matches relative to the group's own pattern.
+type PathGroupMatcher struct {
+	Methods []string
+	Pattern string
+}
+
+// Matchers reports the matchers declared inside this group. Their methods are what can actually
+// reach a handler under the group's pattern: a request whose method no matcher accepts falls
+// through to the not-found handler in ServeHTTP above, however many methods chi's route table
+// lists for the pattern. See Router.WalkPathGroups for why that distinction needs an accessor.
+func (g *RouterPathGroup) Matchers() []PathGroupMatcher {
+	matchers := make([]PathGroupMatcher, 0, len(g.matchers))
+	for _, m := range g.matchers {
+		methods := m.methods.Values()
+		slices.Sort(methods)
+		matchers = append(matchers, PathGroupMatcher{Methods: methods, Pattern: m.pattern})
+	}
+	return matchers
+}
+
 type RouterPathGroupPattern struct {
 	pattern     string
 	re          *regexp.Regexp

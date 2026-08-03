@@ -466,7 +466,10 @@ func TestAPIAgentCannotPlantCredentialsUnderRepo(t *testing.T) {
 	defer tests.PrepareTestEnv(t)()
 
 	const secretKey = "0000000000000000000000000000000000000000000000000000000000000041"
-	token := getUserToken(t, "user2", auth_model.AccessTokenScopeWriteRepository)
+	// write:user is on the token because /agent/keys is user-scoped and a token that cannot reach
+	// it cannot enrol the key at all; the *key* stays write:repository, which is what the refusals
+	// below are about.
+	token := getUserToken(t, "user2", auth_model.AccessTokenScopeWriteRepository, auth_model.AccessTokenScopeWriteUser)
 	registerAgentKey(t, token, agentPubKey(t, secretKey), string(auth_model.AccessTokenScopeWriteRepository))
 
 	t.Run("installing a deploy key", func(t *testing.T) {
@@ -709,6 +712,54 @@ func TestAPIAgentCannotGrantStandingAccess(t *testing.T) {
 			&api.TransferRepoOption{NewOwner: "org3"}).AddTokenAuth(repoToken)
 		MakeRequest(t, req, http.StatusAccepted)
 		unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1, OwnerName: "org3"})
+	})
+}
+
+// The gate on a grant is part of the grant. PATCH /orgs/{org} reads as disclosure - description,
+// location, visibility - but EditOrgOption also carries repo_admin_change_team_access, and that
+// field is precisely what changeRepoTeam checks before letting a repository admin who is not an
+// organization owner add a team to a repository. The team-repository grant itself is guarded at
+// both of its aliases; an agent that could turn this flag on would hand the grant to every
+// repository admin in the organization instead, make no grant itself, and leave a state that
+// revoking its key does not undo. The other fields stay reachable, which is what the last case
+// pins: the guard is on the route because the route carries the field, not because editing an
+// organization is off limits to an agent.
+func TestAPIAgentCannotOpenTheTeamRepositoryGrantGate(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+
+	const secretKey = "000000000000000000000000000000000000000000000000000000000000004f"
+	// user2 owns org3, so reqOrgOwnership() is satisfied and the refusal below is the guard's
+	// doing rather than a permission check's.
+	token := getUserToken(t, "user2", auth_model.AccessTokenScopeWriteOrganization, auth_model.AccessTokenScopeWriteUser)
+	registerAgentKey(t, token, agentPubKey(t, secretKey), string(auth_model.AccessTokenScopeWriteOrganization))
+
+	const path = "/api/v1/orgs/org3"
+
+	t.Run("opening the gate on the team-repository grant", func(t *testing.T) {
+		body := `{"repo_admin_change_team_access":true}`
+		req := NewRequestWithBody(t, "PATCH", path, strings.NewReader(body)).
+			SetHeader("Content-Type", "application/json").
+			SetHeader("Authorization", signNIP98(t, secretKey, "PATCH", path, body, time.Now(), "open-team-gate"))
+		MakeRequest(t, req, http.StatusForbidden)
+
+		// A refusal, not a 403 after the write: the gate has to still be shut, or every
+		// repository admin in org3 reaches the guarded grant afterwards with their own credential.
+		org := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 3})
+		assert.False(t, org.RepoAdminChangeTeamAccess,
+			"the authorization gate on PUT /repos/{owner}/{repo}/teams/{team} is now open")
+	})
+
+	// PAT parity: the guard tests how the request authenticated, so the owner holding their own
+	// token still sets the flag. Without this the change would read as a scope narrowing.
+	t.Run("the owner's own credential still sets it", func(t *testing.T) {
+		open := true
+		req := NewRequestWithJSON(t, "PATCH", path, &api.EditOrgOption{
+			RepoAdminChangeTeamAccess: &open,
+		}).AddTokenAuth(token)
+		MakeRequest(t, req, http.StatusOK)
+
+		org := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: 3})
+		assert.True(t, org.RepoAdminChangeTeamAccess)
 	})
 }
 
