@@ -343,6 +343,45 @@ func TestAPIRepoEventStreamWithholdsCommentsFromARepositoryScopedToken(t *testin
 	assert.Empty(t, onlyComments.NextCursor)
 }
 
+// The scope filter is a property of access tokens, so every other way of authenticating this route
+// has to fall through it untouched. It is the default that is at risk: an absent ?kinds= is the
+// empty slice, which one layer down means *every* kind but which the handler also reads as "the
+// scope filter dropped everything". A caller with no scopes to check must not be handed that value.
+//
+// Basic auth with a password is the case every other test here misses - they all sign with a PAT,
+// which does carry a scope. services/auth/basic.go takes the UserSignIn path for a password and
+// sets LoginMethod alone, leaving both ApiTokenScope and IsApiToken absent; an Actions task token
+// (basic.go, same file) and HTTP signature auth (services/auth/httpsign.go) reach the handler with
+// the same pair unset, so this one case stands for all three. A signed-in browser session is not
+// among them: buildAuthGroup carries no Session method, so a cookie is 401 at reqToken() and never
+// arrives here - see TestAPIRepoEventStreamRequiresAToken.
+func TestAPIRepoEventStreamServesACallerWithoutTokenScopes(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+
+	since := writeEventStreamRows(t)
+	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+	owner := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: repo.OwnerID})
+
+	listWith := func(t *testing.T, params url.Values) api.RepoEventList {
+		t.Helper()
+		resp := MakeRequest(t, NewRequest(t, "GET",
+			eventStreamURL(t, owner.Name, repo.Name, params),
+		).AddBasicAuth(owner.Name), http.StatusOK)
+		var list api.RepoEventList
+		DecodeJSON(t, resp, &list)
+		return list
+	}
+
+	// No ?kinds=: the whole stream, not the empty one.
+	all := listWith(t, url.Values{"since": {since}, "limit": {"50"}})
+	assert.Equal(t, []string{"status", "agent_audit", "review", "comment", "action"}, eventKinds(&all))
+
+	// And an explicit filter from the same caller still narrows rather than widens - the two
+	// halves of the bug looked different from each other, which is what hid it.
+	filtered := listWith(t, url.Values{"since": {since}, "kinds": {"comment,review"}, "limit": {"50"}})
+	assert.Equal(t, []string{"review", "comment"}, eventKinds(&filtered))
+}
+
 // The route is behind reqToken(): an anonymous caller gets 401 rather than an anonymous view of the
 // stream, which matters because four of the five sources decide what to show from the doer.
 func TestAPIRepoEventStreamRequiresAToken(t *testing.T) {

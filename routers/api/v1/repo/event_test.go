@@ -65,18 +65,29 @@ func TestEventKindsWithinTokenScope(t *testing.T) {
 	})
 
 	t.Run("a caller that is not a token is unrestricted", func(t *testing.T) {
-		// Scopes are a property of tokens. A session, basic auth or an Actions task has none,
-		// and reading the absent scope as "no scopes" would empty their stream instead.
+		// Scopes are a property of tokens. Basic auth with a password, an Actions task token and
+		// an HTTP signature have none, and reading the absent scope as "no scopes" would empty
+		// their stream instead of leaving it alone.
+		//
+		// The unrestricted path must expand rather than hand the input back: the handler reads
+		// an empty result as "the filter dropped everything" and answers the empty stream, so
+		// returning the nil that means *every* kind would serve nothing to these callers.
 		ctx, _ := contexttest.MockAPIContext(t, "user2/repo1")
 		kinds, err := kindsWithinTokenScope(ctx, nil)
 		require.NoError(t, err)
-		assert.Nil(t, kinds, "every kind, which ListOptions spells as the empty slice")
+		assert.Equal(t, repoevent.AllKinds, kinds, "an absent filter is every kind, spelled out")
 
 		ctx, _ = contexttest.MockAPIContext(t, "user2/repo1")
 		ctx.Data["ApiTokenScope"] = auth_model.AccessTokenScopeReadRepository // but IsApiToken is not set
 		kinds, err = kindsWithinTokenScope(ctx, nil)
 		require.NoError(t, err)
-		assert.Nil(t, kinds)
+		assert.Equal(t, repoevent.AllKinds, kinds)
+
+		// An explicit filter from such a caller is still their filter, not widened.
+		ctx, _ = contexttest.MockAPIContext(t, "user2/repo1")
+		kinds, err = kindsWithinTokenScope(ctx, []repoevent.Kind{repoevent.KindComment})
+		require.NoError(t, err)
+		assert.Equal(t, []repoevent.Kind{repoevent.KindComment}, kinds)
 	})
 
 	t.Run("an unparsable scope is an error, not an open door", func(t *testing.T) {

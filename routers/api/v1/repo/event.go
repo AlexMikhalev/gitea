@@ -164,9 +164,11 @@ func ListRepoEvents(ctx *context.APIContext) {
 		return
 	}
 	if len(opts.Kinds) == 0 {
-		// Every kind the caller asked for is outside their token's scopes. That is the empty
-		// stream, not a refusal, for the same reason the audit trail is absent rather than
-		// forbidden: the answer to "what may I see" is the stream itself.
+		// Every kind the caller asked for is outside their token's scopes - kindsWithinTokenScope
+		// expands "all kinds" to the explicit list on every path, so the empty slice here can only
+		// be a filter that dropped everything, never an absent one. That is the empty stream, not a
+		// refusal, for the same reason the audit trail is absent rather than forbidden: the answer
+		// to "what may I see" is the stream itself.
 		ctx.JSON(http.StatusOK, &api.RepoEventList{Data: []*api.RepoEvent{}})
 		return
 	}
@@ -240,18 +242,23 @@ var kindScopeCategories = map[repoevent.Kind]auth_model.AccessTokenScopeCategory
 // kinds" to the explicit list first - an empty ListOptions.Kinds means every kind, so a filter that
 // left it empty would widen the stream rather than narrow it.
 //
-// A caller who is not an access token (a session, basic auth, an Actions task) is unrestricted
-// here: scopes are a property of tokens, and there is nothing to check.
+// The expansion happens on every path, including the unrestricted one, so that the empty result is
+// unambiguous: it means "every kind the caller asked for was dropped" and never "the caller asked
+// for all of them". A caller who is not an access token - basic auth with a password, an Actions
+// task token, an HTTP signature - is unrestricted here, because scopes are a property of tokens and
+// there is nothing to check; returning their absent filter unchanged would hand the handler's
+// empty-stream guard the one value that means the opposite of what it reads it as.
 func kindsWithinTokenScope(ctx *context.APIContext, kinds []repoevent.Kind) ([]repoevent.Kind, error) {
-	scope, ok := ctx.Data["ApiTokenScope"].(auth_model.AccessTokenScope)
-	if ctx.Data["IsApiToken"] != true || !ok {
-		return kinds, nil
-	}
-
 	requested := kinds
 	if len(requested) == 0 {
 		requested = repoevent.AllKinds
 	}
+
+	scope, ok := ctx.Data["ApiTokenScope"].(auth_model.AccessTokenScope)
+	if ctx.Data["IsApiToken"] != true || !ok {
+		return requested, nil
+	}
+
 	allowed := make([]repoevent.Kind, 0, len(requested))
 	for _, kind := range requested {
 		category, restricted := kindScopeCategories[kind]
