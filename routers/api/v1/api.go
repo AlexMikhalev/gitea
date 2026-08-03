@@ -1176,9 +1176,18 @@ func Routes() *web.Router {
 				m.Get("", user.GetUserSettings)
 				m.Patch("", bind(api.UserSettingsOptions{}), user.UpdateUserSettings)
 			}, reqToken())
+			// reqHumanAuth() on the POST: an added email address is an account-recovery
+			// path, which is a login by another name. services/user.AddEmailAddresses stores
+			// it with IsActivated set from !REGISTER_EMAIL_CONFIRM - false by default - and
+			// models/user.GetUserByEmail resolves any activated alternative address to its
+			// user, which is what the forgot-password flow walks. So a write:user signature
+			// could plant an address it controls and still reset the account's password after
+			// the Nostr key is revoked: the same half-undo /user/keys is guarded against, and
+			// a stronger one than the GPG-key case below. Listing leaves nothing behind and
+			// deleting only removes, so both stay open.
 			m.Combo("/emails").
 				Get(user.ListEmails).
-				Post(bind(api.CreateEmailOption{}), user.AddEmail).
+				Post(reqHumanAuth(), bind(api.CreateEmailOption{}), user.AddEmail).
 				Delete(bind(api.DeleteEmailOption{}), user.DeleteEmail)
 
 			// manage user-level actions features
@@ -1875,8 +1884,14 @@ func Routes() *web.Router {
 			})
 			m.Group("/repos", func() {
 				m.Get("", reqToken(), org.GetTeamRepos)
+				// reqHumanAuth() on the PUT for the third time, and for the same reason as the
+				// two grants above: adding a repository to a team hands standing access to it
+				// to every current member of that team - separate accounts, reaching it with
+				// their own passwords, PATs and SSH keys - and revoking the agent key that
+				// granted it removes none of that. The DELETE takes access away, so it stays
+				// open.
 				m.Combo("/{org}/{reponame}").
-					Put(reqToken(), org.AddTeamRepository).
+					Put(reqToken(), reqHumanAuth(), org.AddTeamRepository).
 					Delete(reqToken(), org.RemoveTeamRepository).
 					Get(reqToken(), org.GetTeamRepo)
 			})

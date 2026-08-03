@@ -48,6 +48,21 @@ const (
 	// hold N buffers resident. services/auth passes setting.Agent.MaxRequestBodySize, which is
 	// this value unless the operator says otherwise.
 	DefaultMaxBodySize = 32 << 20 // 32 MiB
+
+	// MaxNonceLength bounds the `nonce` tag. It is not a protocol limit - NIP-98 says nothing
+	// about the value - but a column one: the nonce is written verbatim into
+	// models/agent.AuditEvent.Nonce, a VARCHAR(255), for every accepted credential.
+	//
+	// This is the same coupling the `method` allowlist enforces, one column over. A client
+	// controls this string entirely, so without a bound a long nonce either fails the audit
+	// insert on a strict database - turning a request that deserved its ordinary response into a
+	// 401 after the event id has already been spent - or is silently truncated on a lax one.
+	// Truncation is the worse half here: AuditEvent.VerifyEvent cross-checks only the `method`
+	// and `u` projections against the signed tags, so a row whose `nonce` column no longer
+	// matches the tag its signature covers still verifies cleanly. Refusing the credential
+	// keeps the row and the tag in step, and costs a conformant client nothing: a nonce exists
+	// to be unique, and 255 characters is far more than uniqueness needs.
+	MaxNonceLength = 255
 )
 
 // Errors returned by Verify. They are distinguished so that callers can log a precise reason;
@@ -60,6 +75,7 @@ var (
 	ErrMalformedHeader = errors.New("malformed NIP-98 authorization header")
 	ErrInvalidEvent    = errors.New("invalid NIP-98 event")
 	ErrMissingNonce    = errors.New("authorization event has no `nonce` tag")
+	ErrNonceTooLong    = errors.New("authorization event `nonce` tag is too long to record")
 	ErrWrongKind       = errors.New("authorization event is not kind 27235")
 	ErrURLMismatch     = errors.New("authorization event was signed for a different URL")
 	ErrMethodMismatch  = errors.New("authorization event was signed for a different method")
@@ -233,6 +249,11 @@ func VerifyCredential(req *http.Request, opts Options) (*SignedRequest, error) {
 	nonce := tagValue(event.Tags, "nonce")
 	if nonce == "" {
 		return nil, fmt.Errorf("%w: every signed request must carry a unique nonce", ErrMissingNonce)
+	}
+	// Bounded for the same reason the method is checked against a fixed set: this value is
+	// client-controlled and is recorded verbatim in a narrow audit column. See MaxNonceLength.
+	if len(nonce) > MaxNonceLength {
+		return nil, fmt.Errorf("%w: %d characters, the limit is %d", ErrNonceTooLong, len(nonce), MaxNonceLength)
 	}
 
 	// The hex fields must be in NIP-01's canonical lower case. This is not tidiness: the event id

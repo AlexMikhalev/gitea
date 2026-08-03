@@ -309,6 +309,39 @@ func TestVerify(t *testing.T) {
 			},
 			wantErr: ErrMissingNonce,
 		},
+		// The nonce is bounded for the same reason the method is checked against a fixed set:
+		// it is client-controlled and is written verbatim into a VARCHAR(255) audit column. A
+		// nonce that does not fit either fails the insert - a 401 for a request that deserved
+		// its ordinary response, after the event id has already been spent - or is truncated,
+		// leaving a row whose `nonce` column disagrees with the tag its signature covers while
+		// still verifying cleanly, since VerifyEvent cross-checks only `method` and `u`.
+		{
+			name:   "nonce longer than the audit column",
+			method: "GET",
+			url:    testURL,
+			header: func(t *testing.T) string {
+				return encodeHeader(t, signedEvent(t, EventKind, frozenNow, nostr.Tags{
+					nostr.Tag{"u", testURL},
+					nostr.Tag{"method", "GET"},
+					nostr.Tag{"nonce", strings.Repeat("a", MaxNonceLength+1)},
+				}))
+			},
+			wantErr: ErrNonceTooLong,
+		},
+		// The bound is a bound and not a fencepost off it: a nonce that exactly fills the
+		// column is a nonce the row can hold, so it is accepted.
+		{
+			name:   "nonce exactly at the limit",
+			method: "GET",
+			url:    testURL,
+			header: func(t *testing.T) string {
+				return encodeHeader(t, signedEvent(t, EventKind, frozenNow, nostr.Tags{
+					nostr.Tag{"u", testURL},
+					nostr.Tag{"method", "GET"},
+					nostr.Tag{"nonce", strings.Repeat("a", MaxNonceLength)},
+				}))
+			},
+		},
 	}
 
 	for _, tc := range cases {
@@ -352,6 +385,19 @@ func TestAcceptedMethodsFitTheAuditColumn(t *testing.T) {
 			"method %q does not fit agent_audit_event.method; widen the column in a migration or drop the method", method)
 		assert.Equal(t, strings.ToUpper(method), method, "the set is matched against an upper-cased tag")
 	}
+}
+
+// The same coupling one column over: the accepted nonce has to fit agent_audit_event.nonce, for
+// the same reason and with the same symptoms - a 500 on a strict database, or a truncated column
+// that no longer matches the tag the signature covers. The bound and the column are declared in
+// two packages, so assert they agree rather than trusting that a later widening of either
+// remembers the other.
+func TestAcceptedNoncesFitTheAuditColumn(t *testing.T) {
+	// models/agent.AuditEvent.Nonce and models/migrations/v1_26/v327.go.
+	const auditNonceColumnWidth = 255
+
+	assert.LessOrEqual(t, MaxNonceLength, auditNonceColumnWidth,
+		"a nonce this package accepts does not fit agent_audit_event.nonce; widen the column in a migration or lower the bound")
 }
 
 // The verifier has to read the body to hash it; a handler downstream must still see all of it.

@@ -498,6 +498,176 @@ func TestAPIAgentCannotPlantCredentialsUnderRepo(t *testing.T) {
 	})
 }
 
+// The third class the containment has to cover: granting a *different account* standing access.
+// A collaborator, a team member and a team's repository all reach the granted repository through
+// their own passwords, PATs and SSH keys, so revoking the agent's Nostr key takes none of it back
+// - the same half-undo the credential-planting guards exist to prevent, reached without planting
+// anything. reqAdmin()/reqOrgOwnership() cannot draw this line: they ask whether the agent *user*
+// may grant, which a correctly-scoped agent for a repository admin or an org owner may.
+//
+// These assertions exist because the guards are three words on three route lines, and a route
+// refactor that dropped one would otherwise be silent.
+func TestAPIAgentCannotGrantStandingAccess(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+
+	const repoSecretKey = "0000000000000000000000000000000000000000000000000000000000000043"
+	repoToken := getUserToken(t, "user2", auth_model.AccessTokenScopeWriteRepository)
+	registerAgentKey(t, repoToken, agentPubKey(t, repoSecretKey), string(auth_model.AccessTokenScopeWriteRepository))
+
+	// user2 owns org3 and is a member of its teams, so every refusal below is the guard's doing
+	// rather than reqOrgOwnership()'s or reqTeamMembership()'s.
+	const orgSecretKey = "0000000000000000000000000000000000000000000000000000000000000045"
+	orgToken := getUserToken(t, "user2", auth_model.AccessTokenScopeWriteOrganization)
+	registerAgentKey(t, orgToken, agentPubKey(t, orgSecretKey), string(auth_model.AccessTokenScopeWriteOrganization))
+
+	t.Run("adding a repository collaborator", func(t *testing.T) {
+		const path = "/api/v1/repos/user2/repo1/collaborators/user4"
+		body := `{"permission":"admin"}`
+		req := NewRequestWithBody(t, "PUT", path, strings.NewReader(body)).
+			SetHeader("Content-Type", "application/json").
+			SetHeader("Authorization", signNIP98(t, repoSecretKey, "PUT", path, body, time.Now(), "grant-collaborator"))
+		MakeRequest(t, req, http.StatusForbidden)
+	})
+
+	t.Run("adding a team member", func(t *testing.T) {
+		const path = "/api/v1/teams/1/members/user4"
+		req := NewRequestWithBody(t, "PUT", path, strings.NewReader("")).
+			SetHeader("Authorization", signNIP98(t, orgSecretKey, "PUT", path, "", time.Now(), "grant-team-member"))
+		MakeRequest(t, req, http.StatusForbidden)
+	})
+
+	// Adding a repository to a team is the same grant made from the other end: it hands the
+	// repository to every current member of the team at once.
+	t.Run("adding a repository to a team", func(t *testing.T) {
+		const path = "/api/v1/teams/2/repos/org3/repo21"
+		req := NewRequestWithBody(t, "PUT", path, strings.NewReader("")).
+			SetHeader("Authorization", signNIP98(t, orgSecretKey, "PUT", path, "", time.Now(), "grant-team-repo"))
+		MakeRequest(t, req, http.StatusForbidden)
+	})
+
+	// Reading who already has access grants nothing, so it stays reachable. Asserting it pins
+	// where the line is: this guard is about handing out standing access, and a later widening
+	// that swallowed the reads too would be a different decision, not a tidy-up.
+	t.Run("reading the collaborator list is still allowed", func(t *testing.T) {
+		const path = "/api/v1/repos/user2/repo1/collaborators"
+		req := NewRequest(t, "GET", path).
+			SetHeader("Authorization", signNIP98(t, repoSecretKey, "GET", path, "", time.Now(), "read-collaborators"))
+		MakeRequest(t, req, http.StatusOK)
+	})
+
+	t.Run("reading the team member list is still allowed", func(t *testing.T) {
+		const path = "/api/v1/teams/1/members"
+		req := NewRequest(t, "GET", path).
+			SetHeader("Authorization", signNIP98(t, orgSecretKey, "GET", path, "", time.Now(), "read-team-members"))
+		MakeRequest(t, req, http.StatusOK)
+	})
+
+	// PAT parity: the guard tests how the request authenticated, so the same scope carried by a
+	// token still makes the grant. Without this the change would read as a scope narrowing.
+	t.Run("the owner's own credential still grants", func(t *testing.T) {
+		permission := "write"
+		req := NewRequestWithJSON(t, "PUT", "/api/v1/repos/user2/repo1/collaborators/user4",
+			&api.AddCollaboratorOption{Permission: &permission}).AddTokenAuth(repoToken)
+		MakeRequest(t, req, http.StatusNoContent)
+	})
+}
+
+// Editing an existing account is the strongest half-undo on the instance: PATCH
+// /admin/users/{username} sets the password, the primary email, LoginName/LoginSource, IsAdmin and
+// AllowGitHook, every one of which is an independent login that outlives the agent key. Taking
+// over an existing administrator is strictly more than creating a fresh account, so guarding only
+// the POST would buy nothing - which is what this pins.
+func TestAPIAgentCannotEditAnExistingAccount(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+
+	const secretKey = "0000000000000000000000000000000000000000000000000000000000000047"
+	// user1 is the site administrator, so reqSiteAdmin() is satisfied and the refusals below are
+	// the guard's doing. write:user is what reaches /agent/keys to enrol the key at all.
+	token := getUserToken(t, "user1", auth_model.AccessTokenScopeWriteAdmin, auth_model.AccessTokenScopeWriteUser)
+	registerAgentKey(t, token, agentPubKey(t, secretKey), string(auth_model.AccessTokenScopeWriteAdmin))
+
+	t.Run("taking over an existing account", func(t *testing.T) {
+		const path = "/api/v1/admin/users/user2"
+		body := `{"login_name":"user2","source_id":0,"password":"agent-chosen-password-1","admin":true}`
+		req := NewRequestWithBody(t, "PATCH", path, strings.NewReader(body)).
+			SetHeader("Content-Type", "application/json").
+			SetHeader("Authorization", signNIP98(t, secretKey, "PATCH", path, body, time.Now(), "take-over-account"))
+		MakeRequest(t, req, http.StatusForbidden)
+	})
+
+	t.Run("creating a whole new account", func(t *testing.T) {
+		const path = "/api/v1/admin/users"
+		body := `{"username":"agentplanted","email":"agentplanted@example.com","password":"agent-chosen-password-2","must_change_password":false}`
+		req := NewRequestWithBody(t, "POST", path, strings.NewReader(body)).
+			SetHeader("Content-Type", "application/json").
+			SetHeader("Authorization", signNIP98(t, secretKey, "POST", path, body, time.Now(), "create-account"))
+		MakeRequest(t, req, http.StatusForbidden)
+	})
+
+	// Reading the user list leaves no credential behind, so it stays reachable.
+	t.Run("listing users is still allowed", func(t *testing.T) {
+		const path = "/api/v1/admin/users"
+		req := NewRequest(t, "GET", path).
+			SetHeader("Authorization", signNIP98(t, secretKey, "GET", path, "", time.Now(), "list-users"))
+		MakeRequest(t, req, http.StatusOK)
+	})
+
+	// PAT parity, as above: the administrator holding their own token is unaffected.
+	t.Run("the administrator's own credential is unaffected", func(t *testing.T) {
+		website := "https://example.com/edited-by-a-human"
+		req := NewRequestWithJSON(t, "PATCH", "/api/v1/admin/users/user2", &api.EditUserOption{
+			LoginName: "user2",
+			SourceID:  0,
+			Website:   &website,
+		}).AddTokenAuth(token)
+		MakeRequest(t, req, http.StatusOK)
+	})
+}
+
+// An added email address is an account-recovery path, which is a login by another name: it is
+// stored already activated whenever REGISTER_EMAIL_CONFIRM is off - the default - and the
+// forgot-password flow resolves any activated address to its user. So a write:user signature could
+// plant an address it controls and still reset the account's password after the Nostr key is
+// revoked. That is a durable independent login, which is why POST is guarded while the list and
+// the delete, which plant nothing, are not.
+func TestAPIAgentCannotPlantAnAccountRecoveryPath(t *testing.T) {
+	defer tests.PrepareTestEnv(t)()
+
+	const secretKey = "0000000000000000000000000000000000000000000000000000000000000049"
+	token := getUserToken(t, "user2", auth_model.AccessTokenScopeWriteUser)
+	// write:user is exactly the scope that reaches this endpoint, so the refusal below is the
+	// guard's doing and not the scope's.
+	registerAgentKey(t, token, agentPubKey(t, secretKey), string(auth_model.AccessTokenScopeWriteUser))
+
+	t.Run("adding an email address", func(t *testing.T) {
+		const path = "/api/v1/user/emails"
+		body := `{"emails":["user2-agent@example.com"]}`
+		req := NewRequestWithBody(t, "POST", path, strings.NewReader(body)).
+			SetHeader("Content-Type", "application/json").
+			SetHeader("Authorization", signNIP98(t, secretKey, "POST", path, body, time.Now(), "plant-email"))
+		MakeRequest(t, req, http.StatusForbidden)
+
+		// The refusal has to be a refusal, not a 403 after the write: the address must not be
+		// on the account for the forgot-password flow to find later.
+		unittest.AssertNotExistsBean(t, &user_model.EmailAddress{Email: "user2-agent@example.com"})
+	})
+
+	t.Run("listing email addresses is still allowed", func(t *testing.T) {
+		const path = "/api/v1/user/emails"
+		req := NewRequest(t, "GET", path).
+			SetHeader("Authorization", signNIP98(t, secretKey, "GET", path, "", time.Now(), "list-emails"))
+		MakeRequest(t, req, http.StatusOK)
+	})
+
+	// PAT parity: the human holding a write:user token still adds addresses.
+	t.Run("the owner's own credential is unaffected", func(t *testing.T) {
+		req := NewRequestWithJSON(t, "POST", "/api/v1/user/emails", &api.CreateEmailOption{
+			Emails: []string{"user2-human@example.com"},
+		}).AddTokenAuth(token)
+		MakeRequest(t, req, http.StatusCreated)
+	})
+}
+
 // The owner, holding their own credential, must be able to do all three - otherwise revocation is
 // unreachable and the incident-response story is "edit the table by hand".
 func TestAPIAgentKeyLifecycle(t *testing.T) {
