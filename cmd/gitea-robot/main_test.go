@@ -209,9 +209,9 @@ func TestHandleToolsList(t *testing.T) {
 		t.Fatalf("Expected tools to be []map[string]interface{}, got %T", result["tools"])
 	}
 
-	// Verify we have 4 tools
-	if len(tools) != 4 {
-		t.Errorf("Expected 4 tools, got %d", len(tools))
+	// Verify we have 5 tools
+	if len(tools) != 5 {
+		t.Errorf("Expected 5 tools, got %d", len(tools))
 	}
 
 	// Verify tool names
@@ -220,6 +220,7 @@ func TestHandleToolsList(t *testing.T) {
 		"ready":   false,
 		"graph":   false,
 		"add_dep": false,
+		"room":    false,
 	}
 
 	for _, tool := range tools {

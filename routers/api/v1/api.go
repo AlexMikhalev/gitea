@@ -2065,6 +2065,15 @@ func Routes() *web.Router {
 			m.Get("/triage", robot.Triage)
 			m.Get("/ready", robot.Ready)
 			m.Get("/graph", robot.Graph)
+			// Inbound webhook for branch-as-room automation (issue #56). Auth is
+			// the HMAC signature on the delivery, not a token; with no
+			// ROOM_HOOK_SECRET configured the handler answers 404. Deployment
+			// note: the delivery carries no credentials, so on instances with
+			// strict sign-in (Service.RequireSignInViewStrict, checked above)
+			// tokenless requests are rejected with 403 before reaching the
+			// handler - the hook only works where anonymous API access is
+			// allowed.
+			m.Post("/room/hook", robot.RoomHook)
 		}, tokenRequiresScopes(auth_model.AccessTokenScopeCategoryIssue))
 	}, sudo())
 

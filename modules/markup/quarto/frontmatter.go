@@ -11,7 +11,7 @@ func HasFrontmatter(data []byte) bool {
 	return bytes.HasPrefix(data, []byte("---"))
 }
 
-func ExtractFrontmatter(data []byte) (frontmatter []byte, content []byte) {
+func ExtractFrontmatter(data []byte) (frontmatter, content []byte) {
 	if !HasFrontmatter(data) {
 		return nil, data
 	}

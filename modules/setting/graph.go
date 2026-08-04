@@ -20,6 +20,11 @@ var IssueGraphSettings = struct {
 	PageRankCacheTTL int  // Time-to-live for PageRank cache in seconds (default: 300)
 	AuditLog         bool // Enable audit logging for robot API access (default: true)
 	StrictMode       bool // Enable strict mode - deny access on any error (default: false)
+
+	// RoomHookSecret is the HMAC-SHA256 secret for the branch-as-room inbound
+	// webhook route (POST /api/v1/robot/room/hook). When empty the route is
+	// disabled and answers 404; an unsigned request is never accepted.
+	RoomHookSecret string
 }{
 	Enabled:       true,
 	DampingFactor: 0.85,
@@ -48,6 +53,7 @@ func loadIssueGraphFrom(rootCfg ConfigProvider) {
 	IssueGraphSettings.PageRankCacheTTL = sec.Key("PAGERANK_CACHE_TTL").MustInt(300)
 	IssueGraphSettings.AuditLog = sec.Key("AUDIT_LOG").MustBool(true)
 	IssueGraphSettings.StrictMode = sec.Key("STRICT_MODE").MustBool(false)
+	IssueGraphSettings.RoomHookSecret = sec.Key("ROOM_HOOK_SECRET").MustString("")
 
 	// Validation
 	if IssueGraphSettings.PageRankCacheTTL < 0 {

@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"code.gitea.io/gitea/modules/nostr"
+	"code.gitea.io/gitea/modules/robotroom"
 )
 
 var (
@@ -173,6 +174,8 @@ func main() {
 		graphCmd()
 	case "add-dep":
 		addDepCmd()
+	case "room":
+		roomCmd()
 	case "mcp-server":
 		mcpServerCmd()
 	default:
@@ -193,6 +196,7 @@ Commands:
   ready       Get unblocked (ready) tasks
   graph       Get dependency graph
   add-dep     Add dependency between issues
+  room        Manage a branch room issue: open|status|close
   mcp-server  Start MCP server exposing gitea-robot functionality
 
 Environment:
@@ -229,6 +233,11 @@ Examples:
 
   # Add dependency: issue 2 blocked by issue 1
   gitea-robot add-dep --owner terraphim --repo gitea --issue 2 --blocks 1
+
+  # Open the room for a feat branch (idempotent), post a CI status, close it
+  gitea-robot room open --owner terraphim --repo gitea --branch feat/foo
+  gitea-robot room status --owner terraphim --repo gitea --branch feat/foo --state success
+  gitea-robot room close --owner terraphim --repo gitea --branch feat/foo
 
   # Start MCP server
   gitea-robot mcp-server`)
@@ -347,36 +356,54 @@ func addDepCmd() {
 }
 
 func apiGet(url string) string {
-	req, err := http.NewRequest("GET", url, nil)
+	data, err := apiGetSafe(url)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating request: %v\n", err)
-		os.Exit(1)
-	}
-
-	if err := setRequestAuth(req, ""); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
+	}
+	return data
+}
+
+// apiGetSafe performs a GET request and returns error instead of calling os.Exit
+func apiGetSafe(url string) (string, error) {
+	return apiSendSafe("GET", url, "")
+}
+
+// apiSendSafe performs an HTTP request with an optional JSON body and returns
+// error instead of calling os.Exit. GET requests send no body.
+func apiSendSafe(method, url, body string) (string, error) {
+	var reader io.Reader
+	if body != "" {
+		reader = strings.NewReader(body)
+	}
+	req, err := http.NewRequest(method, url, reader)
+	if err != nil {
+		return "", fmt.Errorf("error creating request: %v", err)
+	}
+
+	if err := setRequestAuth(req, body); err != nil {
+		return "", err
+	}
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
 	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error making request: %v\n", err)
-		os.Exit(1)
+		return "", fmt.Errorf("error making request: %v", err)
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error reading response: %v\n", err)
-		os.Exit(1)
+		return "", fmt.Errorf("error reading response: %v", err)
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		fmt.Fprintf(os.Stderr, "Error: %s\n%s%s\n", resp.Status, string(body), authFailureHint(resp.StatusCode))
-		os.Exit(1)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return "", fmt.Errorf("error: %s\n%s%s", resp.Status, string(respBody), authFailureHint(resp.StatusCode))
 	}
 
-	return string(body)
+	return string(respBody), nil
 }
 
 // authFailureHint explains what a signed request's 401 most likely means. The server refuses
@@ -688,6 +715,57 @@ func handleToolsList(req MCPRequest) any {
 						"required": []string{"owner", "repo", "issue"},
 					},
 				},
+				{
+					"name":        "room",
+					"description": "Manage a branch room issue (open|status|close) for a feat/* branch",
+					"inputSchema": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"action": map[string]any{
+								"type":        "string",
+								"description": "Room action: open, status, or close",
+								"enum":        []string{"open", "status", "close"},
+							},
+							"owner": map[string]any{
+								"type":        "string",
+								"description": "Repository owner",
+							},
+							"repo": map[string]any{
+								"type":        "string",
+								"description": "Repository name",
+							},
+							"branch": map[string]any{
+								"type":        "string",
+								"description": "Branch name (feat/* only)",
+							},
+							"head": map[string]any{
+								"type":        "string",
+								"description": "Branch head SHA recorded in the room marker (open only)",
+							},
+							"state": map[string]any{
+								"type":        "string",
+								"description": "CI state: pending, success, error, or failure (status only)",
+							},
+							"context": map[string]any{
+								"type":        "string",
+								"description": "CI context name (status only)",
+							},
+							"sha": map[string]any{
+								"type":        "string",
+								"description": "Commit SHA the status is for (status only)",
+							},
+							"target_url": map[string]any{
+								"type":        "string",
+								"description": "Link to CI details (status only)",
+							},
+							"description": map[string]any{
+								"type":        "string",
+								"description": "Short status description (status only)",
+							},
+						},
+						"required": []string{"action", "owner", "repo", "branch"},
+					},
+				},
 			},
 		},
 	}
@@ -721,6 +799,8 @@ func handleToolsCall(req MCPRequest) any {
 		return handleGraphTool(params.Arguments, req.ID)
 	case "add_dep":
 		return handleAddDepTool(params.Arguments, req.ID)
+	case "room":
+		return handleRoomTool(params.Arguments, req.ID)
 	default:
 		return MCPErrorResponse{
 			JSONRPC: "2.0",
@@ -1000,32 +1080,7 @@ func handleAddDepTool(args json.RawMessage, id *json.RawMessage) any {
 
 // apiPostSafe performs a POST request and returns error instead of calling os.Exit
 func apiPostSafe(url, body string) (string, error) {
-	req, err := http.NewRequest("POST", url, strings.NewReader(body))
-	if err != nil {
-		return "", fmt.Errorf("error creating request: %v", err)
-	}
-
-	if err := setRequestAuth(req, body); err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("error making request: %v", err)
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("error reading response: %v", err)
-	}
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return "", fmt.Errorf("error: %s\n%s%s", resp.Status, string(respBody), authFailureHint(resp.StatusCode))
-	}
-
-	return string(respBody), nil
+	return apiSendSafe("POST", url, body)
 }
 
 // handlePing handles ping requests
@@ -1034,5 +1089,281 @@ func handlePing(req MCPRequest) any {
 		JSONRPC: "2.0",
 		ID:      req.ID,
 		Result:  map[string]string{},
+	}
+}
+
+// The room marker, room issue body and status comment shape come from
+// modules/robotroom, shared with the server-side room hook
+// (routers/api/v1/robot): the hook and this CLI operate on the same rooms,
+// and the shared builders keep the two sides byte-identical.
+
+// roomIssueListEntry is the subset of the API issue shape the room commands need.
+type roomIssueListEntry struct {
+	Index int64  `json:"number"`
+	Body  string `json:"body"`
+}
+
+// roomFindIssue locates the open room issue for branch, paging through the
+// repo's open issues. It returns the issue index and whether a room exists.
+func roomFindIssue(owner, repo, branch string) (int64, bool, error) {
+	for page := 1; ; page++ {
+		url := fmt.Sprintf("%s/api/v1/repos/%s/%s/issues?state=open&type=issues&limit=50&page=%d",
+			giteaURL, owner, repo, page)
+		data, err := apiGetSafe(url)
+		if err != nil {
+			return 0, false, err
+		}
+		var issues []roomIssueListEntry
+		if err := json.Unmarshal([]byte(data), &issues); err != nil {
+			return 0, false, fmt.Errorf("error parsing issue list: %v", err)
+		}
+		for _, issue := range issues {
+			if m, ok := robotroom.ParseMarker(issue.Body); ok && m.Branch == branch {
+				return issue.Index, true, nil
+			}
+		}
+		if len(issues) < 50 {
+			return 0, false, nil
+		}
+	}
+}
+
+// roomOpen creates the room issue unless one already exists. It reports
+// whether a new issue was created and the room's issue index.
+//
+// Like the server side, idempotency is search-then-create with no unique
+// constraint behind it; two concurrent opens for the same branch can create
+// duplicates. The hook's deliveries are serialized per webhook, which keeps
+// the window theoretical in practice.
+func roomOpen(owner, repo, branch, head string) (bool, int64, error) {
+	if index, found, err := roomFindIssue(owner, repo, branch); err != nil || found {
+		return false, index, err
+	}
+	url := fmt.Sprintf("%s/api/v1/repos/%s/%s/issues", giteaURL, owner, repo)
+	body := fmt.Sprintf(`{"title": %s, "body": %s}`,
+		jsonString("Room: "+branch), jsonString(robotroom.IssueBody(branch, head)))
+	data, err := apiPostSafe(url, body)
+	if err != nil {
+		return false, 0, err
+	}
+	var created roomIssueListEntry
+	if err := json.Unmarshal([]byte(data), &created); err != nil {
+		// The room was created server-side but its index is unknown; surface
+		// the failure instead of reporting a bogus "issue #0". A retry is
+		// safe: roomFindIssue finds the room just created.
+		return true, 0, fmt.Errorf("room issue created but its response could not be parsed: %v", err)
+	}
+	return true, created.Index, nil
+}
+
+// roomStatus posts one CI status comment on the room issue.
+func roomStatus(owner, repo, branch, state, context, sha, targetURL, description string) (int64, error) {
+	index, found, err := roomFindIssue(owner, repo, branch)
+	if err != nil {
+		return 0, err
+	}
+	if !found {
+		return 0, fmt.Errorf("no open room for branch %s (open it first with 'room open')", branch)
+	}
+	url := fmt.Sprintf("%s/api/v1/repos/%s/%s/issues/%d/comments", giteaURL, owner, repo, index)
+	body := fmt.Sprintf(`{"body": %s}`, jsonString(robotroom.StatusComment(state, context, sha, targetURL, description)))
+	if _, err := apiPostSafe(url, body); err != nil {
+		return 0, err
+	}
+	return index, nil
+}
+
+// roomClose closes the room issue.
+func roomClose(owner, repo, branch string) (int64, error) {
+	index, found, err := roomFindIssue(owner, repo, branch)
+	if err != nil {
+		return 0, err
+	}
+	if !found {
+		return 0, fmt.Errorf("no open room for branch %s", branch)
+	}
+	url := fmt.Sprintf("%s/api/v1/repos/%s/%s/issues/%d", giteaURL, owner, repo, index)
+	if _, err := apiSendSafe("PATCH", url, `{"state": "closed"}`); err != nil {
+		return 0, err
+	}
+	return index, nil
+}
+
+// jsonString renders s as a JSON string literal.
+func jsonString(s string) string {
+	data, _ := json.Marshal(s)
+	return string(data)
+}
+
+// roomArgs holds the flags shared by all room actions.
+type roomArgs struct {
+	Action      string
+	Owner       string
+	Repo        string
+	Branch      string
+	Head        string
+	State       string
+	Context     string
+	SHA         string
+	TargetURL   string
+	Description string
+}
+
+// validateRoomArgs checks the flags shared by all room actions. It is split
+// out of runRoomAction so the MCP tool can report invalid parameters as
+// -32602 (invalid params) rather than -32603 (internal error).
+func validateRoomArgs(a roomArgs) error {
+	if a.Owner == "" || a.Repo == "" || a.Branch == "" {
+		return errors.New("--owner, --repo, and --branch required")
+	}
+	if !strings.HasPrefix(a.Branch, "feat/") {
+		return fmt.Errorf("branch %q is not a feat/* branch; rooms only exist for feat/* branches", a.Branch)
+	}
+	switch a.Action {
+	case "open", "status", "close":
+		return nil
+	default:
+		return fmt.Errorf("unknown room action %q (want open|status|close)", a.Action)
+	}
+}
+
+// runRoomAction executes one room action and returns a human-readable result.
+func runRoomAction(a roomArgs) (string, error) {
+	if err := validateRoomArgs(a); err != nil {
+		return "", err
+	}
+	switch a.Action {
+	case "open":
+		created, index, err := roomOpen(a.Owner, a.Repo, a.Branch, a.Head)
+		if err != nil {
+			return "", err
+		}
+		if created {
+			return fmt.Sprintf("✓ Room opened: issue #%d for %s", index, a.Branch), nil
+		}
+		return fmt.Sprintf("Room already exists: issue #%d for %s", index, a.Branch), nil
+	case "status":
+		state := a.State
+		if state == "" {
+			state = "pending"
+		}
+		index, err := roomStatus(a.Owner, a.Repo, a.Branch, state, a.Context, a.SHA, a.TargetURL, a.Description)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("✓ Status %q posted on room issue #%d for %s", state, index, a.Branch), nil
+	case "close":
+		index, err := roomClose(a.Owner, a.Repo, a.Branch)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("✓ Room closed: issue #%d for %s", index, a.Branch), nil
+	default:
+		return "", fmt.Errorf("unknown room action %q (want open|status|close)", a.Action)
+	}
+}
+
+// roomCmd implements `gitea-robot room open|status|close --owner X --repo Y --branch feat/foo`,
+// the manual/ops path for the operations the room hook drives automatically.
+func roomCmd() {
+	if len(os.Args) < 2 {
+		fmt.Fprintln(os.Stderr, "Error: room action required: open|status|close")
+		os.Exit(1)
+	}
+	action := os.Args[1]
+
+	fs := flag.NewFlagSet("room "+action, flag.ExitOnError)
+	owner := fs.String("owner", "", "Repository owner")
+	repo := fs.String("repo", "", "Repository name")
+	branch := fs.String("branch", "", "Branch name (feat/* only)")
+	head := fs.String("head", "", "Branch head SHA recorded in the room marker (open only)")
+	state := fs.String("state", "pending", "CI state: pending|success|error|failure (status only)")
+	context := fs.String("context", "", "CI context name (status only)")
+	sha := fs.String("sha", "", "Commit SHA the status is for (status only)")
+	targetURL := fs.String("target-url", "", "Link to CI details (status only)")
+	description := fs.String("description", "", "Short status description (status only)")
+	// Parse only errors on bad flags, and ExitOnError turns that into os.Exit
+	// with the usage message, so the error itself never leaves this call.
+	_ = fs.Parse(os.Args[2:])
+
+	out, err := runRoomAction(roomArgs{
+		Action: action, Owner: *owner, Repo: *repo, Branch: *branch,
+		Head: *head, State: *state, Context: *context, SHA: *sha,
+		TargetURL: *targetURL, Description: *description,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		fs.Usage()
+		os.Exit(1)
+	}
+	fmt.Println(out)
+}
+
+// handleRoomTool executes the room MCP tool
+func handleRoomTool(args json.RawMessage, id *json.RawMessage) any {
+	var argsStruct struct {
+		Action      *string `json:"action,omitempty"`
+		Owner       *string `json:"owner,omitempty"`
+		Repo        *string `json:"repo,omitempty"`
+		Branch      *string `json:"branch,omitempty"`
+		Head        *string `json:"head,omitempty"`
+		State       *string `json:"state,omitempty"`
+		Context     *string `json:"context,omitempty"`
+		SHA         *string `json:"sha,omitempty"`
+		TargetURL   *string `json:"target_url,omitempty"`
+		Description *string `json:"description,omitempty"`
+	}
+	if err := json.Unmarshal(args, &argsStruct); err != nil {
+		return MCPErrorResponse{
+			JSONRPC: "2.0",
+			ID:      id,
+			Error: &MCPError{
+				Code:    -32602,
+				Message: "Invalid arguments for room: " + err.Error(),
+			},
+		}
+	}
+
+	str := func(p *string) string {
+		if p == nil {
+			return ""
+		}
+		return *p
+	}
+
+	a := roomArgs{
+		Action: str(argsStruct.Action), Owner: str(argsStruct.Owner), Repo: str(argsStruct.Repo),
+		Branch: str(argsStruct.Branch), Head: str(argsStruct.Head), State: str(argsStruct.State),
+		Context: str(argsStruct.Context), SHA: str(argsStruct.SHA),
+		TargetURL: str(argsStruct.TargetURL), Description: str(argsStruct.Description),
+	}
+	// Argument validation is a client error (-32602), not an internal one.
+	if err := validateRoomArgs(a); err != nil {
+		return MCPErrorResponse{
+			JSONRPC: "2.0",
+			ID:      id,
+			Error: &MCPError{
+				Code:    -32602,
+				Message: "Invalid arguments for room: " + err.Error(),
+			},
+		}
+	}
+
+	out, err := runRoomAction(a)
+	if err != nil {
+		return MCPErrorResponse{
+			JSONRPC: "2.0",
+			ID:      id,
+			Error: &MCPError{
+				Code:    -32603,
+				Message: err.Error(),
+			},
+		}
+	}
+
+	return MCPResponse{
+		JSONRPC: "2.0",
+		ID:      id,
+		Result:  out,
 	}
 }
