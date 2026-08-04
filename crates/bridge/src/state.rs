@@ -88,6 +88,16 @@ const FAILURES_CAP: usize = 10_000;
 /// anything.
 const SUPPRESSION_CAP: usize = 10_000;
 
+/// Upper bound on the set of tasks the sweeps must reach by id.
+///
+/// Bounded by work a human has been asked about and has not answered, not by board history —
+/// an entry leaves the moment any `kanban show` reports the task in some other status. The cap
+/// is here for the same reason the others are: nothing else bounds it, and this daemon is meant
+/// to run for months. Dropping it whole costs one `hermes kanban unblock` by hand for each
+/// forgotten task, exactly like a restart, and is loud rather than silent — see
+/// [`BridgeState::remember_unlisted`].
+const UNLISTED_CAP: usize = 10_000;
+
 /// Per-process guards shared by the approval, outbound and reconcile legs.
 #[derive(Debug, Default)]
 pub struct BridgeState {
@@ -108,6 +118,8 @@ struct Inner {
     reported: HashSet<String>,
     /// Consecutive failed applications of a task's plan.
     failures: HashMap<String, u32>,
+    /// Task ids last seen holding [`crate::hermes::UNLISTABLE_STATUS`].
+    unlisted: HashSet<String>,
 }
 
 impl BridgeState {
@@ -128,7 +140,7 @@ impl BridgeState {
     /// forever. A human can always re-approve: removing and re-adding the 🐝 produces a new
     /// fingerprint, which this set does not hold.
     pub fn suppress_fingerprint(&self, fingerprint: &str) {
-        insert_capped(&mut self.lock().fingerprints, fingerprint);
+        insert_capped(&mut self.lock().fingerprints, fingerprint, SUPPRESSION_CAP);
     }
 
     /// Whether this approval has been suppressed for the lifetime of this process.
@@ -141,7 +153,7 @@ impl BridgeState {
     /// Without it the unmarked task is exactly what the reconcile sweep looks for, so the
     /// user-visible Gitea comment is posted again on every sweep.
     pub fn suppress_task(&self, task_id: &str) {
-        insert_capped(&mut self.lock().tasks, task_id);
+        insert_capped(&mut self.lock().tasks, task_id, SUPPRESSION_CAP);
     }
 
     /// Whether this task has been suppressed for the lifetime of this process.
@@ -159,7 +171,7 @@ impl BridgeState {
     /// own failure mode is far cheaper: without its marker it would be re-posted on every
     /// sweep, so this bounds it to the one that was already posted.
     pub fn suppress_escalation(&self, task_id: &str) {
-        insert_capped(&mut self.lock().escalations, task_id);
+        insert_capped(&mut self.lock().escalations, task_id, SUPPRESSION_CAP);
     }
 
     /// Whether this task's escalation comment has been suppressed for this process.
@@ -237,6 +249,51 @@ impl BridgeState {
     /// Forgets a task's failures — its plan applied cleanly.
     pub fn clear_plan_failures(&self, task_id: &str) {
         self.lock().failures.remove(task_id);
+    }
+
+    /// Records that this task holds [`crate::hermes::UNLISTABLE_STATUS`].
+    ///
+    /// This set exists because a `list` is the wrong instrument for that status: on hermes
+    /// v0.19.0 `hermes kanban list` *promotes* a blocked task by reading it, so a sweep that
+    /// enumerated it released every task a worker had stopped for a human — the R7 P1. No
+    /// sweep enumerates it now, which leaves the sweeps needing some *other* way to see a
+    /// blocked task at all, or the 🐝 that unblocks one and the reconciliation of one whose
+    /// Gitea report never landed would both simply stop happening.
+    ///
+    /// So the legs remember what they learn. Every `kanban show` in the daemon reports a
+    /// status, and `show` does not promote (same probe), so the ids arrive for free from calls
+    /// already being made — above all from the watch leg, which shows every task the moment it
+    /// emits its `blocked` event. The sweeps then reach those tasks by id.
+    ///
+    /// It is in-process, and what that costs is worth stating plainly: **a restart forgets
+    /// which tasks are blocked**, and nothing re-learns a task that is already blocked and
+    /// therefore emits no further event. Such a task needs `hermes kanban unblock` by hand.
+    /// That is a liveness cost, not a safety one — nothing is released without a 🐝, and no
+    /// duplicate lands on a Gitea issue — and it is the strictly better half of the trade the
+    /// alternative offered: releasing *every* blocked task on a timer, with no human at all.
+    pub fn remember_unlisted(&self, task_id: &str) {
+        insert_capped(&mut self.lock().unlisted, task_id, UNLISTED_CAP);
+    }
+
+    /// Forgets a task that is listable again — any status but the unlistable one.
+    ///
+    /// Called from the same places as [`Self::remember_unlisted`], on the other branch, so the
+    /// set cannot accumulate tasks that moved on: a `show` reporting `ready` is proof that a
+    /// `list` of that status will return the task, and reaching it by id as well would cost a
+    /// second `show` per sweep forever.
+    pub fn forget_unlisted(&self, task_id: &str) {
+        self.lock().unlisted.remove(task_id);
+    }
+
+    /// The tasks the sweeps must reach by id, in id order.
+    ///
+    /// Sorted so a sweep's work is deterministic rather than dependent on hash iteration
+    /// order, which is what makes a partial sweep — one cut short by a `show` failure — repeat
+    /// the same prefix rather than a fresh random sample.
+    pub fn unlisted(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.lock().unlisted.iter().cloned().collect();
+        ids.sort_unstable();
+        ids
     }
 }
 
@@ -438,13 +495,13 @@ impl PendingApprovals {
     }
 }
 
-/// Adds one suppression, bounded by [`SUPPRESSION_CAP`].
+/// Adds one entry to a bounded set — [`SUPPRESSION_CAP`] or [`UNLISTED_CAP`].
 ///
 /// Dropped whole at the cap rather than evicted one by one: there is no recency to evict on —
 /// every entry is equally permanent by design — and dropping whole makes the cost the same
 /// bounded one a restart already has.
-fn insert_capped(set: &mut HashSet<String>, value: &str) {
-    if set.len() >= SUPPRESSION_CAP && !set.contains(value) {
+fn insert_capped(set: &mut HashSet<String>, value: &str, cap: usize) {
+    if set.len() >= cap && !set.contains(value) {
         set.clear();
     }
     set.insert(value.to_string());
@@ -588,6 +645,45 @@ mod tests {
         // hit still suppresses.
         state.suppress_task("t_0");
         assert!(state.is_task_suppressed("t_0"));
+    }
+
+    /// The R7 P1's other half: with no sweep enumerating `blocked`, this set is the only way
+    /// a blocked task is reachable at all, so it has to hold exactly the tasks that are
+    /// blocked *now* — no more (a stale id costs a `show` per sweep forever) and no fewer (a
+    /// missing id is a task no 🐝 can release and no sweep can reconcile).
+    #[test]
+    fn a_task_is_reachable_by_id_for_exactly_as_long_as_it_is_blocked() {
+        let state = BridgeState::new();
+        assert!(state.unlisted().is_empty());
+
+        state.remember_unlisted("t_2");
+        state.remember_unlisted("t_1");
+        assert_eq!(state.unlisted(), vec!["t_1", "t_2"], "id order, not hash order");
+        // Remembering twice is the steady state — every sweep re-shows a task that is still
+        // blocked — and must not double it up.
+        state.remember_unlisted("t_1");
+        assert_eq!(state.unlisted().len(), 2);
+
+        // Unblocked, or run, or completed: whatever moved it, a `list` reaches it again, and
+        // paying a second `show` for it every sweep forever is exactly what this avoids.
+        state.forget_unlisted("t_1");
+        assert_eq!(state.unlisted(), vec!["t_2"]);
+        // Forgetting one that was never held is a no-op: `forget` runs on every non-blocked
+        // `show` in the daemon, which is most of them.
+        state.forget_unlisted("t_9");
+        assert_eq!(state.unlisted(), vec!["t_2"]);
+    }
+
+    #[test]
+    fn the_unlisted_set_is_bounded() {
+        let state = BridgeState::new();
+        for i in 0..UNLISTED_CAP + 10 {
+            state.remember_unlisted(&format!("t_{i}"));
+        }
+        assert!(state.unlisted().len() <= UNLISTED_CAP);
+        // …and the bound is the only thing that changed.
+        state.remember_unlisted("t_0");
+        assert!(state.unlisted().contains(&"t_0".to_string()));
     }
 
     fn pending(index: i64) -> PendingTask {

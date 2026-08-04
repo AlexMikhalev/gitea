@@ -105,6 +105,39 @@ pub struct Label {
     pub name: String,
 }
 
+/// One issue, as `GET /repos/{o}/{r}/issues/{index}` reports it — the one field the approval
+/// gate needs (`modules/structs/issue.go`, `state` is a `StateType`: `open` or `closed`).
+///
+/// Only `state` is read. The gate holds a *snapshot* of the issue's title and body taken when
+/// it was last offered by the ready endpoint, and it re-holds — and so refreshes — on every
+/// inbound sweep for as long as the issue stays ready. An issue that stops being offered stops
+/// being refreshed, and nothing else would ever drop it, so this is what says whether the
+/// snapshot still describes work anyone wants done.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Issue {
+    /// `open | closed`.
+    #[serde(default)]
+    pub state: String,
+}
+
+impl Issue {
+    /// Whether the issue is open.
+    ///
+    /// Deliberately not `!is_closed()`. `state` is `#[serde(default)]`, so a payload the
+    /// decoder does not recognise yields an empty string, and treating that as "open" would
+    /// dispatch agents onto closed issues while treating it as "closed" would silently empty
+    /// the approval gate. Neither is answerable from here, so both questions are asked
+    /// separately and the caller fails closed on "neither".
+    pub fn is_open(&self) -> bool {
+        self.state.eq_ignore_ascii_case("open")
+    }
+
+    /// Whether the issue is closed.
+    pub fn is_closed(&self) -> bool {
+        self.state.eq_ignore_ascii_case("closed")
+    }
+}
+
 /// The user a token authenticates as (`GET /api/v1/user`, `modules/structs/user.go`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuthenticatedUser {
@@ -342,6 +375,20 @@ impl GiteaClient {
         })
     }
 
+    /// `GET /api/v1/repos/{owner}/{repo}/issues/{index}` (`routers/api/v1/api.go`).
+    ///
+    /// Anonymous on a public repository, like the ready and reactions endpoints. A deleted
+    /// issue answers 404, which reaches the caller as [`GiteaError::NotFound`] and is as final
+    /// an answer as `closed`.
+    pub async fn issue(&self, owner: &str, repo: &str, index: i64) -> Result<Issue, GiteaError> {
+        let path = format!(
+            "/api/v1/repos/{}/{}/issues/{index}",
+            urlencode(owner),
+            urlencode(repo)
+        );
+        self.get_json(&path).await
+    }
+
     /// `GET /api/v1/user` — the user this token authenticates as. Requires a token.
     pub async fn current_user(&self) -> Result<AuthenticatedUser, GiteaError> {
         self.get_json("/api/v1/user").await
@@ -464,6 +511,23 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The gate drops a held issue on `is_closed`, not on `!is_open`, and the difference is
+    /// the whole safety of the check: `state` is `#[serde(default)]`, so an unrecognised
+    /// payload decodes to `""` — which must answer *neither* question, or a shape change would
+    /// silently empty the approval gate.
+    #[test]
+    fn an_issue_state_the_decoder_does_not_recognise_answers_neither_question() {
+        let open: Issue = serde_json::from_str(r#"{"state":"open","title":"x"}"#).expect("decodes");
+        assert!(open.is_open() && !open.is_closed());
+
+        let closed: Issue = serde_json::from_str(r#"{"state":"closed"}"#).expect("decodes");
+        assert!(closed.is_closed() && !closed.is_open());
+
+        let unknown: Issue = serde_json::from_str("{}").expect("an absent state still decodes");
+        assert!(!unknown.is_open());
+        assert!(!unknown.is_closed());
+    }
 
     #[test]
     fn ready_response_decodes_the_verified_shape() {

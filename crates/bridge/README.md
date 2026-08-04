@@ -122,7 +122,7 @@ gitea-automations --config bridge.yaml run            # all four legs
 
 See `bridge.example.yaml` and `rules.example.yaml`.
 
-## Six things that bite
+## Seven things that bite
 
 **`robot.blocked_label` must already exist in every repository.** Nothing here creates
 repository labels — creating one is not in the action space — and a label name Gitea cannot
@@ -211,6 +211,13 @@ Consequences worth stating:
   set is rebuilt by the next inbound sweep, because an issue with no task is still ready. One
   ready interval of memory is the whole cost.
 * `check` prints the path and how many issues are held; `run` logs the same at startup.
+* A held issue is revalidated against Gitea on every 🐝 sweep, and one that is **closed or
+  deleted** is dropped from the gate (`dropped=` in the sweep's log line). Nothing else would
+  ever remove it: `/robot/ready` stops offering a closed issue, so it stops being re-held and
+  stops being refreshed, and a 🐝 landing on it months later would otherwise dispatch an agent
+  onto a wontfix with a title frozen at the last hold. The drop needs a *definite* answer — an
+  unreachable Gitea, or a state the client cannot read, leaves the issue held and creates
+  nothing.
 * `hermes kanban create` is still `ready`-by-default and that is now correct — by the time the
   argv is built, a human has approved.
 
@@ -228,6 +235,42 @@ blocked with `needs_input`, the next sweep spent bo's and re-dispatched the agen
 question nobody had answered. To release a task again, remove and re-add the 🐝 (which changes
 its `created_at`, and so is a new approval), or have a maintainer who has not yet reacted add
 theirs — a genuinely new fingerprint is never one of the marked ones.
+
+**No sweep ever lists `blocked`, and a restart forgets which tasks are.** This is the same
+hermes bug as the gate above, reached by a different road, and it is worth stating on its own
+because the blast radius is different: it undoes a human decision that was already made.
+
+`hermes kanban list --status blocked` *promotes* what it returns. Both timed legs used to make
+that call: the approval sweep every 60 seconds, the reconciliation sweep every 300. So a worker
+that stopped a task with `--kind needs_input` — "waiting for spec", a question addressed to a
+person — had it handed back to a worker within the minute, and the agent re-ran on the
+unanswered question. No human, no log line, and no Gitea comment either, because `BLOCK_MARKER`
+correctly suppresses the repeat. The gate redesign did not cover this: the gate is about tasks
+that have not run, and these have.
+
+Neither leg enumerates it now. `RECONCILE_STATUSES` is every documented status except that one,
+and the approval sweep lists `todo` alone. Blocked tasks are reached **by id** through
+`hermes kanban show`, which does not promote — so the 🐝 that unblocks a `needs_input` task
+still works, and a block whose Gitea report never landed is still replayed.
+
+The cost, stated plainly: the daemon knows a task is blocked because it *saw* it blocked — the
+watch leg shows every task the instant it emits its terminal event — and that memory is
+in-process.
+
+* A **restart** forgets it, and nothing re-learns a task that is already blocked, because a
+  blocked task emits no further event. Such a task needs `hermes kanban unblock <id>` by hand;
+  a 🐝 on its issue will not move it.
+* Everything else is unaffected: the issue already carries its `status/blocked` label and reason
+  comment (that happened when the block fired), and nothing is released without an authorized
+  approval. It is a liveness gap, not a safety one.
+* `reconciliation sweep complete` logs `unlisted=` — how many blocked tasks this process is
+  tracking. `unlisted=0` on a board that has blocked tasks means the daemon has been restarted
+  since they blocked.
+
+If a future hermes stops promoting on read, the honest fix is to put `blocked` back in both
+lists and delete the by-id path. Until then, do not: `no_sweep_asks_kanban_for_the_status_that_listing_would_release`
+fails if either list grows it back, and the live probe in `tests/live_kanban.rs` is the record
+of why.
 
 **A base branch may not contain a slash.** The existence probe is
 `GET /repos/{o}/{r}/pulls/{base}/{head}` and only `{head}` is a catch-all segment

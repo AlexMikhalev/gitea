@@ -41,27 +41,48 @@ where
 /// `status/blocked` label plus a reason comment.
 pub const TERMINAL_KINDS: [&str; 5] = ["completed", "blocked", "gave_up", "crashed", "timed_out"];
 
-/// Every status a task can hold, as [`Task::status`] documents them.
+/// The one status the bridge must never ask kanban to enumerate.
 ///
-/// The reconciliation sweep enumerates *all* of these rather than the two a terminal event
-/// was observed to leave behind (`done` after `complete`, `blocked` after `block`). Nothing
-/// pins the status of a `crashed`, `gave_up` or `timed_out` task, and kanban's crash-reclaim
-/// exists precisely to return a dead worker's task to a claimable status — most plausibly
-/// `ready`. A sweep keyed on a hand-maintained pair of statuses would never list those, and
-/// their Gitea feedback would be dropped for good, for the three kinds most likely to
-/// coincide with the infrastructure trouble that made the sweep necessary.
+/// On hermes v0.19.0 **`hermes kanban list` promotes a blocked task by reading it** — plain
+/// and with `--status blocked`, probed twice on a scratch board on 2026-08-04
+/// (`tests/live_kanban.rs`). Against this status a `list` is not a read at all; it is a
+/// write, and it is the *worst* write available, because the thing it undoes is a human
+/// decision: a worker that stopped a task with `--kind needs_input` ("waiting for spec") is
+/// asking somebody to answer, and a promotion hands it straight back to a worker with the
+/// question still unanswered — invisibly, because [`crate::outbound::BLOCK_MARKER`]
+/// suppresses the repeat Gitea comment.
+///
+/// Both timed legs used to make that call on a timer: the approval sweep every 60s and the
+/// reconciliation sweep every 300s. Neither does now. A blocked task is reached **by id**
+/// through `kanban show`, which does not promote (same probe: repeated `show` calls leave the
+/// status alone) — see [`crate::state::BridgeState::unlisted`].
+pub const UNLISTABLE_STATUS: &str = "blocked";
+
+/// Every status the reconciliation sweep enumerates.
+///
+/// It lists *widely* rather than the two statuses a terminal event was observed to leave
+/// behind (`done` after `complete`, `blocked` after `block`). Nothing pins the status of a
+/// `crashed`, `gave_up` or `timed_out` task, and kanban's crash-reclaim exists precisely to
+/// return a dead worker's task to a claimable status — most plausibly `ready`. A sweep keyed
+/// on a hand-maintained pair of statuses would never list those, and their Gitea feedback
+/// would be dropped for good, for the three kinds most likely to coincide with the
+/// infrastructure trouble that made the sweep necessary.
 ///
 /// Enumerating widely is safe because the discrimination is done by
 /// [`crate::outbound::latest_terminal_kind`] on the task's *event trail*, not by its status:
 /// a task that has not run yet has no terminal event and is skipped whichever status listed
 /// it.
-pub const RECONCILE_STATUSES: [&str; 9] = [
+///
+/// It is every documented status **except** [`UNLISTABLE_STATUS`], which is not an omission
+/// but the point: listing that one would release the task it lists. Blocked tasks are
+/// reconciled by id instead, so widening this array back to nine would reintroduce a bug that
+/// is silent on both sides.
+pub const RECONCILE_STATUSES: [&str; 8] = [
     "triage",
     "todo",
     "ready",
     "running",
     "review",
-    "blocked",
     "scheduled",
     "done",
     "archived",
@@ -1084,18 +1105,34 @@ mod tests {
     }
 
     #[test]
-    fn the_reconcile_status_set_covers_every_documented_status() {
+    fn the_reconcile_status_set_covers_every_documented_status_but_one() {
         // The sweep used to enumerate `done` and `blocked` only. Nothing pins the status a
         // `crashed`, `gave_up` or `timed_out` task lands in, and crash-reclaim plausibly
         // returns it to `ready` — which that pair does not list, so those three kinds were
         // never reconciled.
-        for status in ["done", "blocked", "ready", "todo", "running"] {
+        for status in ["done", "ready", "todo", "running", "archived"] {
             assert!(RECONCILE_STATUSES.contains(&status), "{status}");
         }
         let mut sorted = RECONCILE_STATUSES.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), RECONCILE_STATUSES.len(), "no duplicates");
+    }
+
+    /// The R7 P1 this closes, pinned at the one place the set is spelled.
+    ///
+    /// `hermes kanban list --status blocked` *promotes* what it lists on hermes v0.19.0, so
+    /// the reconciliation sweep — a timer, every 300s, unconditional — was releasing every
+    /// worker-blocked task back to a claimable status. A `needs_input` block is a human being
+    /// asked a question; promoting it re-runs the agent on the unanswered question, with no
+    /// human, no log line and no Gitea comment.
+    #[test]
+    fn no_enumerated_status_is_one_a_list_would_promote() {
+        assert!(
+            !RECONCILE_STATUSES.contains(&UNLISTABLE_STATUS),
+            "listing {UNLISTABLE_STATUS:?} releases the tasks it lists; blocked tasks are \
+             reconciled by id through `show` instead"
+        );
     }
 
     #[tokio::test]
