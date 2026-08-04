@@ -56,6 +56,32 @@ const REPORTED_CAP: usize = 50_000;
 /// escalation is a no-op the second time because that marker is durable in kanban.
 const FAILURES_CAP: usize = 10_000;
 
+/// Upper bound on each of the three suppression sets.
+///
+/// Same argument again, and the asymmetry with the two caches above was the only thing keeping
+/// it out: nothing removes a suppression, by design — a fingerprint or task id stays in its set
+/// for the lifetime of the process — so under a kanban that will not accept comments, each set
+/// grows one entry per distinct fingerprint or task, which is board-scaled exactly like
+/// [`REPORTED_CAP`].
+///
+/// Smaller than the caches because these are pathological entries rather than routine ones: an
+/// id only ever lands here when a marker write failed *after* [`MARKER_ATTEMPTS`] retries, and
+/// a suppressed task stops re-inserting itself. Reaching 10k of them means the durable side has
+/// been rejecting writes for a very long time.
+///
+/// At the cap the set is dropped whole, and what that costs is bounded by the same durable
+/// marker each suppression stands in for — it is the restart case, without the restart:
+///
+/// * a dropped fingerprint costs at most one extra release of one task by an approval already
+///   given (and the release is retried only while kanban still refuses the marker);
+/// * a dropped task id costs at most one extra replay, i.e. one repeated Gitea comment;
+/// * a dropped escalation id costs at most one repeated escalation comment.
+///
+/// Each of those is a single event, and any of them recurring is the failure the suppression
+/// was for, which re-suppresses on the spot. Retaining the sets forever is not bounded by
+/// anything.
+const SUPPRESSION_CAP: usize = 10_000;
+
 /// Per-process guards shared by the approval, outbound and reconcile legs.
 #[derive(Debug, Default)]
 pub struct BridgeState {
@@ -96,7 +122,7 @@ impl BridgeState {
     /// forever. A human can always re-approve: removing and re-adding the 🐝 produces a new
     /// fingerprint, which this set does not hold.
     pub fn suppress_fingerprint(&self, fingerprint: &str) {
-        self.lock().fingerprints.insert(fingerprint.to_string());
+        insert_capped(&mut self.lock().fingerprints, fingerprint);
     }
 
     /// Whether this approval has been suppressed for the lifetime of this process.
@@ -109,7 +135,7 @@ impl BridgeState {
     /// Without it the unmarked task is exactly what the reconcile sweep looks for, so the
     /// user-visible Gitea comment is posted again on every sweep.
     pub fn suppress_task(&self, task_id: &str) {
-        self.lock().tasks.insert(task_id.to_string());
+        insert_capped(&mut self.lock().tasks, task_id);
     }
 
     /// Whether this task has been suppressed for the lifetime of this process.
@@ -127,7 +153,7 @@ impl BridgeState {
     /// own failure mode is far cheaper: without its marker it would be re-posted on every
     /// sweep, so this bounds it to the one that was already posted.
     pub fn suppress_escalation(&self, task_id: &str) {
-        self.lock().escalations.insert(task_id.to_string());
+        insert_capped(&mut self.lock().escalations, task_id);
     }
 
     /// Whether this task's escalation comment has been suppressed for this process.
@@ -206,6 +232,18 @@ impl BridgeState {
     pub fn clear_plan_failures(&self, task_id: &str) {
         self.lock().failures.remove(task_id);
     }
+}
+
+/// Adds one suppression, bounded by [`SUPPRESSION_CAP`].
+///
+/// Dropped whole at the cap rather than evicted one by one: there is no recency to evict on —
+/// every entry is equally permanent by design — and dropping whole makes the cost the same
+/// bounded one a restart already has.
+fn insert_capped(set: &mut HashSet<String>, value: &str) {
+    if set.len() >= SUPPRESSION_CAP && !set.contains(value) {
+        set.clear();
+    }
+    set.insert(value.to_string());
 }
 
 /// Cache key. `\0` cannot occur in a kanban id or status, so it cannot be spelled by data.
@@ -323,6 +361,29 @@ mod tests {
         assert_eq!(state.record_plan_failure("t_2"), 1);
         state.clear_plan_failures("t_1");
         assert_eq!(state.record_plan_failure("t_1"), 1);
+    }
+
+    /// Nothing ever removes a suppression, so without a bound these three sets are the one
+    /// board-scaled structure in the module with no ceiling — the asymmetry with the two
+    /// caches above, which are capped for exactly this reason.
+    #[test]
+    fn the_suppression_sets_are_bounded() {
+        let state = BridgeState::new();
+        for i in 0..SUPPRESSION_CAP + 10 {
+            state.suppress_fingerprint(&format!("alex@{i}"));
+            state.suppress_task(&format!("t_{i}"));
+            state.suppress_escalation(&format!("t_{i}"));
+        }
+        let inner = state.lock();
+        assert!(inner.fingerprints.len() <= SUPPRESSION_CAP);
+        assert!(inner.tasks.len() <= SUPPRESSION_CAP);
+        assert!(inner.escalations.len() <= SUPPRESSION_CAP);
+        drop(inner);
+
+        // …and the bound is the only thing that changed: a suppression made after the cap was
+        // hit still suppresses.
+        state.suppress_task("t_0");
+        assert!(state.is_task_suppressed("t_0"));
     }
 
     /// Counters are only removed on success, so the permanently-failing tasks — the ones this

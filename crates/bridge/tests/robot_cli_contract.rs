@@ -98,10 +98,18 @@ fn every_flag_the_bridge_emits_is_declared() {
         head: "h".into(),
         body: "Refs #1".into(),
     };
+    // `draft_pulls` is off by default, so a robot built from `RobotConfig::default()` never
+    // emits `--draft` or `--wip-prefix` — they were the only flags the bridge can produce that
+    // no test running a real binary exercised, covered solely by the Go-side table.
+    let drafting = Robot::new(&RobotConfig {
+        draft_pulls: true,
+        ..RobotConfig::default()
+    });
     for argv in [
         robot.comment_args("o", "r", 1, "b"),
         robot.add_labels_args("o", "r", 1, &["status/blocked".to_string()]),
         robot.create_pull_args("o", "r", &pr),
+        drafting.create_pull_args("o", "r", &pr),
     ] {
         let verb = argv[0].clone();
         // `--help` prints the flag set the verb declares; every flag the bridge passes has

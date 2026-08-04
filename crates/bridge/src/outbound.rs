@@ -152,12 +152,6 @@ pub enum PlanError {
         /// The kind that was already reported.
         kind: &'static str,
     },
-    /// A `completed` task has no branch to open a pull request from.
-    #[error("task {task} completed but no head branch could be resolved")]
-    NoHeadBranch {
-        /// Kanban task id.
-        task: String,
-    },
 }
 
 /// Builds the pull-request head branch for an issue, matching this repo's convention.
@@ -340,15 +334,22 @@ pub fn plan(
             .last_event("completed")
             .and_then(|e| e.payload_str("summary"))
             .or_else(|| detail.latest_summary.clone());
+        // Always a name, never a question of whether one exists: `head_branch` falls back to
+        // `task/<index>` for a title that slugifies to nothing, so this cannot be empty.
+        //
+        // "Completed but the worker never pushed a branch" is a real operational state and it
+        // is deliberately *not* handled here. Planning is offline — it sees a kanban payload,
+        // not a git remote — so a head that does not exist is indistinguishable at this point
+        // from one that does. It is answered where the answer is knowable: `create-pull` fails,
+        // the failure is counted, and `escalate_plan_failure` reports it on the issue. A guard
+        // here could only ever have caught a shape that cannot occur, while reading like it
+        // covered the one that does.
         let head = detail
             .task
             .branch_name
             .clone()
             .filter(|b| !b.trim().is_empty())
             .unwrap_or_else(|| head_branch(gitea_ref.index, &detail.task.title));
-        if head.trim().is_empty() {
-            return Err(PlanError::NoHeadBranch { task: task_id });
-        }
         let pr = PullRequest {
             title: format!("issue #{}: {}", gitea_ref.index, detail.task.title),
             head,

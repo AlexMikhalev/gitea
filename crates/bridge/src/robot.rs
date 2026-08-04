@@ -26,6 +26,7 @@ pub struct Robot {
     base_branch: String,
     blocked_label: String,
     draft_pulls: bool,
+    wip_prefix: String,
 }
 
 /// A pull request the bridge wants opened.
@@ -47,6 +48,7 @@ impl Robot {
             base_branch: cfg.base_branch.clone(),
             blocked_label: cfg.blocked_label.clone(),
             draft_pulls: cfg.draft_pulls,
+            wip_prefix: cfg.wip_prefix.clone(),
         }
     }
 
@@ -102,6 +104,16 @@ impl Robot {
     /// reports an existing pull request as success (`cmd/gitea-robot/write.go`,
     /// `runCreatePull`). That is what makes retrying a partly-applied `completed` plan
     /// safe — see `apply_event` in `main.rs`.
+    ///
+    /// `--draft` is always paired with `--wip-prefix`, never sent alone. Gitea has no `draft`
+    /// field on `CreatePullRequestOption` — draft-ness is inferred from the title prefix,
+    /// matched against `PULL_REQUEST.WORK_IN_PROGRESS_PREFIXES` — and neither the bridge nor
+    /// `gitea-robot` can read the instance's `app.ini`. Sending `--draft` on its own means
+    /// accepting the CLI's default prefix, which on an instance that customised the setting is
+    /// not a work-in-progress marker at all: the pull request opens as an ordinary,
+    /// immediately-reviewable one while the config says draft, and the call succeeds, so
+    /// nothing anywhere reports it. [`RobotConfig::wip_prefix`] is the escape hatch, and
+    /// passing it unconditionally is what makes it reachable.
     pub fn create_pull_args(&self, owner: &str, repo: &str, pr: &PullRequest) -> Vec<String> {
         let mut argv = vec![
             "create-pull".into(),
@@ -120,6 +132,8 @@ impl Robot {
         ];
         if self.draft_pulls {
             argv.push("--draft".into());
+            argv.push("--wip-prefix".into());
+            argv.push(self.wip_prefix.clone());
         }
         argv
     }
@@ -306,22 +320,45 @@ mod tests {
         assert!(!argv.contains(&"--draft".to_string()));
     }
 
+    /// `--draft` alone is a no-op on an instance that changed
+    /// `PULL_REQUEST.WORK_IN_PROGRESS_PREFIXES`: Gitea reads draft-ness off the title prefix,
+    /// and neither binary can read `app.ini`. So the prefix travels with the flag.
     #[test]
-    fn draft_flag_is_opt_in() {
+    fn draft_flag_is_opt_in_and_carries_the_wip_prefix() {
+        let pr = PullRequest {
+            title: "t".into(),
+            head: "h".into(),
+            body: "Refs #1".into(),
+        };
         let r = Robot::new(&RobotConfig {
             draft_pulls: true,
             ..RobotConfig::default()
         });
-        let argv = r.create_pull_args(
-            "o",
-            "r",
-            &PullRequest {
-                title: "t".into(),
-                head: "h".into(),
-                body: "Refs #1".into(),
-            },
-        );
+        let argv = r.create_pull_args("o", "r", &pr);
         assert!(argv.contains(&"--draft".to_string()));
+        let i = argv
+            .iter()
+            .position(|a| a == "--wip-prefix")
+            .expect("--draft must never travel alone: {argv:?}");
+        assert_eq!(argv[i + 1], crate::config::DEFAULT_WIP_PREFIX);
+
+        // …and a customised instance can actually reach it, which is the point.
+        let custom = Robot::new(&RobotConfig {
+            draft_pulls: true,
+            wip_prefix: "[DRAFT]".into(),
+            ..RobotConfig::default()
+        });
+        let argv = custom.create_pull_args("o", "r", &pr);
+        let i = argv.iter().position(|a| a == "--wip-prefix").expect("prefix");
+        assert_eq!(argv[i + 1], "[DRAFT]");
+
+        // Off, neither flag appears — the prefix is meaningless without the draft flag.
+        let plain = Robot::new(&RobotConfig::default());
+        let argv = plain.create_pull_args("o", "r", &pr);
+        assert!(
+            !argv.iter().any(|a| a == "--draft" || a == "--wip-prefix"),
+            "{argv:?}"
+        );
     }
 
     #[test]

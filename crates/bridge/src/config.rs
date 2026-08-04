@@ -25,6 +25,14 @@ pub const DEFAULT_APPROVAL_REACTION: &str = "honeybee";
 /// terminal state.
 pub const DEFAULT_BLOCKED_LABEL: &str = "status/blocked";
 
+/// Work-in-progress title prefix a stock Gitea recognises.
+///
+/// The first entry of the shipped `PULL_REQUEST.WORK_IN_PROGRESS_PREFIXES`
+/// (`modules/setting/repository.go:230`), which is also `defaultWIPPrefix` in
+/// `cmd/gitea-robot/write.go`. Draft-ness is decided from the title, so an instance that
+/// changed the setting must say so — see [`RobotConfig::wip_prefix`].
+pub const DEFAULT_WIP_PREFIX: &str = "WIP:";
+
 /// A single `<owner>/<repo>` the bridge is responsible for.
 ///
 /// Unknown keys are rejected here and in every other config struct — see [`Config`].
@@ -139,8 +147,25 @@ pub struct RobotConfig {
     #[serde(default = "default_blocked_label")]
     pub blocked_label: String,
     /// Open pull requests as drafts.
+    ///
+    /// Only meaningful together with [`wip_prefix`](Self::wip_prefix) on an instance that
+    /// changed `PULL_REQUEST.WORK_IN_PROGRESS_PREFIXES`.
     #[serde(default)]
     pub draft_pulls: bool,
+    /// Work-in-progress title prefix this instance recognises.
+    ///
+    /// Gitea has no `draft` field on `CreatePullRequestOption` — draft-ness *is* the title
+    /// prefix, matched against `PULL_REQUEST.WORK_IN_PROGRESS_PREFIXES`
+    /// (`modules/setting/repository.go:230`) — and `gitea-robot` cannot read `app.ini`, so it
+    /// takes the prefix as a flag (`--wip-prefix`, `cmd/gitea-robot/write.go`). The default
+    /// here is the first shipped prefix, which is also the CLI's own default.
+    ///
+    /// It exists so that [`draft_pulls`](Self::draft_pulls) is not a silent no-op on an
+    /// instance that customised the setting: there, `WIP:` is not a work-in-progress marker,
+    /// so the pull request opens as an ordinary, immediately-reviewable one while the config
+    /// says draft — with no diagnostic anywhere, because the request succeeded.
+    #[serde(default = "default_wip_prefix")]
+    pub wip_prefix: String,
 }
 
 /// Poll cadences. The bridge is a poller by construction on both approval and ready.
@@ -339,6 +364,20 @@ impl Config {
                 self.robot.blocked_label
             )));
         }
+        // Draft-ness is the title prefix and nothing else, so an empty prefix under
+        // `draft_pulls` is a request the server cannot refuse and cannot honour: `gitea-robot`
+        // falls back to its own default, which is precisely the value an instance that
+        // customised WORK_IN_PROGRESS_PREFIXES does not recognise. Refuse it here rather than
+        // open an ordinary pull request while the config says draft.
+        if self.robot.draft_pulls && self.robot.wip_prefix.trim().is_empty() {
+            return Err(ConfigError::Invalid(format!(
+                "robot.wip_prefix is required when robot.draft_pulls is on: Gitea has no draft \
+                 field on a pull request — it matches the title against \
+                 PULL_REQUEST.WORK_IN_PROGRESS_PREFIXES — so an empty prefix silently opens an \
+                 ordinary pull request. Use {DEFAULT_WIP_PREFIX:?} unless this instance changed \
+                 the setting"
+            )));
+        }
         // 0 is not "unlimited" here, deliberately: the ready endpoint has no limit and no
         // paging, so an unlimited sweep's cost is whatever the board happens to hold, forever.
         // An operator who wants more work in flight raises the number.
@@ -408,6 +447,9 @@ fn default_base_branch() -> String {
 fn default_blocked_label() -> String {
     DEFAULT_BLOCKED_LABEL.into()
 }
+fn default_wip_prefix() -> String {
+    DEFAULT_WIP_PREFIX.into()
+}
 fn default_ready_interval_secs() -> u64 {
     60
 }
@@ -462,6 +504,7 @@ impl Default for RobotConfig {
             base_branch: default_base_branch(),
             blocked_label: default_blocked_label(),
             draft_pulls: false,
+            wip_prefix: default_wip_prefix(),
         }
     }
 }
@@ -586,6 +629,32 @@ mod tests {
             let err = cfg.validate().expect_err("must reject");
             assert!(err.to_string().contains(needle), "{err}");
         }
+    }
+
+    /// Draft-ness *is* the title prefix, so `draft_pulls` without one is a setting that
+    /// cannot be honoured and cannot fail: the pull request opens as an ordinary one and the
+    /// call succeeds. The prefix is also the only way an instance that customised
+    /// `WORK_IN_PROGRESS_PREFIXES` can make `draft_pulls` mean anything at all.
+    #[test]
+    fn draft_pulls_without_a_wip_prefix_is_rejected() {
+        let cfg: Config = serde_norway::from_str(&format!(
+            "{}robot:\n  draft_pulls: true\n  wip_prefix: \"  \"\n",
+            minimal()
+        ))
+        .expect("parses");
+        let err = cfg.validate().expect_err("must reject");
+        assert!(err.to_string().contains("wip_prefix"), "{err}");
+
+        // The default is the shipped prefix, so the common case needs no configuration…
+        let cfg: Config =
+            serde_norway::from_str(&format!("{}robot:\n  draft_pulls: true\n", minimal())).expect("parses");
+        cfg.validate().expect("valid");
+        assert_eq!(cfg.robot.wip_prefix, DEFAULT_WIP_PREFIX);
+
+        // …and an empty prefix is only an error when it would be read.
+        let cfg: Config =
+            serde_norway::from_str(&format!("{}robot:\n  wip_prefix: \"\"\n", minimal())).expect("parses");
+        cfg.validate().expect("valid");
     }
 
     #[test]

@@ -227,11 +227,82 @@ async fn every_reconcile_status_is_one_kanban_will_list() {
         }
     }
 
-    // …and the sweep really finds a task through one of them.
+    // …and the sweep really finds the task through one of them. Which one is deliberately not
+    // asserted here — that is `a_gated_task_stays_where_the_approval_sweep_looks_for_it`'s
+    // subject, and it has its own answer. The reconcile sweep enumerates all nine and dedups
+    // by id, so being listed by *some* status is exactly what it needs.
+    let mut listed = None;
+    for status in RECONCILE_STATUSES {
+        let tasks = kanban.list(Some(status)).await.expect("list");
+        if let Some(task) = tasks.into_iter().find(|t| t.id == id) {
+            listed = Some(task);
+            break;
+        }
+    }
+    let listed = listed.expect("a bridge task must be listed by one of the enumerated statuses");
+
+    // The id is not enough. Both list-driven legs — the approval sweep and the reconcile
+    // sweep — open with `GiteaRef::parse_from_body(task.body)` and `continue` past every task
+    // that has none, so a `list --json` that projects rows *without* the body would leave them
+    // evaluating nothing, silently and with both preflights green: every inbound task would sit
+    // blocked awaiting a 🐝 nobody looks for, and the reconcile summary would read idle.
+    // `Task::body` is `#[serde(default)] Option<String>`, so nothing but this asserts it.
+    // `Kanban::list` rejects a payload whose rows have no `body` key at all; this pins the
+    // stronger fact — that the trailer the bridge wrote survives the round trip through `list`,
+    // not merely through `show`.
+    assert_eq!(
+        listed.body.as_deref().and_then(GiteaRef::parse_from_body),
+        Some(GiteaRef::new("terraphim", "gitea", 63)),
+        "`kanban list --json` must return the body carrying the gitea-ref trailer, or the \
+         approval and reconcile legs are both dead: {listed:?}"
+    );
+}
+
+/// The approval gate's other half: a gated task must still be gated when the sweep looks.
+///
+/// `create_lands_in_a_status_the_approval_sweep_covers` pins where a gated task *starts*.
+/// This pins that it is still there one `kanban list` later — which is the only moment that
+/// matters, because `approval_sweep`'s first act is `kanban.list(Some("blocked"))`.
+///
+/// **Known red against hermes v0.19.0** (probed 2026-08-04, `hermes kanban list --status
+/// blocked` on a scratch board): that call *promotes* the task. `show` reports `blocked`
+/// across repeated calls, one `list` runs, and the next `show` reports `ready` with a
+/// `promoted` event appended to the trail. So on this hermes the approval sweep releases every
+/// gated task to a worker by the act of looking for one to release, no 🐝 involved, and then
+/// finds an empty list — the gate is not merely unreachable, the sweep is what defeats it.
+///
+/// Left failing on purpose. It is the F4 approval gate's central claim, nothing else in-repo
+/// asserts it, and it cannot be fixed from this crate: the gate needs a hold kanban will not
+/// lift by itself, or it needs to move out of kanban's status entirely.
+#[tokio::test]
+#[ignore = "runs a real hermes kanban on a throwaway board"]
+async fn a_gated_task_stays_where_the_approval_sweep_looks_for_it() {
+    let Some(board) = ScratchBoard::new("gatehold") else {
+        return;
+    };
+    let kanban = board.kanban();
+    let id = kanban
+        .create(&create_request(63, "live gate hold probe"))
+        .await
+        .expect("create");
+    assert_eq!(
+        kanban.show(&id).await.expect("show").task.status,
+        "blocked",
+        "a gated task must start blocked"
+    );
+
+    // Exactly what `approval_sweep` does, in the order it does it.
     let blocked = kanban.list(Some("blocked")).await.expect("list blocked");
     assert!(
         blocked.iter().any(|t| t.id == id),
-        "a gated task must be listed by the status it holds: {blocked:?}"
+        "a gated task must be listed by the status it holds, or the 🐝 leg never sees it: \
+         {blocked:?}"
+    );
+    let detail = kanban.show(&id).await.expect("show");
+    assert_eq!(
+        detail.task.status, "blocked",
+        "listing the blocked tasks must not release them: {:?}",
+        detail.events
     );
 }
 

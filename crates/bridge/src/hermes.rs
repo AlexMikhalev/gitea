@@ -558,24 +558,23 @@ impl Kanban {
     }
 
     /// Lists tasks, optionally filtered by status.
+    ///
+    /// The payload is checked against `decode_list`'s contract before it is returned — `id`
+    /// *and* `body`. Both callers branch on fields that are `#[serde(default)]`, so a shape
+    /// change is otherwise silent rather than an error.
     pub async fn list(&self, status: Option<&str>) -> Result<Vec<Task>, KanbanError> {
         let args = self.list_args(status);
         let out = self.run(&args).await?;
-        let tasks: Vec<Task> = serde_json::from_str(&out).map_err(|source| KanbanError::Decode {
-            args: redact(&args),
-            source,
-        })?;
-        // Same reasoning as `TaskDetail::validate`: an every-field-defaulted struct turns a
-        // shape change into a list of blanks rather than an error.
-        if let Some(i) = tasks.iter().position(|t| t.id.trim().is_empty()) {
-            return Err(KanbanError::Shape {
+        decode_list(&out).map_err(|err| match err {
+            ListDecodeError::Decode(source) => KanbanError::Decode {
                 args: redact(&args),
-                reason: format!(
-                    "entry {i} has no id — `kanban list --json` did not return the expected shape"
-                ),
-            });
-        }
-        Ok(tasks)
+                source,
+            },
+            ListDecodeError::Shape(reason) => KanbanError::Shape {
+                args: redact(&args),
+                reason,
+            },
+        })
     }
 
     /// Appends a comment to a task.
@@ -682,6 +681,73 @@ impl Kanban {
     async fn run(&self, args: &[String]) -> Result<String, KanbanError> {
         run_argv(&self.binary, args).await
     }
+}
+
+/// Why a `kanban list --json` payload was rejected.
+///
+/// Split from [`KanbanError`] so [`decode_list`] can be a pure function the tests drive with
+/// a payload string, and the argv is attached once, by the caller that knows it.
+#[derive(Debug)]
+pub(crate) enum ListDecodeError {
+    /// The output is not JSON, or not a list of task objects.
+    Decode(serde_json::Error),
+    /// It decoded, but not into the shape the daemon branches on.
+    Shape(String),
+}
+
+/// Decodes a `kanban list --json` payload and pins the fields the daemon *branches on*.
+///
+/// Every field of [`Task`] is `#[serde(default)]` — deliberately, so kanban can add fields —
+/// which means a differently shaped payload decodes to a list of blanks rather than failing.
+/// The same reasoning as [`TaskDetail::validate`], applied to the list path, where two of the
+/// daemon's four legs live:
+///
+/// * `id` — without it nothing can be shown, promoted or unblocked.
+/// * `body` — both list callers open with
+///   `task.body.as_deref().and_then(GiteaRef::parse_from_body)` and `continue` on `None`
+///   (`approval_sweep` and `reconcile_sweep` in `main.rs`). `body` is what carries the
+///   `gitea-ref:` trailer, because `list`/`show` do not echo the idempotency key back, so a
+///   list without it is a list in which *no task is a bridge task*: every inbound task sits
+///   `blocked` awaiting a 🐝 that can never be seen, and the reconcile sweep reports nothing
+///   while its own summary reads idle. Two legs dead, no error, both preflights green — the
+///   exact failure class the `id` guard was written for.
+///
+/// The `body` check is on the **key**, not the value: a task legitimately has no body, and
+/// `null`/`""` are perfectly good answers. Only a payload in which *no* row carries the key at
+/// all is treated as a shape change — that is the signal that the field left the list
+/// projection, as opposed to this particular set of tasks having nothing in it. A board whose
+/// listed tasks are all bodyless *and* a kanban that omits the key rather than emitting null
+/// would trip it; that is a loud, named error on a board with no bridge task on it, which is
+/// the trade this whole guard exists to make.
+pub(crate) fn decode_list(raw: &str) -> Result<Vec<Task>, ListDecodeError> {
+    let rows: Vec<serde_json::Value> = serde_json::from_str(raw).map_err(ListDecodeError::Decode)?;
+    let tasks = rows
+        .iter()
+        .cloned()
+        .map(serde_json::from_value::<Task>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(ListDecodeError::Decode)?;
+    if let Some(i) = tasks.iter().position(|t| t.id.trim().is_empty()) {
+        return Err(ListDecodeError::Shape(format!(
+            "entry {i} has no id — `kanban list --json` did not return the expected shape"
+        )));
+    }
+    let objects = rows.iter().filter(|r| r.is_object()).count();
+    let with_body = rows
+        .iter()
+        .filter_map(serde_json::Value::as_object)
+        .filter(|o| o.contains_key("body"))
+        .count();
+    if objects > 0 && with_body == 0 {
+        return Err(ListDecodeError::Shape(format!(
+            "none of the {objects} listed tasks carries a `body` field — `kanban list --json` \
+             no longer projects it. The bridge finds its own tasks by the `{prefix}` trailer in \
+             the body and skips every task without one, so this would silently kill both the \
+             approval and the reconciliation legs rather than fail",
+            prefix = crate::inbound::GITEA_REF_PREFIX
+        )));
+    }
+    Ok(tasks)
 }
 
 /// Runs `binary` with `args` and returns stdout.
@@ -843,6 +909,49 @@ mod tests {
         assert!(wrong.validate().is_err());
         let ok: TaskDetail = serde_json::from_str(r#"{"task":{"id":"t_1"}}"#).expect("decodes");
         assert!(ok.validate().is_ok());
+    }
+
+    /// The list path's equivalent, on the two fields the sweeps branch on.
+    ///
+    /// `body` is load-bearing exactly like `id`: it is where the `gitea-ref:` trailer lives,
+    /// and both `approval_sweep` and `reconcile_sweep` `continue` past every task without one.
+    /// A list projection that dropped it would leave those two legs dead and silent.
+    #[test]
+    fn a_list_without_the_body_projection_is_rejected_rather_than_skipped() {
+        let dropped = r#"[{"id":"t_1","title":"a","status":"blocked"},
+                          {"id":"t_2","title":"b","status":"todo"}]"#;
+        let err = decode_list(dropped).expect_err("a list with no body field must not decode");
+        let ListDecodeError::Shape(reason) = err else {
+            panic!("must be a shape error, not a decode error")
+        };
+        assert!(reason.contains("body"), "{reason}");
+
+        // The check is on the key, not the value: a task with no body is ordinary, and both
+        // spellings of "no body" are answers rather than shape changes.
+        for payload in [
+            r#"[{"id":"t_1","body":null},{"id":"t_2","body":""}]"#,
+            r#"[{"id":"t_1","body":"gitea-ref: o/r#1"},{"id":"t_2","title":"not a bridge task"}]"#,
+        ] {
+            assert!(decode_list(payload).is_ok(), "{payload}");
+        }
+
+        // An empty board is an empty board, not a regression.
+        assert!(decode_list("[]").expect("decodes").is_empty());
+
+        // …and the id guard still holds.
+        let err = decode_list(r#"[{"body":"gitea-ref: o/r#1"}]"#).expect_err("no id");
+        assert!(matches!(err, ListDecodeError::Shape(reason) if reason.contains("id")));
+
+        // The trailer really does survive the round trip this guard protects.
+        let tasks =
+            decode_list(r#"[{"id":"t_1","body":"x\n\ngitea-ref: terraphim/gitea#63"}]"#).expect("decodes");
+        assert_eq!(
+            tasks[0]
+                .body
+                .as_deref()
+                .and_then(crate::inbound::GiteaRef::parse_from_body),
+            Some(crate::inbound::GiteaRef::new("terraphim", "gitea", 63))
+        );
     }
 
     #[test]

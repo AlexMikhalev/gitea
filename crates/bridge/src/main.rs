@@ -347,6 +347,10 @@ async fn inbound_sweep(gitea: &GiteaClient, kanban: &Kanban, cfg: &Config, repo:
 /// specifier's, not ours. With `kanban.require_approval` on, this is also the leg that
 /// releases a freshly created task — inbound creates it `blocked` precisely so that it does.
 async fn approval_sweep(gitea: &GiteaClient, kanban: &Kanban, cfg: &Config, state: &BridgeState) {
+    // Same reason the reconcile sweep counts these: the loop below `continue`s past every task
+    // whose body carries no `gitea-ref:` trailer, and that skip is bare — a leg evaluating no
+    // task at all is otherwise indistinguishable in the log from a board with no 🐝 on it.
+    let (mut candidates, mut trailered) = (0u64, 0u64);
     for status in ["blocked", "todo"] {
         let tasks = match kanban.list(Some(status)).await {
             Ok(tasks) => tasks,
@@ -356,9 +360,11 @@ async fn approval_sweep(gitea: &GiteaClient, kanban: &Kanban, cfg: &Config, stat
             }
         };
         for task in tasks {
+            candidates += 1;
             let Some(gref) = task.body.as_deref().and_then(GiteaRef::parse_from_body) else {
                 continue;
             };
+            trailered += 1;
             if !cfg
                 .repos
                 .iter()
@@ -445,6 +451,10 @@ async fn approval_sweep(gitea: &GiteaClient, kanban: &Kanban, cfg: &Config, stat
             }
         }
     }
+    // Debug rather than info: this runs every 60s, and unlike the reconcile sweep it has
+    // nothing to say when it did its job. It is here so that "no bridge task was evaluated at
+    // all" is answerable without attaching a debugger to a daemon that looks healthy.
+    tracing::debug!(candidates, trailered, "approval sweep complete");
 }
 
 /// Follows `kanban watch` and applies each terminal event to Gitea.
@@ -552,6 +562,14 @@ async fn outbound_loop(cfg: Arc<Config>, kanban: Kanban, robot: Robot, state: Ar
 /// flight rather than by history.
 async fn reconcile_sweep(cfg: &Config, kanban: &Kanban, robot: &Robot, state: &BridgeState) {
     let (mut checked, mut replayed, mut reported, mut idle, mut suppressed) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    // Counted apart from `candidates` on purpose. `candidates` is every listed task, *before*
+    // the trailer filter below, so on its own it cannot tell a board with nothing to do from a
+    // list payload in which no task carries a `gitea-ref:` trailer at all — the state in which
+    // this leg reports nothing while its summary line reads perfectly healthy.
+    // `Kanban::list` now fails loudly if the `body` projection disappears; this is the line
+    // that says so from the sweep's side, including for the cases the decoder cannot see (a
+    // trailer the bridge no longer writes, a board that is simply not ours).
+    let mut trailered = 0u64;
     let mut seen = std::collections::HashSet::new();
     let (mut failed_statuses, mut first_error): (Vec<&str>, Option<String>) = (Vec::new(), None);
     for status in RECONCILE_STATUSES {
@@ -579,6 +597,7 @@ async fn reconcile_sweep(cfg: &Config, kanban: &Kanban, robot: &Robot, state: &B
             let Some(gref) = task.body.as_deref().and_then(GiteaRef::parse_from_body) else {
                 continue;
             };
+            trailered += 1;
             if !cfg
                 .repos
                 .iter()
@@ -638,6 +657,7 @@ async fn reconcile_sweep(cfg: &Config, kanban: &Kanban, robot: &Robot, state: &B
         reported,
         idle,
         suppressed,
+        trailered,
         candidates = seen.len(),
         "reconciliation sweep complete"
     );
@@ -682,7 +702,14 @@ enum Resolution {
     Reported,
     /// A terminal event with no report marker behind it. Apply this.
     Replay(TerminalKind, OutboundPlan),
-    /// A terminal event the sweep cannot turn into actions.
+    /// A terminal event the sweep cannot turn into actions — in practice a body whose
+    /// `gitea-ref:` trailer went away between the `list` that selected the task and the `show`
+    /// that resolved it.
+    ///
+    /// Note what is *not* here: a `completed` task whose branch was never pushed. Planning is
+    /// offline and cannot ask a git remote whether a head exists, so that case plans normally
+    /// and surfaces where it is knowable — `create-pull` fails, the failure is counted, and
+    /// `escalate_plan_failure` reports it on the issue.
     Unplannable(PlanError),
 }
 
@@ -732,6 +759,9 @@ async fn apply_event(
             return;
         }
     };
+    // Matched exhaustively on `PlanError`, with no catch-all arm: a new variant is a new way
+    // for a terminal event to produce nothing on the user's issue, and it should have to be
+    // answered here rather than swept into one error line.
     let plan = match plan(&detail, kind, robot.blocked_label(), true) {
         Ok(plan) => plan,
         Err(PlanError::NoGiteaRef { .. }) => {
@@ -752,10 +782,6 @@ async fn apply_event(
                 kind = kind.event_kind(),
                 "already reported; ignoring replay"
             );
-            return;
-        }
-        Err(err) => {
-            tracing::error!(task = task_id, error = %err, "cannot plan outbound actions");
             return;
         }
     };

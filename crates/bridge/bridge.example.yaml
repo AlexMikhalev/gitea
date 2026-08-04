@@ -66,6 +66,12 @@ robot:
   # comment behind it down with it. `check` probes for it.
   blocked_label: status/blocked
   draft_pulls: false
+  # Only read when draft_pulls is on. Gitea has no `draft` field on a pull request - it
+  # decides draft-ness by matching the title against PULL_REQUEST.WORK_IN_PROGRESS_PREFIXES
+  # (modules/setting/repository.go:230) - and neither this daemon nor gitea-robot can read
+  # app.ini. So an instance that changed that setting must repeat its first prefix here, or
+  # draft_pulls opens an ordinary, immediately-reviewable pull request and says nothing.
+  wip_prefix: "WIP:"
 
 poll:
   ready_interval_secs: 60
