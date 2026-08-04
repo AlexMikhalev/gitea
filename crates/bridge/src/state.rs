@@ -27,9 +27,15 @@
 //! sweep need not pay a `kanban show` subprocess for it on every sweep for the lifetime of the
 //! board. It deliberately does **not** cover the other cheap outcome — a task with nothing to
 //! report yet — because that one is not stable: see [`BridgeState::mark_reported`].
+//!
+//! [`PendingApprovals`] is the one thing here that *is* a source of truth, and it is here
+//! because it cannot be anywhere else: it is the approval gate. See its own documentation.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+
+use serde::{Deserialize, Serialize};
 
 /// Attempts a marker write gets before it is treated as a dead letter.
 pub const MARKER_ATTEMPTS: u32 = 3;
@@ -234,6 +240,204 @@ impl BridgeState {
     }
 }
 
+/// Upper bound on the approval gate's held set.
+///
+/// Unlike the caches above, dropping this whole is *cheap and self-healing*: every held entry
+/// is rebuilt from `GET /api/v1/robot/ready` by the next inbound sweep, because an issue whose
+/// task has not been created is still ready. So the cap costs at most one ready-poll interval
+/// of gate memory, and it is what stops a board whose issues are never approved (and are then
+/// closed, so they never come back) from growing the file for the lifetime of the deployment.
+const PENDING_CAP: usize = 10_000;
+
+/// One ready Gitea issue held at the approval gate — everything needed to create its kanban
+/// task later, without going back to the ready endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingTask {
+    /// Repository owner.
+    pub owner: String,
+    /// Repository name.
+    pub repo: String,
+    /// Issue index.
+    pub index: i64,
+    /// Task title — the Gitea issue title.
+    pub title: String,
+    /// Opening post, carrying the `gitea-ref:` trailer.
+    pub body: String,
+    /// `gitea:<owner>/<repo>#<index>`, and the key of this entry.
+    pub idempotency_key: String,
+}
+
+/// Failures of the approval gate's durable store.
+#[derive(Debug, thiserror::Error)]
+pub enum PendingError {
+    /// The state file could not be read.
+    #[error("cannot read the approval gate state {path}: {source}")]
+    Read {
+        /// Path that failed to open.
+        path: PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The state file could not be written.
+    #[error("cannot write the approval gate state {path}: {source}")]
+    Write {
+        /// Path that failed to write.
+        path: PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The state file is not the JSON the gate wrote.
+    #[error("cannot parse the approval gate state {path}: {source}")]
+    Parse {
+        /// Path that failed to parse.
+        path: PathBuf,
+        /// Underlying JSON error.
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+/// The approval gate: ready issues the bridge is deliberately *not* turning into kanban tasks.
+///
+/// The gate used to be a kanban status — inbound created the task with `--initial-status
+/// blocked` and the 🐝 released it. That cannot work: on the deployed hermes (v0.19.0, probed
+/// twice on 2026-08-04) **`hermes kanban list` promotes a blocked task by reading it**, both
+/// plain and with `--status blocked`. `approval_sweep`'s very first call is a `kanban list`, so
+/// the sweep looking for a task to release was itself what released every gated task to a
+/// worker, with no human involved and nothing in the log to say so.
+///
+/// So the gate moved to the only side that can hold it: this one. Inbound does not create the
+/// kanban task at all; it records the issue here, and the approval sweep creates the task the
+/// moment an authorized 🐝 appears. Until then no task exists, so there is nothing for kanban
+/// to promote, and no worker can claim work no board is carrying.
+///
+/// It is a file rather than a `HashSet` because it is the gate: `approval-once` must be able to
+/// release an issue a *previous* process held, and a daemon that restarts between the reaction
+/// and the next inbound sweep must still act on it. Losing the file is nevertheless not a
+/// safety failure in either direction — nothing is released that was not approved, and the held
+/// set is rebuilt by the next inbound sweep, because an issue with no task is still ready.
+///
+/// Both mutations write the whole map through a temporary file and a rename, so a crash mid-save
+/// leaves the previous state rather than a truncated one. A save that fails after the in-memory
+/// map moved is reported and tolerated: the pair (create, release) is idempotent — `create`
+/// dedups on the idempotency key and the consumed markers are matched line-exactly — so a stale
+/// entry replayed after a restart resolves to the same task and writes no second marker.
+#[derive(Debug)]
+pub struct PendingApprovals {
+    path: PathBuf,
+    held: Mutex<BTreeMap<String, PendingTask>>,
+}
+
+impl PendingApprovals {
+    /// Loads the gate from `path`. A file that is not there yet is an empty gate, not an error.
+    pub fn load(path: &Path) -> Result<Self, PendingError> {
+        let held = match std::fs::read_to_string(path) {
+            Ok(raw) if raw.trim().is_empty() => BTreeMap::new(),
+            Ok(raw) => serde_json::from_str(&raw).map_err(|source| PendingError::Parse {
+                path: path.to_path_buf(),
+                source,
+            })?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(source) => {
+                return Err(PendingError::Read {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        };
+        Ok(Self {
+            path: path.to_path_buf(),
+            held: Mutex::new(held),
+        })
+    }
+
+    /// An in-memory gate, for tests and for the `check` path that only reports its size.
+    pub fn ephemeral() -> Self {
+        Self {
+            path: PathBuf::new(),
+            held: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// The file this gate persists to.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, PendingTask>> {
+        self.held.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
+    /// Holds one ready issue at the gate. Returns whether it was not already held.
+    ///
+    /// Re-holding an issue is the ordinary steady state, not an anomaly: an issue whose task
+    /// has not been created is still ready, so every inbound sweep offers it again.
+    pub fn hold(&self, entry: PendingTask) -> Result<bool, PendingError> {
+        let mut held = self.lock();
+        let key = entry.idempotency_key.clone();
+        if held.len() >= PENDING_CAP && !held.contains_key(&key) {
+            held.clear();
+        }
+        let fresh = held.insert(key, entry).is_none();
+        self.persist(&held)?;
+        Ok(fresh)
+    }
+
+    /// Releases one issue from the gate — its kanban task now exists.
+    ///
+    /// Returns whether it was held. Persisting is attempted even when it was not, so a caller
+    /// that retries after a failed save converges.
+    pub fn release(&self, idempotency_key: &str) -> Result<bool, PendingError> {
+        let mut held = self.lock();
+        let was_held = held.remove(idempotency_key).is_some();
+        self.persist(&held)?;
+        Ok(was_held)
+    }
+
+    /// Everything held right now, in idempotency-key order.
+    pub fn held(&self) -> Vec<PendingTask> {
+        self.lock().values().cloned().collect()
+    }
+
+    /// How many issues are waiting on a 🐝.
+    pub fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    /// Whether nothing is waiting on a 🐝.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Writes the whole map through a temporary file and a rename.
+    ///
+    /// Whole-file rather than append-only because the map is small and bounded by
+    /// [`PENDING_CAP`], and rename-based because a half-written gate that failed to parse would
+    /// take the daemon down on its next start.
+    fn persist(&self, held: &BTreeMap<String, PendingTask>) -> Result<(), PendingError> {
+        if self.path.as_os_str().is_empty() {
+            return Ok(());
+        }
+        let write_err = |source| PendingError::Write {
+            path: self.path.clone(),
+            source,
+        };
+        if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent).map_err(write_err)?;
+        }
+        let raw = serde_json::to_string_pretty(held).map_err(|source| PendingError::Parse {
+            path: self.path.clone(),
+            source,
+        })?;
+        let tmp = self.path.with_extension("tmp");
+        std::fs::write(&tmp, raw).map_err(write_err)?;
+        std::fs::rename(&tmp, &self.path).map_err(write_err)?;
+        Ok(())
+    }
+}
+
 /// Adds one suppression, bounded by [`SUPPRESSION_CAP`].
 ///
 /// Dropped whole at the cap rather than evicted one by one: there is no recency to evict on —
@@ -384,6 +588,91 @@ mod tests {
         // hit still suppresses.
         state.suppress_task("t_0");
         assert!(state.is_task_suppressed("t_0"));
+    }
+
+    fn pending(index: i64) -> PendingTask {
+        PendingTask {
+            owner: "terraphim".into(),
+            repo: "gitea".into(),
+            index,
+            title: "automations daemon".into(),
+            body: format!("gitea-ref: terraphim/gitea#{index}"),
+            idempotency_key: format!("gitea:terraphim/gitea#{index}"),
+        }
+    }
+
+    /// The R6 P1 this closes: the gate cannot live in a kanban status, because `hermes kanban
+    /// list` promotes a blocked task by reading it — so the sweep looking for a task to release
+    /// released every one of them. The gate is this file instead, and the property it has to
+    /// have is that a *restart* does not open it.
+    #[test]
+    fn the_approval_gate_survives_a_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state").join("bridge-state.json");
+
+        let gate = PendingApprovals::load(&path).expect("an absent file is an empty gate");
+        assert!(gate.is_empty());
+        assert!(gate.hold(pending(57)).expect("holds"), "newly held");
+        assert!(
+            !gate.hold(pending(57)).expect("holds"),
+            "an issue with no task is still ready, so every inbound sweep re-offers it"
+        );
+        gate.hold(pending(58)).expect("holds");
+
+        // The moral equivalent of a restart: nothing of the gate is in this process any more.
+        let reloaded = PendingApprovals::load(&path).expect("reloads");
+        assert_eq!(reloaded.len(), 2);
+        assert_eq!(
+            reloaded.held().iter().map(|p| p.index).collect::<Vec<_>>(),
+            vec![57, 58],
+            "held in idempotency-key order, and carrying what `create` needs"
+        );
+        assert_eq!(reloaded.held()[0].body, "gitea-ref: terraphim/gitea#57");
+
+        // Releasing is what a 🐝 does, and it is durable too — otherwise the next sweep would
+        // re-create the task it just created.
+        assert!(reloaded.release("gitea:terraphim/gitea#57").expect("releases"));
+        assert!(
+            !reloaded.release("gitea:terraphim/gitea#57").expect("releases"),
+            "releasing twice is a no-op, not an error: a save that failed is retried"
+        );
+        let again = PendingApprovals::load(&path).expect("reloads");
+        assert_eq!(again.len(), 1);
+        assert_eq!(again.held()[0].index, 58);
+    }
+
+    #[test]
+    fn a_corrupt_gate_is_a_named_error_rather_than_an_open_gate() {
+        // Failing closed is not an option here — there is nothing to fail closed *to*, since
+        // the gate holds work that has not been created. So it must be loud: an unparsable
+        // file that silently became an empty gate would re-create every held task on the next
+        // 🐝 sweep and forget which issues were waiting.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bridge-state.json");
+        std::fs::write(&path, "{not json").expect("write");
+        let err = PendingApprovals::load(&path).expect_err("must not decode");
+        assert!(matches!(err, PendingError::Parse { .. }), "{err:?}");
+        assert!(err.to_string().contains("bridge-state.json"), "{err}");
+
+        // An empty file is an empty gate: that is what a half-finished first write looks like.
+        std::fs::write(&path, "  \n").expect("write");
+        assert!(PendingApprovals::load(&path).expect("loads").is_empty());
+    }
+
+    /// Same argument as the suppression sets, with one extra property that makes the cap free:
+    /// every dropped entry is rebuilt by the next inbound sweep, because an issue with no task
+    /// is still ready.
+    #[test]
+    fn the_approval_gate_is_bounded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let gate = PendingApprovals::load(&dir.path().join("bridge-state.json")).expect("loads");
+        for i in 0..PENDING_CAP + 10 {
+            gate.hold(pending(i as i64)).expect("holds");
+        }
+        assert!(gate.len() <= PENDING_CAP);
+        // …and the bound is the only thing that changed.
+        gate.hold(pending(1)).expect("holds");
+        assert!(gate.held().iter().any(|p| p.index == 1));
     }
 
     /// Counters are only removed on success, so the permanently-failing tasks — the ones this

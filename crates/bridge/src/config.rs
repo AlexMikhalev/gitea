@@ -119,16 +119,19 @@ pub struct KanbanConfig {
     /// Tenant namespace, when the board is shared.
     #[serde(default)]
     pub tenant: Option<String>,
-    /// Create tasks blocked, so a 🐝 is what releases them to a worker.
+    /// Hold each ready issue until a 🐝, and create **no** kanban task before it arrives.
     ///
-    /// This is what makes the approval leg reachable at all. `hermes kanban create` has no
-    /// `--status` flag and defaults to **`ready`** — a created task is immediately
-    /// dispatchable — so with this off, an issue reaching the ready endpoint runs an agent
-    /// with no human in the loop, and the approval sweep (which covers `blocked` and
-    /// `todo`) never sees a bridge-created task. With it on, `--initial-status blocked` is
-    /// passed, and [`crate::approval`] is what returns the task to `ready`.
+    /// The hold is bridge-side — [`crate::state::PendingApprovals`], persisted to
+    /// [`Config::state_file`] — and not a kanban status, because a kanban status cannot hold
+    /// it: on hermes v0.19.0 `hermes kanban list` *promotes* a blocked task by reading it, so
+    /// a task created `--initial-status blocked` was released by the very sweep that went
+    /// looking for one to release. With no task created there is nothing for kanban to
+    /// promote and nothing for a worker to claim.
     ///
-    /// Turn it off deliberately, for a board where the Gitea triage *is* the approval.
+    /// With this off, every ready issue becomes a task immediately, and `hermes kanban create`
+    /// has no `--status` flag and defaults to **`ready`** — immediately claimable — so an agent
+    /// runs it with no human in the loop. Turn it off deliberately, for a board where the Gitea
+    /// triage *is* the approval.
     #[serde(default = "default_true")]
     pub require_approval: bool,
 }
@@ -254,6 +257,15 @@ pub struct Config {
     /// Optional declarative rules file. See [`crate::rules`].
     #[serde(default)]
     pub rules_file: Option<PathBuf>,
+    /// Where the approval gate keeps the issues it is holding.
+    ///
+    /// This is the gate — see [`crate::state::PendingApprovals`] and
+    /// [`KanbanConfig::require_approval`]. It is read at startup and rewritten whenever an
+    /// issue is held or released, so the daemon needs write access to it and to its directory.
+    /// Only [`KanbanConfig::require_approval`] makes it load-bearing; with the gate off it
+    /// stays empty.
+    #[serde(default = "default_state_file")]
+    pub state_file: PathBuf,
 }
 
 /// Configuration load / validation failures.
@@ -389,6 +401,18 @@ impl Config {
                     .into(),
             ));
         }
+        // The gate lives in this file, so an unwritable path is not a cosmetic problem: with
+        // `require_approval` on, an issue that cannot be *held* is an issue the bridge would
+        // otherwise have to either create unapproved or drop. Neither is acceptable, so an
+        // empty path is refused here rather than discovered on the first ready issue.
+        if self.state_file.as_os_str().is_empty() {
+            return Err(ConfigError::Invalid(
+                "state_file is required: it is where the approval gate holds ready issues that \
+                 have not been approved yet, and the gate cannot be held in kanban — `hermes \
+                 kanban list` promotes a blocked task by reading it"
+                    .into(),
+            ));
+        }
         if self.approval.reaction.trim().is_empty() {
             return Err(ConfigError::Invalid("approval.reaction is required".into()));
         }
@@ -464,6 +488,9 @@ fn default_approval_interval_secs() -> u64 {
 }
 fn default_approval_reaction() -> String {
     DEFAULT_APPROVAL_REACTION.into()
+}
+fn default_state_file() -> PathBuf {
+    PathBuf::from("bridge-state.json")
 }
 fn default_true() -> bool {
     true
@@ -549,9 +576,11 @@ mod tests {
         assert_eq!(cfg.robot.binary, "gitea-robot");
         assert!(cfg.poll.skip_in_progress);
         assert_eq!(cfg.repos[0].slug(), "terraphim/gitea");
-        // The approval gate is only reachable because tasks are created blocked: kanban
-        // creates `ready` by default, which would dispatch an agent with no human in it.
+        // The gate defaults on, and it is bridge-side: no kanban task exists for a ready
+        // issue until a 🐝 arrives, because a kanban `blocked` status cannot hold it —
+        // `hermes kanban list` promotes a blocked task by reading it.
         assert!(cfg.kanban.require_approval);
+        assert_eq!(cfg.state_file, PathBuf::from("bridge-state.json"));
         assert_eq!(cfg.reconcile_interval().as_secs(), 300);
         // The ready endpoint is unpaged, so an absent cap must not mean "no cap".
         assert_eq!(cfg.poll.max_tasks_per_sweep, 25);
@@ -655,6 +684,15 @@ mod tests {
         let cfg: Config =
             serde_norway::from_str(&format!("{}robot:\n  wip_prefix: \"\"\n", minimal())).expect("parses");
         cfg.validate().expect("valid");
+    }
+
+    /// The gate is a file, so a config with nowhere to put it is a config with no gate.
+    #[test]
+    fn an_empty_state_file_is_rejected() {
+        let cfg: Config =
+            serde_norway::from_str(&format!("{}state_file: \"\"\n", minimal())).expect("parses");
+        let err = cfg.validate().expect_err("must reject");
+        assert!(err.to_string().contains("state_file"), "{err}");
     }
 
     #[test]

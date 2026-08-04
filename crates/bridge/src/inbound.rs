@@ -16,6 +16,7 @@
 use crate::config::RepoRef;
 use crate::gitea::{GiteaClient, GiteaError, ReadyIssue};
 use crate::hermes::{CreateTask, Kanban, KanbanError};
+use crate::state::{PendingApprovals, PendingTask};
 
 /// Trailer prefix that carries the Gitea coordinates on the kanban task body.
 ///
@@ -179,6 +180,11 @@ pub struct InboundReport {
     /// A cap that truncates in silence reads exactly like a board with nothing left to do,
     /// so this is carried out of the sweep and logged rather than dropped.
     pub deferred: usize,
+    /// Issue indices held at the approval gate rather than created.
+    ///
+    /// Every admitted issue lands here instead of in `resolved` when the gate is on: no
+    /// kanban task exists for it yet, and the 🐝 sweep is what creates one.
+    pub held: Vec<i64>,
 }
 
 impl InboundReport {
@@ -201,7 +207,14 @@ pub enum InboundError {
 
 /// Runs one inbound sweep over a single repository.
 ///
-/// At most `max_tasks` issues are turned into tasks, chosen by [`select_ready`].
+/// At most `max_tasks` issues are admitted, chosen by [`select_ready`].
+///
+/// `gate` is the approval gate. When it is `Some`, an admitted issue is **held** rather than
+/// created: no `hermes kanban create` runs at all, so no task exists for a worker to claim, and
+/// [`crate::state::PendingApprovals`] is what a 🐝 releases. That is the only place the gate can
+/// live — a task created `--initial-status blocked` is promoted out of `blocked` by the next
+/// `hermes kanban list`, which is the approval sweep's own first call. When it is `None` the
+/// task is created immediately, in kanban's default `ready`, with no human in the loop.
 pub async fn poll_once(
     gitea: &GiteaClient,
     kanban: &Kanban,
@@ -209,6 +222,7 @@ pub async fn poll_once(
     base_url: &str,
     skip_in_progress: bool,
     max_tasks: usize,
+    gate: Option<&PendingApprovals>,
 ) -> Result<InboundReport, InboundError> {
     let ready = gitea.ready(&repo.owner, &repo.repo, skip_in_progress).await?;
     let (selected, deferred) = select_ready(&ready.ready_issues, max_tasks);
@@ -227,6 +241,42 @@ pub async fn poll_once(
     }
     for issue in selected {
         let req = create_request(repo, issue, base_url);
+        if let Some(gate) = gate {
+            // Held, not created. Re-holding an issue is the steady state rather than an
+            // anomaly: an issue with no task is still ready, so it is offered every sweep —
+            // which is also what makes losing the gate file recoverable.
+            let entry = PendingTask {
+                owner: repo.owner.clone(),
+                repo: repo.repo.clone(),
+                index: issue.index,
+                title: req.title.clone(),
+                body: req.body.clone(),
+                idempotency_key: req.idempotency_key.clone(),
+            };
+            match gate.hold(entry) {
+                Ok(fresh) => {
+                    if fresh {
+                        tracing::info!(
+                            repo = %repo.slug(),
+                            index = issue.index,
+                            key = %req.idempotency_key,
+                            "ready issue held at the approval gate; no kanban task exists until a 🐝 arrives"
+                        );
+                    }
+                    report.held.push(issue.index);
+                }
+                Err(err) => {
+                    // Not merely a failed write: the gate is the only record that this issue
+                    // is waiting, and the alternative to holding it is creating it unapproved.
+                    tracing::error!(
+                        repo = %repo.slug(), index = issue.index, error = %err,
+                        "cannot hold a ready issue at the approval gate; it stays uncreated"
+                    );
+                    report.failed.push((issue.index, err.to_string()));
+                }
+            }
+            continue;
+        }
         match kanban.create(&req).await {
             Ok(id) => {
                 tracing::info!(

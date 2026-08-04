@@ -9,16 +9,20 @@
 //! between them — not a second rules engine. The fabric is inherited, not rebuilt:
 //!
 //! * [`inbound`] polls `GET /api/v1/robot/ready` and turns each ready issue into exactly
-//!   one kanban task, deduplicated by `--idempotency-key gitea:<owner>/<repo>#<index>`.
+//!   one kanban task, deduplicated by `--idempotency-key gitea:<owner>/<repo>#<index>` —
+//!   or, with the approval gate on, holds it and creates nothing until a 🐝 arrives.
 //! * [`outbound`] watches the kanban event stream for the five terminal kinds and maps
 //!   them back onto Gitea: `completed` opens a PR, the other four apply `status/blocked`.
 //! * [`rules`] parses declarative YAML rules whose action space is a closed allowlist —
 //!   there is no shell action, and no way to spell one.
 //! * [`approval`] polls 🐝 (`honeybee`) reactions as the human approval signal, because
 //!   reactions are not observable through the F2 event stream.
-//! * [`state`] holds the only in-process state in the crate: dead-letter guards for the
-//!   durable markers the three legs above depend on, and a cost cache for the reconcile
-//!   sweep. Losing it on restart costs at most one extra replay.
+//! * [`state`] holds the crate's state: dead-letter guards for the durable markers the three
+//!   legs above depend on and a cost cache for the reconcile sweep — losing those on restart
+//!   costs at most one extra replay — plus the approval gate itself
+//!   ([`state::PendingApprovals`]), which is durable because it has to be, and lives here
+//!   rather than in a kanban status because `hermes kanban list` promotes a blocked task by
+//!   reading it.
 
 pub mod approval;
 pub mod config;

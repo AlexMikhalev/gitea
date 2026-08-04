@@ -53,8 +53,8 @@ pub const TERMINAL_KINDS: [&str; 5] = ["completed", "blocked", "gave_up", "crash
 ///
 /// Enumerating widely is safe because the discrimination is done by
 /// [`crate::outbound::latest_terminal_kind`] on the task's *event trail*, not by its status:
-/// a task created `blocked` to await a 🐝 has no terminal event and is skipped whichever
-/// status listed it.
+/// a task that has not run yet has no terminal event and is skipped whichever status listed
+/// it.
 pub const RECONCILE_STATUSES: [&str; 9] = [
     "triage",
     "todo",
@@ -174,8 +174,9 @@ impl TaskDetail {
     /// The most recent event whose kind is one of [`TERMINAL_KINDS`].
     ///
     /// This is what the reconciliation sweep keys on rather than the task's *status*: a task
-    /// created with `--initial-status blocked` to await a 🐝 is `blocked` but has only a
-    /// `created` event, and reporting it to Gitea as a block would be a lie.
+    /// can hold a status it never ran into — `blocked` with only a `created` event on the
+    /// trail — and reporting that to Gitea as a block would be a lie about work that has not
+    /// started.
     pub fn last_terminal_event(&self) -> Option<&TaskEvent> {
         self.events
             .iter()
@@ -386,7 +387,11 @@ impl Kanban {
         }
     }
 
-    /// Whether created tasks wait for a 🐝 before a worker can claim them.
+    /// Whether the bridge holds a ready issue until a 🐝 rather than creating its task.
+    ///
+    /// Nothing in the argv depends on this any more — see [`Kanban::create_args`]. The gate is
+    /// [`crate::state::PendingApprovals`], and this is only how the inbound leg reads the
+    /// setting off the handle it already has.
     pub fn require_approval(&self) -> bool {
         self.require_approval
     }
@@ -412,20 +417,22 @@ impl Kanban {
     /// one ready issue return the same task id, because kanban returns the existing task
     /// rather than creating a duplicate.
     ///
-    /// `--initial-status blocked` is what makes acceptance criterion 5 hold. `create` has no
-    /// `--status` flag and its default is **`ready`** — verified against the shipped CLI, and
-    /// pinned by `create_lands_in_a_status_the_approval_sweep_covers` in `live_kanban.rs`.
-    /// A `ready` task is immediately claimable, so without this flag the task is dispatched
-    /// to an agent before any human sees it, and the approval sweep — which covers `blocked`
-    /// and `todo` — never has a bridge-created task to act on.
+    /// It deliberately does **not** pass `--initial-status blocked` any more, and that is the
+    /// whole of acceptance criterion 5's redesign. `create` has no `--status` flag and its
+    /// default is `ready` — immediately claimable — so the gate used to be a blocked task the
+    /// 🐝 released. On hermes v0.19.0 that hold does not exist: `hermes kanban list` **promotes
+    /// a blocked task by reading it** (probed twice on 2026-08-04, plain and with `--status
+    /// blocked`), and `approval_sweep`'s first act is a `kanban list`, so the sweep was what
+    /// released every gated task, unapproved and unlogged.
+    ///
+    /// The gate is therefore bridge-side: with `kanban.require_approval` on, this argv is not
+    /// built at all until a 🐝 has landed — the issue waits in
+    /// [`crate::state::PendingApprovals`] and no task exists for kanban to promote. Once it is
+    /// built, `ready` is the correct status: the human already approved.
     pub fn create_args(&self, req: &CreateTask) -> Vec<String> {
         let mut argv = self.prefix();
         argv.push("create".into());
         argv.push(req.title.clone());
-        if self.require_approval {
-            argv.push("--initial-status".into());
-            argv.push("blocked".into());
-        }
         argv.push("--body".into());
         argv.push(req.body.clone());
         argv.push("--idempotency-key".into());
@@ -864,37 +871,34 @@ mod tests {
         assert!(argv.last().map(String::as_str) == Some("--json"), "{joined}");
     }
 
+    /// The R6 P1, stated from the argv side: the gate is no longer a kanban status.
+    ///
+    /// `--initial-status blocked` was the whole gate, and on hermes v0.19.0 it holds nothing —
+    /// `kanban list` promotes a blocked task by reading it, and the approval sweep opens with a
+    /// `kanban list`. Passing it now would be worse than useless: it would put a freshly
+    /// *approved* task into a status a human has to release a second time.
     #[test]
-    fn create_blocks_the_task_so_the_approval_gate_is_reachable() {
-        // `hermes kanban create` has no `--status` and defaults to `ready`, which is
-        // immediately claimable. Without this flag AC5's promote/unblock branch is dead code
-        // and every ready issue reaches an agent unreviewed.
-        let argv = kanban().create_args(&CreateTask {
-            title: "t".into(),
-            body: "gitea-ref: o/r#1".into(),
-            idempotency_key: "gitea:o/r#1".into(),
-        });
-        let i = argv
-            .iter()
-            .position(|a| a == "--initial-status")
-            .expect("--initial-status present");
-        assert_eq!(argv[i + 1], "blocked");
-
-        let open = Kanban::new(&KanbanConfig {
-            require_approval: false,
-            ..KanbanConfig::default()
-        });
-        assert!(
-            !open
-                .create_args(&CreateTask {
-                    title: "t".into(),
-                    body: "b".into(),
-                    idempotency_key: "k".into(),
-                })
-                .iter()
-                .any(|a| a == "--initial-status"),
-            "opting out must leave kanban's own default alone"
-        );
+    fn create_never_asks_kanban_to_hold_the_gate() {
+        for require_approval in [true, false] {
+            let k = Kanban::new(&KanbanConfig {
+                require_approval,
+                ..KanbanConfig::default()
+            });
+            let argv = k.create_args(&CreateTask {
+                title: "t".into(),
+                body: "gitea-ref: o/r#1".into(),
+                idempotency_key: "gitea:o/r#1".into(),
+            });
+            assert!(
+                !argv.iter().any(|a| a == "--initial-status"),
+                "the gate is bridge-side; kanban's own default is correct once approved: {argv:?}"
+            );
+            assert_eq!(
+                k.require_approval(),
+                require_approval,
+                "the setting still reads back"
+            );
+        }
     }
 
     #[test]
@@ -956,9 +960,9 @@ mod tests {
 
     #[test]
     fn only_a_terminal_event_counts_as_one() {
-        // The reconciliation sweep keys on this rather than on status: a task created with
-        // `--initial-status blocked` to await a 🐝 is `blocked` but has only a `created`
-        // event, and must not be reported to Gitea as a block.
+        // The reconciliation sweep keys on this rather than on status: a task can be
+        // `blocked` with only a `created` event on its trail, and must not be reported to
+        // Gitea as a block.
         let gated: TaskDetail = serde_json::from_str(
             r#"{"task":{"id":"t_1","status":"blocked"},
                 "events":[{"kind":"created","payload":{"status":"blocked"},"created_at":1}]}"#,

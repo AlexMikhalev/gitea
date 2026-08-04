@@ -3,15 +3,19 @@
 
 //! `gitea-automations` — the F4 bridge daemon.
 //!
-//! Four concurrent legs, all of them stateless in this process:
+//! Four concurrent legs:
 //!
-//! * inbound — poll ready issues, create kanban tasks (deduplicated by idempotency key);
+//! * inbound — poll ready issues; hold them at the approval gate, or create their kanban
+//!   tasks directly when the gate is off (deduplicated by idempotency key);
 //! * outbound — watch the five terminal kanban events, return PRs / blocks to Gitea;
-//! * approval — poll 🐝 reactions, promote the tasks a human blessed;
+//! * approval — poll 🐝 reactions; create the task a human blessed, and release the tasks
+//!   kanban itself blocked;
 //! * reconcile — replay the terminal tasks whose Gitea feedback never landed.
 //!
 //! Nothing here owns liveness. Claims, heartbeats, reclaim and the circuit breaker are
 //! kanban's, so killing this process orphans nothing and restarting it duplicates nothing.
+//! The one piece of durable state this process does own is the approval gate — see
+//! [`bridge::state::PendingApprovals`], and the reason it cannot be kanban's.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,10 +23,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use bridge::approval::{ApprovalOutcome, Preflight, evaluate, preflight};
+use bridge::approval::{Approval, ApprovalOutcome, Preflight, evaluate, preflight};
 use bridge::config::{Config, RepoRef};
 use bridge::gitea::GiteaClient;
-use bridge::hermes::{Kanban, RECONCILE_STATUSES, TaskDetail};
+use bridge::hermes::{CreateTask, Kanban, RECONCILE_STATUSES, TaskDetail};
 use bridge::inbound::{GiteaRef, poll_once};
 use bridge::outbound::{
     OutboundPlan, PlanError, PlannedAction, TerminalKind, WatchLine, classify_watch_line, escalation_actions,
@@ -30,7 +34,7 @@ use bridge::outbound::{
 };
 use bridge::robot::{LabelCheck, Robot, check_blocked_label};
 use bridge::rules::{Action, RuleSet};
-use bridge::state::{BridgeState, ESCALATE_AFTER, MARKER_ATTEMPTS};
+use bridge::state::{BridgeState, ESCALATE_AFTER, MARKER_ATTEMPTS, PendingApprovals};
 
 /// Bridge between the Gitea shared board and the Hermes kanban execution fabric.
 #[derive(Debug, Parser)]
@@ -96,6 +100,16 @@ async fn main() -> Result<()> {
     let gitea = GiteaClient::new(&cfg.gitea).context("building the gitea client")?;
     let kanban = Kanban::new(&cfg.kanban);
     let robot = Robot::new(&cfg.robot);
+    // Loaded before anything runs, and fatal if it will not load: this file *is* the approval
+    // gate, so a corrupt one that quietly became an empty gate would forget which issues are
+    // waiting on a human and re-create them all on the next 🐝 sweep.
+    let pending = Arc::new(
+        PendingApprovals::load(&cfg.state_file)
+            .with_context(|| format!("approval gate state {}", cfg.state_file.display()))?,
+    );
+    // `None` is what turns the gate off, so the branch is taken once, here, rather than
+    // re-derived per sweep.
+    let gate = cfg.kanban.require_approval.then(|| pending.clone());
 
     match cli.command {
         Command::CheckRules { .. } => unreachable!("handled above"),
@@ -123,21 +137,32 @@ async fn main() -> Result<()> {
                     RuleSet::VALIDATION_ONLY_NOTICE
                 );
             }
-            // `hermes kanban create` has no `--status` flag and defaults to `ready`, which
-            // is immediately claimable. Whether a human sees an issue before an agent does
-            // therefore hangs entirely on this one setting, and getting it wrong is silent
-            // in both directions — so it is stated rather than assumed.
+            // Whether a human sees an issue before an agent does hangs entirely on this one
+            // setting, and getting it wrong is silent in both directions — so it is stated
+            // rather than assumed, along with *where* the gate is, because that is the part
+            // an operator would otherwise have to read the source to learn.
             if cfg.kanban.require_approval {
                 println!(
-                    "approval gate ON: tasks are created with --initial-status blocked, so a \
-                     {:?} reaction from a writer is what releases each one to a worker",
-                    cfg.approval.reaction
+                    "approval gate ON (held by this bridge, not by kanban): a ready issue is \
+                     recorded in {} and NO kanban task is created for it until a {:?} reaction \
+                     from a writer arrives; {} issue(s) held right now",
+                    cfg.state_file.display(),
+                    cfg.approval.reaction,
+                    pending.len()
+                );
+                println!(
+                    "note: the gate cannot be a kanban status — on hermes v0.19.0 `hermes kanban \
+                     list` promotes a blocked task by reading it, and the approval sweep's first \
+                     call is a `kanban list`, so a task created --initial-status blocked was \
+                     released by the very sweep looking for one to release. Creating nothing is \
+                     what closes that: there is no task for kanban to promote"
                 );
             } else {
                 println!(
-                    "warning: kanban.require_approval is off — `hermes kanban create` defaults \
-                     to `ready`, so every ready issue is dispatched to an agent with no human \
-                     approval, and the 🐝 leg only ever sees tasks kanban itself blocked"
+                    "warning: kanban.require_approval is off — every ready issue becomes a kanban \
+                     task at once, and `hermes kanban create` defaults to `ready`, so an agent is \
+                     dispatched with no human approval. The 🐝 leg then only ever sees tasks \
+                     kanban itself blocked"
                 );
             }
             // Not just "is a token set": a token that is neither site admin nor an admin
@@ -169,23 +194,30 @@ async fn main() -> Result<()> {
         }
         Command::PollOnce => {
             for repo in &cfg.repos {
-                inbound_sweep(&gitea, &kanban, &cfg, repo).await;
+                inbound_sweep(&gitea, &kanban, &cfg, repo, gate.as_deref()).await;
             }
             Ok(())
         }
         Command::ApprovalOnce => {
-            approval_sweep(&gitea, &kanban, &cfg, &BridgeState::new()).await;
+            approval_sweep(&gitea, &kanban, &cfg, &BridgeState::new(), &pending).await;
             Ok(())
         }
         Command::ReconcileOnce => {
             reconcile_sweep(&cfg, &kanban, &robot, &BridgeState::new()).await;
             Ok(())
         }
-        Command::Run => run(Arc::new(cfg), gitea, kanban, robot).await,
+        Command::Run => run(Arc::new(cfg), gitea, kanban, robot, pending, gate).await,
     }
 }
 
-async fn run(cfg: Arc<Config>, gitea: GiteaClient, kanban: Kanban, robot: Robot) -> Result<()> {
+async fn run(
+    cfg: Arc<Config>,
+    gitea: GiteaClient,
+    kanban: Kanban,
+    robot: Robot,
+    pending: Arc<PendingApprovals>,
+    gate: Option<Arc<PendingApprovals>>,
+) -> Result<()> {
     // Said once at startup rather than once per reaction. A token that cannot query
     // permissions leaves the approval leg permanently dead while every other leg, and the
     // process itself, looks healthy.
@@ -216,14 +248,33 @@ async fn run(cfg: Arc<Config>, gitea: GiteaClient, kanban: Kanban, robot: Robot)
         }
     }
 
+    // The third startup disclosure, and the one with no server-side probe behind it: whether a
+    // human sees an issue before an agent does. It is said out loud because the gate is *not*
+    // where a reader of `hermes kanban` would look for it — a kanban status cannot hold it, so
+    // this daemon holds it, and the file it holds it in is the thing to back up and to watch.
+    if cfg.kanban.require_approval {
+        tracing::info!(
+            state_file = %cfg.state_file.display(),
+            held = pending.len(),
+            "approval gate ON: no kanban task is created for a ready issue until an authorized \
+             🐝 lands. The hold is bridge-side because `hermes kanban list` promotes a blocked \
+             task by reading it (hermes v0.19.0), which is the approval sweep's own first call"
+        );
+    } else {
+        tracing::warn!(
+            "kanban.require_approval is off: every ready issue becomes a `ready` kanban task at \
+             once and is dispatched to an agent with no human approval"
+        );
+    }
+
     let mut inbound = {
-        let (cfg, gitea, kanban) = (cfg.clone(), gitea.clone(), kanban.clone());
+        let (cfg, gitea, kanban, gate) = (cfg.clone(), gitea.clone(), kanban.clone(), gate.clone());
         tokio::spawn(async move {
             let mut ticker = interval(cfg.ready_interval());
             loop {
                 ticker.tick().await;
                 for repo in &cfg.repos {
-                    inbound_sweep(&gitea, &kanban, &cfg, repo).await;
+                    inbound_sweep(&gitea, &kanban, &cfg, repo, gate.as_deref()).await;
                 }
             }
         })
@@ -235,12 +286,18 @@ async fn run(cfg: Arc<Config>, gitea: GiteaClient, kanban: Kanban, robot: Robot)
     let state = Arc::new(BridgeState::new());
 
     let mut approval = {
-        let (cfg, gitea, kanban, state) = (cfg.clone(), gitea.clone(), kanban.clone(), state.clone());
+        let (cfg, gitea, kanban, state, pending) = (
+            cfg.clone(),
+            gitea.clone(),
+            kanban.clone(),
+            state.clone(),
+            pending.clone(),
+        );
         tokio::spawn(async move {
             let mut ticker = interval(cfg.approval_interval());
             loop {
                 ticker.tick().await;
-                approval_sweep(&gitea, &kanban, &cfg, &state).await;
+                approval_sweep(&gitea, &kanban, &cfg, &state, &pending).await;
             }
         })
     };
@@ -319,7 +376,13 @@ fn interval(period: std::time::Duration) -> tokio::time::Interval {
     ticker
 }
 
-async fn inbound_sweep(gitea: &GiteaClient, kanban: &Kanban, cfg: &Config, repo: &RepoRef) {
+async fn inbound_sweep(
+    gitea: &GiteaClient,
+    kanban: &Kanban,
+    cfg: &Config,
+    repo: &RepoRef,
+    gate: Option<&PendingApprovals>,
+) {
     match poll_once(
         gitea,
         kanban,
@@ -327,12 +390,14 @@ async fn inbound_sweep(gitea: &GiteaClient, kanban: &Kanban, cfg: &Config, repo:
         &cfg.gitea.base_url,
         cfg.poll.skip_in_progress,
         cfg.poll.max_tasks_per_sweep,
+        gate,
     )
     .await
     {
         Ok(report) => tracing::info!(
             repo = %repo.slug(),
             resolved = report.resolved.len(),
+            held = report.held.len(),
             failed = report.failed.len(),
             deferred = report.deferred,
             "inbound sweep complete"
@@ -341,12 +406,200 @@ async fn inbound_sweep(gitea: &GiteaClient, kanban: &Kanban, cfg: &Config, repo:
     }
 }
 
-/// Sweeps 🐝 reactions for every bridge-created task waiting on a human.
+/// The 🐝 leg: both halves of it.
+///
+/// 1. [`gate_sweep`] — the ready issues this bridge is *holding*, which have no kanban task at
+///    all. An authorized 🐝 is what creates one. This is the approval gate.
+/// 2. [`release_sweep`] — the tasks kanban itself moved to `blocked` or `todo`, i.e. work that
+///    already ran and stopped for a human. An authorized 🐝 unblocks or promotes them.
+///
+/// They are separate because the first is a safety property and the second is a convenience:
+/// the gate decides whether an agent runs at all, and it is deliberately outside kanban, where
+/// nothing can lift it by accident. See [`bridge::state::PendingApprovals`].
+async fn approval_sweep(
+    gitea: &GiteaClient,
+    kanban: &Kanban,
+    cfg: &Config,
+    state: &BridgeState,
+    pending: &PendingApprovals,
+) {
+    gate_sweep(gitea, kanban, cfg, state, pending).await;
+    release_sweep(gitea, kanban, cfg, state).await;
+}
+
+/// Creates the kanban task for every held issue a human has approved.
+///
+/// This is the gate, and the whole of it: until this function runs, an issue admitted by the
+/// inbound leg has no task, so there is nothing for a worker to claim and nothing for kanban to
+/// promote. The previous design — create the task `--initial-status blocked` and unblock it
+/// here — does not hold on hermes v0.19.0, where `hermes kanban list` promotes a blocked task
+/// by reading it: [`release_sweep`]'s own first call released every gated task, with no 🐝 and
+/// no log line. Nothing in this crate could fix that, so the gate moved out of kanban.
+///
+/// Each step is idempotent, which is what makes a failure anywhere in the middle safe to retry
+/// on the next sweep: `create` dedups on the idempotency key and returns the same task, the
+/// consumed markers are matched line-exactly so they are written at most once, and releasing an
+/// issue that is no longer held is a no-op.
+async fn gate_sweep(
+    gitea: &GiteaClient,
+    kanban: &Kanban,
+    cfg: &Config,
+    state: &BridgeState,
+    pending: &PendingApprovals,
+) {
+    let held = pending.held();
+    let (mut released, mut waiting) = (0u64, 0u64);
+    for entry in &held {
+        // The gate outlives a config change, so an issue held for a repository this bridge no
+        // longer owns stays held rather than being created by whoever inherits the file.
+        if !cfg
+            .repos
+            .iter()
+            .any(|r| r.owner == entry.owner && r.repo == entry.repo)
+        {
+            continue;
+        }
+        match evaluate(gitea, &cfg.approval, &entry.owner, &entry.repo, entry.index).await {
+            Ok(ApprovalOutcome::Approved { approvals }) => {
+                let req = CreateTask {
+                    title: entry.title.clone(),
+                    body: entry.body.clone(),
+                    idempotency_key: entry.idempotency_key.clone(),
+                };
+                let task_id = match kanban.create(&req).await {
+                    Ok(id) => id,
+                    Err(err) => {
+                        tracing::error!(
+                            issue = entry.index, key = %entry.idempotency_key, error = %err,
+                            "approved, but kanban create failed; the issue stays held and the \
+                             next sweep retries it"
+                        );
+                        continue;
+                    }
+                };
+                let approver = approvals.first().map(|a| a.by.as_str()).unwrap_or("-");
+                tracing::info!(
+                    task = %task_id, issue = entry.index, by = %approver,
+                    "approval released a held issue into a kanban task"
+                );
+                // Read back rather than assumed empty: `create` returns the *existing* task
+                // when this entry is a re-hold of an issue already released, and writing its
+                // markers a second time would be comment spam on that task.
+                let detail = match kanban.show(&task_id).await {
+                    Ok(detail) => detail,
+                    Err(err) => {
+                        tracing::error!(
+                            task = %task_id, error = %err,
+                            "cannot resolve the task just created; leaving the issue held so the \
+                             next sweep records the approvals against it (create is idempotent)"
+                        );
+                        continue;
+                    }
+                };
+                consume_approvals(kanban, state, &task_id, &approvals, Some(&detail)).await;
+                if let Err(err) = pending.release(&entry.idempotency_key) {
+                    // The task exists, so the gate has already done its job; the cost of this
+                    // is one idempotent `create` per sweep until the file is writable again.
+                    tracing::error!(
+                        task = %task_id, key = %entry.idempotency_key, error = %err,
+                        "cannot record the release in the approval gate state"
+                    );
+                }
+                released += 1;
+            }
+            Ok(ApprovalOutcome::NotRequested) => waiting += 1,
+            Ok(ApprovalOutcome::NotAuthorized { reactors }) => tracing::info!(
+                issue = entry.index,
+                ?reactors,
+                "held issue: ignoring approval reaction, no reactor has write permission"
+            ),
+            Ok(ApprovalOutcome::Undetermined { reason, reactors }) => tracing::warn!(
+                issue = entry.index, ?reactors, %reason,
+                "held issue: approval undetermined; failing closed"
+            ),
+            Err(err) => tracing::error!(
+                issue = entry.index, error = %err,
+                "held issue: reaction poll failed"
+            ),
+        }
+    }
+    // Info rather than debug, unlike the release sweep: "how many issues is a human sitting on"
+    // is the number an operator actually wants, and it is the only place the gate is visible
+    // without reading the state file.
+    tracing::info!(
+        held = held.len(),
+        released,
+        waiting,
+        state_file = %pending.path().display(),
+        "approval gate sweep complete"
+    );
+}
+
+/// Records **every** currently-authorized approval on the issue as consumed on this task.
+///
+/// Not merely the one that did the releasing, and that is the fix rather than an
+/// afterthought. A reaction is durable and Gitea records nothing about it having been used, so
+/// each unconsumed 🐝 is a stored release. With one marker per release, two maintainers
+/// approving issue #57 *before* it ever ran meant: alex's 🐝 released it and was marked; the
+/// worker later blocked it with `needs_input`; the next 60s sweep found bo's still-unconsumed
+/// 🐝 from before the run and released it again — re-dispatching the agent onto a question
+/// nobody had answered, and invisibly, because [`bridge::outbound::BLOCK_MARKER`] suppresses
+/// the repeat Gitea comment.
+///
+/// The anti-shadowing property this is built beside still holds: a genuinely *new* 🐝 — removed
+/// and re-added, or a second maintainer reacting after the block — carries a different
+/// `created_at` and so a different fingerprint, which nothing here has written.
+async fn consume_approvals(
+    kanban: &Kanban,
+    state: &BridgeState,
+    task_id: &str,
+    approvals: &[Approval],
+    detail: Option<&TaskDetail>,
+) {
+    for approval in unconsumed(approvals, state, detail) {
+        if let Err(err) = kanban
+            .comment_with_retry(task_id, &approval.consumed_marker(), MARKER_ATTEMPTS)
+            .await
+        {
+            tracing::error!(
+                task = %task_id, fingerprint = %approval.fingerprint,
+                attempts = MARKER_ATTEMPTS, error = %err,
+                "cannot record the consumed approval after retries; suppressing this fingerprint \
+                 for the lifetime of this process to avoid a release loop. A fresh 🐝 (removed \
+                 and re-added) still releases the task, and a restart costs at most one extra \
+                 release"
+            );
+            state.suppress_fingerprint(&approval.fingerprint);
+        }
+    }
+}
+
+/// The authorized approvals this task does not already record as acted on.
+///
+/// Split out from [`consume_approvals`] so the property that fix rests on — *all* of them, not
+/// the one that did the releasing — is testable without a board behind it.
+fn unconsumed<'a>(
+    approvals: &'a [Approval],
+    state: &BridgeState,
+    detail: Option<&TaskDetail>,
+) -> Vec<&'a Approval> {
+    approvals
+        .iter()
+        .filter(|a| !detail.is_some_and(|d| a.is_consumed(d)))
+        // Suppressed means an earlier marker write for this fingerprint failed after its
+        // retries; re-attempting it every 60s is the loop the suppression exists to stop.
+        .filter(|a| !state.is_fingerprint_suppressed(&a.fingerprint))
+        .collect()
+}
+
+/// Sweeps 🐝 reactions for every bridge task kanban itself stopped for a human.
 ///
 /// `todo` and `blocked` are the two statuses a human decision can move; `triage` is the
-/// specifier's, not ours. With `kanban.require_approval` on, this is also the leg that
-/// releases a freshly created task — inbound creates it `blocked` precisely so that it does.
-async fn approval_sweep(gitea: &GiteaClient, kanban: &Kanban, cfg: &Config, state: &BridgeState) {
+/// specifier's, not ours. This is **not** the approval gate — see [`gate_sweep`] — because a
+/// kanban status cannot hold one: `hermes kanban list --status blocked` promotes what it lists
+/// on hermes v0.19.0, so what this sweep can do is limited to acting on a 🐝 for a task that
+/// already ran. Nothing here depends on kanban holding a task still.
+async fn release_sweep(gitea: &GiteaClient, kanban: &Kanban, cfg: &Config, state: &BridgeState) {
     // Same reason the reconcile sweep counts these: the loop below `continue`s past every task
     // whose body carries no `gitea-ref:` trailer, and that skip is bare — a leg evaluating no
     // task at all is otherwise indistinguishable in the log from a board with no 🐝 on it.
@@ -388,9 +641,12 @@ async fn approval_sweep(gitea: &GiteaClient, kanban: &Kanban, cfg: &Config, stat
                     // …and the in-process guard covers the case where that durable record
                     // could not be written at all: without it a marker write that failed
                     // after its retries releases the task again on every sweep.
-                    let Some(approval) = approvals.iter().find(|a| {
-                        !a.is_consumed(&detail) && !state.is_fingerprint_suppressed(&a.fingerprint)
-                    }) else {
+                    //
+                    // `unconsumed` rather than an open-coded predicate, so what decides to
+                    // release and what gets marked afterwards cannot drift apart: an approval
+                    // acted on but not marked is a stored release.
+                    let standing = unconsumed(&approvals, state, Some(&detail));
+                    let Some(approval) = standing.first() else {
                         tracing::debug!(
                             task = %task.id, issue = gref.index,
                             "every approval reaction on this issue has already been acted on \
@@ -409,27 +665,12 @@ async fn approval_sweep(gitea: &GiteaClient, kanban: &Kanban, cfg: &Config, stat
                             tracing::info!(task = %task.id, by = %approval.by, action, "approval promoted task");
                             // Written after the move, never before: a marker without a move
                             // would strand the task, whereas a move without a marker is
-                            // retried on the next sweep. That "retried on the next sweep" is
-                            // only safe while the marker eventually lands, so it is retried,
-                            // and a failure that survives the retries is a dead letter rather
-                            // than a warning: the same 🐝 would otherwise release this task
-                            // every 60 seconds forever, running an agent each time, while
-                            // Gitea shows nothing because BLOCK_MARKER suppresses the repeat
-                            // comment.
-                            if let Err(err) = kanban
-                                .comment_with_retry(&task.id, &approval.consumed_marker(), MARKER_ATTEMPTS)
-                                .await
-                            {
-                                tracing::error!(
-                                    task = %task.id, fingerprint = %approval.fingerprint,
-                                    attempts = MARKER_ATTEMPTS, error = %err,
-                                    "cannot record the consumed approval after retries; suppressing \
-                                     this fingerprint for the lifetime of this process to avoid a \
-                                     release loop. A fresh 🐝 (removed and re-added) still releases \
-                                     the task, and a restart costs at most one extra release"
-                                );
-                                state.suppress_fingerprint(&approval.fingerprint);
-                            }
+                            // retried on the next sweep. And written for *every* authorized
+                            // approval, not only the one that released this task — a surplus
+                            // pre-run 🐝 left pending is a stored release that would unblock
+                            // the next worker block with no human decision behind it. See
+                            // `consume_approvals`.
+                            consume_approvals(kanban, state, &task.id, &approvals, Some(&detail)).await;
                         }
                         Err(err) => {
                             tracing::error!(task = %task.id, action, error = %err, "promotion failed")
@@ -454,7 +695,7 @@ async fn approval_sweep(gitea: &GiteaClient, kanban: &Kanban, cfg: &Config, stat
     // Debug rather than info: this runs every 60s, and unlike the reconcile sweep it has
     // nothing to say when it did its job. It is here so that "no bridge task was evaluated at
     // all" is answerable without attaching a debugger to a daemon that looks healthy.
-    tracing::debug!(candidates, trailered, "approval sweep complete");
+    tracing::debug!(candidates, trailered, "approval release sweep complete");
 }
 
 /// Follows `kanban watch` and applies each terminal event to Gitea.
@@ -541,8 +782,8 @@ async fn outbound_loop(cfg: Arc<Config>, kanban: Kanban, robot: Robot, state: Ar
 /// daemon that was simply down at the time would otherwise drop that issue's feedback for
 /// good: no pull request, no comment, no label, one `error!` line and nothing to re-drive it.
 ///
-/// The sweep keys on the task's *event trail*, not its status. A task created with
-/// `--initial-status blocked` to await a 🐝 is `blocked` and has no terminal event, and
+/// The sweep keys on the task's *event trail*, not its status. A task can hold a status it
+/// never ran into — `blocked` with only a `created` event, `ready` after a crash-reclaim — and
 /// labelling its issue `status/blocked` would be a lie about work that never ran.
 ///
 /// It enumerates [`RECONCILE_STATUSES`] — every documented status — rather than the two a
@@ -691,12 +932,11 @@ fn triage(state: &BridgeState, task_id: &str, status: &str) -> Triage {
 
 /// What the sweep does with a task once `kanban show` has resolved its *event trail*.
 ///
-/// The trail, not the status: a task created `--initial-status blocked` to await a 🐝 is
-/// `blocked` and has no terminal event, and labelling its issue `status/blocked` would be a
-/// lie about work that never ran.
+/// The trail, not the status: a task can hold `blocked` with only a `created` event on its
+/// trail, and labelling its issue `status/blocked` would be a lie about work that never ran.
 #[derive(Debug)]
 enum Resolution {
-    /// No terminal event yet — awaiting a 🐝, or still running.
+    /// No terminal event yet — queued, claimed, or still running.
     Idle,
     /// Its terminal event is confirmed already reported to Gitea.
     Reported,
@@ -796,6 +1036,13 @@ async fn apply_event(
 /// sweep arriving inside that window sees an unmarked task and plans the same actions:
 /// `create-pull` probes for an existing pull request and adding a label twice is a no-op, but
 /// the reason comment is not idempotent, so the user's issue would carry it twice.
+///
+/// The claim closes the *overlapping* case. It cannot close the sequential one on its own: the
+/// plan was computed from a `TaskDetail` read before the claim was taken — the reconcile sweep
+/// pays a `kanban show` subprocess in between — so the other leg can have finished the whole
+/// apply, written its marker and dropped its claim inside that gap, leaving a plan built from a
+/// detail that is now stale. So the task is re-read *under* the claim and the marker this plan
+/// would write is checked again before anything is applied.
 async fn apply_plan(
     cfg: &Config,
     kanban: &Kanban,
@@ -821,6 +1068,36 @@ async fn apply_plan(
         tracing::debug!(task = task_id, repo = %format!("{}/{}", plan.gitea_ref.owner, plan.gitea_ref.repo),
             "task references a repo this bridge does not own; ignoring");
         return;
+    }
+    // Re-read under the claim: see this function's own note. The check is the marker rather
+    // than a re-plan because the marker is exactly what `plan()` would refuse on, and it is
+    // the one line of the comment that must not be posted twice.
+    if let Some(marker) = plan_marker(plan) {
+        match kanban.show(task_id).await {
+            Ok(fresh) if fresh.has_marker(marker) => {
+                tracing::info!(
+                    task = task_id,
+                    marker,
+                    "another leg finished reporting this task while this plan was being prepared; \
+                     not applying it a second time"
+                );
+                return;
+            }
+            Ok(_) => {}
+            Err(err) => {
+                // Deliberately a skip rather than a best-effort apply. The plan in hand may
+                // already have landed, and the action that is not idempotent is the
+                // user-visible one; the reconcile sweep comes back for anything left unmarked,
+                // so waiting costs one interval and guessing costs a duplicate comment on
+                // somebody's issue.
+                tracing::warn!(
+                    task = task_id, error = %err,
+                    "cannot re-read the task before applying its plan; leaving it for the \
+                     reconciliation sweep rather than risking a duplicate reason comment"
+                );
+                return;
+            }
+        }
     }
 
     let (owner, repo, index) = (&plan.gitea_ref.owner, &plan.gitea_ref.repo, plan.gitea_ref.index);
@@ -1009,6 +1286,18 @@ fn first_line(body: &str) -> Option<&str> {
     body.lines().next().map(str::trim).filter(|s| !s.is_empty())
 }
 
+/// The durable marker this plan would write once every one of its actions has landed.
+///
+/// The first comment in the plan, because that is what [`record_marker`] records and what
+/// [`plan`] refuses on. Every plan ends in a comment, so this is `None` only for a plan with
+/// no actions at all.
+fn plan_marker(plan: &OutboundPlan) -> Option<&str> {
+    plan.actions.iter().find_map(|action| match action {
+        PlannedAction::Comment(body) => first_line(body),
+        _ => None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1072,7 +1361,7 @@ mod tests {
             Err(PlanError::AlreadyReported { .. })
         ));
 
-        // 3. Created blocked to await a 🐝: `blocked`, but it never ran. Keying on status
+        // 3. `blocked` with nothing but a `created` event: it never ran. Keying on status
         //    would label the issue and comment about work that has not started.
         let gated = task_detail(&[("created", 1)], &[]);
         assert_eq!(latest_terminal_kind(&gated), None);
@@ -1098,13 +1387,13 @@ mod tests {
     /// The R3 P1 this closes: the sweep's cache used to remember "nothing to report", which
     /// is not a stable fact.
     ///
-    /// On the default config (`require_approval: true`) every bridge task passes through an
-    /// idle `blocked` on its way in, so this is the *normal* path, not a corner:
+    /// Every bridge task passes through an idle status on its way in, so this is the *normal*
+    /// path, not a corner:
     ///
-    /// 1. inbound creates the task `--initial-status blocked`; the sweep lists it under
-    ///    `blocked`, finds only a `created` event, and used to cache `(t_1, "blocked")`;
-    /// 2. a 🐝 releases it → `ready` → `running`; the worker blocks it → `blocked` again,
-    ///    now with a `blocked` event on the trail;
+    /// 1. the task is created and sits unclaimed; the sweep lists it, finds only a `created`
+    ///    event, and used to cache `(t_1, <that status>)`;
+    /// 2. a worker claims and runs it, then blocks it — now with a `blocked` event on the
+    ///    trail, in a status it may well have been idle in before;
     /// 3. the watch leg's apply fails (the R2 case: `status/blocked` missing, `edit-issue`
     ///    refuses at action 0), leaving the task deliberately unmarked;
     /// 4. the next sweep hit the cache and skipped it — for the process lifetime, while its
@@ -1118,7 +1407,7 @@ mod tests {
         let state = BridgeState::new();
         let label = "status/blocked";
 
-        // Sweep 1 — created blocked to await a 🐝. Nothing to report, and — the fix —
+        // Sweep 1 — created, unclaimed, idle in `blocked`. Nothing to report, and — the fix —
         // nothing the sweep is allowed to remember.
         assert_eq!(triage(&state, "t_1", "blocked"), Triage::Resolve);
         let gated = task_detail(&[("created", 1)], &[]);
@@ -1185,6 +1474,113 @@ mod tests {
                 .expect("escalates");
             assert_eq!(actions.len(), 1);
             assert_eq!(actions[0].action(), Action::Comment);
+        }
+    }
+
+    /// The R6 P2 this closes: one marker per release left every *other* authorized 🐝 pending
+    /// forever, and a pending 🐝 is a stored release.
+    ///
+    /// Two maintainers approve issue #57 before it runs. alex's releases it and is marked; the
+    /// worker later blocks it with `needs_input`; the next 60s sweep finds bo's still-unconsumed
+    /// 🐝 from *before* the run and releases it again, re-dispatching the agent onto a question
+    /// nobody answered — invisibly, because `BLOCK_MARKER` suppresses the repeat Gitea comment.
+    #[test]
+    fn releasing_a_task_consumes_every_approval_standing_at_the_time() {
+        let state = BridgeState::new();
+        let at = "2026-08-04T16:23:00Z";
+        let approvals = vec![
+            Approval {
+                by: "alex".into(),
+                fingerprint: format!("alex@{at}"),
+            },
+            Approval {
+                by: "bo".into(),
+                fingerprint: format!("bo@{at}"),
+            },
+        ];
+
+        // Nothing recorded yet: both are written, not just the one that does the releasing.
+        let fresh = task_detail(&[("created", 1)], &[]);
+        assert_eq!(
+            unconsumed(&approvals, &state, Some(&fresh))
+                .iter()
+                .map(|a| a.by.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alex", "bo"],
+        );
+
+        // After the release both are marked, so the worker's later block is *not* released by
+        // a reaction that was standing before the task ever ran.
+        let released = task_detail(
+            &[("created", 1), ("unblocked", 2), ("claimed", 3), ("blocked", 4)],
+            &[&approvals[0].consumed_marker(), &approvals[1].consumed_marker()],
+        );
+        assert!(unconsumed(&approvals, &state, Some(&released)).is_empty());
+
+        // …and the anti-shadowing property is untouched: a genuinely new 🐝 — removed and
+        // re-added, or a third maintainer reacting *after* the block — is a new fingerprint,
+        // so a human can still release the task without restarting anything.
+        let mut with_fresh = approvals.clone();
+        with_fresh.push(Approval {
+            by: "alex".into(),
+            fingerprint: "alex@2026-08-05T09:00:00Z".into(),
+        });
+        assert_eq!(
+            unconsumed(&with_fresh, &state, Some(&released))
+                .iter()
+                .map(|a| a.fingerprint.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alex@2026-08-05T09:00:00Z"],
+        );
+
+        // A fingerprint whose marker could not be written stays out, or the dead-letter guard
+        // would be re-attempted every sweep — which is the loop it exists to stop.
+        state.suppress_fingerprint(&approvals[1].fingerprint);
+        assert_eq!(
+            unconsumed(&approvals, &state, Some(&fresh))
+                .iter()
+                .map(|a| a.by.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alex"],
+        );
+
+        // With no detail at all — the freshly created task on the gate path — everything
+        // unsuppressed is written.
+        assert_eq!(unconsumed(&approvals, &state, None).len(), 1);
+    }
+
+    /// The R6 P2 this closes: the apply-claim is taken *after* the plan was computed, so the
+    /// other leg can have finished the whole apply inside the gap. `create-pull` and the label
+    /// are idempotent; the reason comment is not.
+    ///
+    /// `apply_plan` re-reads the task under the claim and checks this marker, so what has to
+    /// hold is that the marker it checks is the one the plan would write.
+    #[test]
+    fn the_marker_rechecked_under_the_claim_is_the_one_the_plan_would_write() {
+        for (kind, marker) in [
+            (TerminalKind::Completed, PR_MARKER),
+            (TerminalKind::Blocked, BLOCK_MARKER),
+            (TerminalKind::GaveUp, BLOCK_MARKER),
+            (TerminalKind::Crashed, BLOCK_MARKER),
+            (TerminalKind::TimedOut, BLOCK_MARKER),
+        ] {
+            let detail = task_detail(&[("created", 1), (kind.event_kind(), 2)], &[]);
+            let planned = plan(&detail, kind, "status/blocked", true).expect("plans");
+            assert_eq!(
+                plan_marker(&planned),
+                Some(marker),
+                "{} must recheck the marker it writes",
+                kind.event_kind()
+            );
+
+            // …and that marker is exactly what makes the second application a no-op: a task
+            // the other leg already reported plans nothing at all.
+            let reported = task_detail(&[("created", 1), (kind.event_kind(), 2)], &[marker]);
+            assert!(reported.has_marker(marker));
+            assert!(matches!(
+                plan(&reported, kind, "status/blocked", true),
+                Err(PlanError::AlreadyReported { .. })
+            ));
         }
     }
 

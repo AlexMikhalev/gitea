@@ -35,7 +35,12 @@ var bridgeArgv = map[string]struct {
 	},
 	"create-pull": {
 		flagSet: func() *flag.FlagSet { fs, _ := createPullFlagSet(); return fs },
-		emitted: []string{"owner", "repo", "title", "head", "base", "body", "draft"},
+		// wip-prefix travels with draft and never without it (crates/bridge/src/robot.rs:133-137):
+		// Gitea has no draft field on a pull request, so draft-ness *is* the title prefix, and
+		// an instance that changed PULL_REQUEST.WORK_IN_PROGRESS_PREFIXES needs its own. Drop it
+		// from this flag set and every `completed` event becomes "flag provided but not
+		// defined" and an exit 1, with the bridge's own tests still green.
+		emitted: []string{"owner", "repo", "title", "head", "base", "body", "draft", "wip-prefix"},
 	},
 }
 
@@ -397,6 +402,39 @@ func TestCreatePullDraftUsesTheWIPPrefix(t *testing.T) {
 	}
 	if !strings.Contains(requests[1].Body, `"WIP: issue #57: daemon"`) {
 		t.Errorf("create body = %q, want a WIP-prefixed title", requests[1].Body)
+	}
+}
+
+// TestCreatePullHonoursACustomWIPPrefix is the only case --wip-prefix exists for.
+//
+// The default prefix needs no flag — runCreatePull falls back to defaultWIPPrefix — so a test
+// that passes the default (or the zero value) exercises the fallback, not the flag. On an
+// instance that changed PULL_REQUEST.WORK_IN_PROGRESS_PREFIXES, "WIP:" is not a
+// work-in-progress marker at all: the pull request would open as an ordinary, immediately
+// reviewable one while the bridge's config says draft, and the request would still succeed, so
+// nothing anywhere would report it.
+func TestCreatePullHonoursACustomWIPPrefix(t *testing.T) {
+	var requests []recordedRequest
+	writeTestServer(t, &requests, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"number": 1}`))
+	})
+
+	if _, err := runCreatePull(createPullArgs{
+		Owner: "o", Repo: "r", Title: "issue #57: daemon", Head: "h", Base: "main",
+		Draft: true, WIPPrefix: "[DRAFT]",
+	}); err != nil {
+		t.Fatalf("runCreatePull() = %v", err)
+	}
+	if !strings.Contains(requests[1].Body, `"[DRAFT] issue #57: daemon"`) {
+		t.Errorf("create body = %q, want the configured prefix, not the shipped default", requests[1].Body)
+	}
+	if strings.Contains(requests[1].Body, defaultWIPPrefix) {
+		t.Errorf("create body = %q, want no trace of the default prefix", requests[1].Body)
 	}
 }
 

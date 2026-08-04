@@ -50,10 +50,20 @@ in-tree is what makes the write-leg contract test (`TestBridgeWriteVerbsExist`) 
    worker did not push, `create-pull` fails; the reconcile sweep (6) keeps retrying, but no PR exists until the branch does.
 3. `blocked`/`gave_up`/`crashed`/`timed_out` each apply `status/blocked` + a reason comment naming the block kind.
 4. A rules YAML naming a non-allowlisted action fails to parse with a named error; no shell is ever spawned.
-5. 🐝 from a user with write permission promotes the task; 🐝 from anyone else is ignored and logged. Reachable only because
-   inbound passes `--initial-status blocked`: `hermes kanban create` has no `--status` flag and defaults to `ready`, which is
-   immediately claimable, so without it every ready issue would reach an agent unreviewed and this branch would be dead code.
+5. 🐝 from a user with write permission releases the issue to a worker; 🐝 from anyone else is ignored and logged.
    An approval is consumed once — the same 🐝 does not release the same task twice.
+
+   **Amended during implementation (R6, 2026-08-04): the gate is bridge-side, not a kanban status.** This originally read
+   "reachable only because inbound passes `--initial-status blocked`". That hold does not exist: on hermes v0.19.0
+   `hermes kanban list` *promotes* a blocked task by reading it — plain and with `--status blocked`, probed twice on a
+   scratch board — and the approval sweep's first call is a `kanban list`, so the sweep looking for a task to release was
+   itself what released every gated task to a worker, unapproved and unlogged. Nothing in the bridge can hold a task kanban
+   will not hold, so with `kanban.require_approval` on inbound now creates **no kanban task at all**: the ready issue is held
+   in the bridge's own `state_file` (`crates/bridge/src/state.rs`, `PendingApprovals`) and the approval leg runs
+   `hermes kanban create` when an authorized 🐝 arrives. An issue with no task cannot be listed, promoted or claimed.
+   Consuming an approval also marks *every* authorized 🐝 standing at that moment, not only the one that released the task:
+   an unconsumed reaction is a stored release, and one left pending would unblock the next worker block with no human
+   decision behind it.
 6. Restart mid-flight duplicates nothing (dedup is the key, not in-memory state); a crash orphans nothing (kanban owns liveness).
    A terminal event fires exactly once on `watch`, so a failed `gitea-robot` call or a daemon that was down is recovered by a
    periodic reconcile sweep over terminal tasks lacking a report marker — keyed on the event trail, not on status.

@@ -14,9 +14,9 @@ This is that bridge — **not** a second rules engine. The fabric is inherited, 
 
 | Leg | Source | Sink |
 | --- | --- | --- |
-| inbound (`src/inbound.rs`) | `GET /api/v1/robot/ready` | `hermes kanban create --idempotency-key gitea:<owner>/<repo>#<index> --initial-status blocked` |
+| inbound (`src/inbound.rs`) | `GET /api/v1/robot/ready` | the approval gate (`state_file`), or `hermes kanban create --idempotency-key gitea:<owner>/<repo>#<index>` with the gate off |
 | outbound (`src/outbound.rs`) | `hermes kanban watch --kinds completed,blocked,gave_up,crashed,timed_out` | `gitea-robot create-pull` / `edit-issue --add-labels` / `comment` |
-| approval (`src/approval.rs`) | `GET /repos/{o}/{r}/issues/{index}/reactions` | `hermes kanban promote` / `unblock` |
+| approval (`src/approval.rs`) | `GET /repos/{o}/{r}/issues/{index}/reactions` | `hermes kanban create` for a held issue; `promote` / `unblock` for a task kanban stopped |
 | reconcile (`main.rs`) | `hermes kanban list --status <each of the nine>` | the outbound sinks, replayed |
 
 The fourth leg is not decoration. `watch` is a live stream and a terminal kanban event fires
@@ -24,8 +24,9 @@ exactly once, so a single failed `gitea-robot` call — or a daemon that was sim
 the event fired — would otherwise drop that issue's feedback permanently: no pull request,
 no comment, no label, one `error!` line and nothing to re-drive it. The sweep looks for
 terminal tasks carrying no report marker and replays their plan. It keys on the task's
-*event trail*, not its status: a task created blocked to await a 🐝 is `blocked` and has
-never run, and labelling its issue would be a lie about work that has not started.
+*event trail*, not its status: a task can hold a status it never ran into — `blocked` with
+only a `created` event on the trail — and labelling its issue would be a lie about work that
+has not started.
 
 It enumerates *every* documented status rather than the two a terminal event was observed to
 leave behind (`done` after `complete`, `blocked` after `block`). Nothing pins where a
@@ -40,23 +41,23 @@ history, since `done` accumulates forever and every one of those tasks carries a
 marker that cannot un-write itself.
 
 A task with *nothing yet to report* is deliberately **not** remembered, and the asymmetry is
-the point: it can acquire something to report and come back to the same status. On the default
-config every task is created `blocked` to await a 🐝, so the ordinary path — idle in `blocked`,
-released, run, blocked again by the worker — lands back where it started, and a status-keyed
-"nothing to do" would blind the sweep to it for the lifetime of the process. Same shape for a
-task idle in `ready` that is claimed, crashes, and is returned to `ready` by crash-reclaim. The
-cost of not caching it is one `kanban show` per idle bridge task per sweep, bounded by work in
-flight rather than by history.
+the point: it can acquire something to report and come back to the same status. Every task
+passes through an idle status on its way in, so the ordinary path — idle, claimed, run, blocked
+by the worker — can land back where it started, and a status-keyed "nothing to do" would blind
+the sweep to it for the lifetime of the process. Same shape for a task idle in `ready` that is
+claimed, crashes, and is returned to `ready` by crash-reclaim. The cost of not caching it is one
+`kanban show` per idle bridge task per sweep, bounded by work in flight rather than by history.
 
 **The inbound leg is capped, and that cap bounds the whole daemon.**
 `GET /api/v1/robot/ready` returns *every* unblocked open issue — no limit, no paging
 (`routers/api/v1/robot/ready_graph.go:192-276`). Uncapped, a repository with 300 open issues
-means 300 `hermes kanban create` subprocesses per sweep, and then a *permanent* cost behind
-it: 300 tasks polled for a 🐝 every `approval_interval_secs` and one `kanban show` per idle
-task every `reconcile_interval_secs`, forever — because a task the bridge created and blocked
-still leaves its issue "ready" as far as `getInProgressIssues` (`ready_graph.go:279-301`) is
-concerned, so nothing drains the set. With `require_approval` off it is worse: it is unbounded
-*agent dispatch*.
+means 300 entries at the approval gate per sweep — or, with the gate off, 300 `hermes kanban
+create` subprocesses — and then a *permanent* cost behind it: 300 issues or tasks polled for a
+🐝 every `approval_interval_secs` and one `kanban show` per idle task every
+`reconcile_interval_secs`, forever, because an issue the bridge is holding (or whose task is
+merely blocked) still counts as "ready" as far as `getInProgressIssues`
+(`ready_graph.go:279-301`) is concerned, so nothing drains the set. With `require_approval` off
+it is worse: it is unbounded *agent dispatch*.
 
 `poll.max_tasks_per_sweep` (default 25) takes the top N by PageRank, ties broken by issue
 index. The ordering is what makes it a bound on the *board* rather than on one sweep: the same
@@ -94,6 +95,12 @@ for an existing pull request and adding a label twice is a no-op, but the reason
 idempotent, so a plan is claimed per task for the length of its application and the second leg
 steps aside rather than posting it again.
 
+The claim alone covers them *overlapping*; it cannot cover them being sequential, because the
+plan is computed from a `kanban show` read before the claim is taken. The other leg can finish
+its whole apply, write the marker and drop its claim inside that gap, leaving a plan built from
+a detail that is already stale. So the task is re-read under the claim and the marker that plan
+would write is checked again — if it is already there, nothing is applied.
+
 `src/rules.rs` parses the declarative rules file; `src/config.rs` is the daemon config;
 `src/gitea.rs` is the read client and `src/robot.rs` the write side. The three write verbs
 themselves live in `cmd/gitea-robot/write.go`, so that a write carries the agent's NIP-98
@@ -106,14 +113,16 @@ cargo build --manifest-path crates/Cargo.toml --release
 gitea-automations --config bridge.yaml check          # validate config (+ rules file)
 gitea-automations --config bridge.yaml check-rules rules.yaml
 gitea-automations --config bridge.yaml poll-once      # one inbound sweep; safe to repeat
-gitea-automations --config bridge.yaml approval-once  # one 🐝 sweep
+gitea-automations --config bridge.yaml approval-once  # one 🐝 sweep: creates the tasks the
+                                                      # gate is holding for approved issues,
+                                                      # and releases the ones kanban blocked
 gitea-automations --config bridge.yaml reconcile-once # replay unreported terminal tasks
 gitea-automations --config bridge.yaml run            # all four legs
 ```
 
 See `bridge.example.yaml` and `rules.example.yaml`.
 
-## Five things that bite
+## Six things that bite
 
 **`robot.blocked_label` must already exist in every repository.** Nothing here creates
 repository labels — creating one is not in the action space — and a label name Gitea cannot
@@ -168,23 +177,57 @@ startup.
 ```console
 $ gitea-automations --config bridge.yaml check
 approval OK: gitea.token user "bridge-bot" is an admin of every configured repository
-approval gate ON: tasks are created with --initial-status blocked, so a "honeybee" reaction
-from a writer is what releases each one to a worker
+approval gate ON (held by this bridge, not by kanban): a ready issue is recorded in
+bridge-state.json and NO kanban task is created for it until a "honeybee" reaction from a
+writer arrives; 3 issue(s) held right now
+note: the gate cannot be a kanban status — on hermes v0.19.0 `hermes kanban list` promotes a
+blocked task by reading it, …
 ```
 
-**A 🐝 is spent when it is used.** `hermes kanban create` has no `--status` flag and defaults
-to **`ready`**, which is immediately claimable — so `kanban.require_approval` (on by default)
-is the only thing standing between a ready issue and an agent run. It passes
-`--initial-status blocked`, and the approval leg is what returns the task to `ready`.
+**The approval gate is a file on this box, not a kanban status.** This is the part most worth
+knowing, because it is not where you would look for it.
 
-Because a reaction is durable on the issue and Gitea records nothing about it having been
-acted on, the bridge records that itself: promoting a task writes a
-`gitea-bridge: approval-consumed <user>@<created_at>` comment on the kanban task. Without it,
-a task approved once — which later blocks with `needs_input` or `transient` — is unblocked
-again by the *same* 🐝 on every 60s sweep: it runs, blocks, and repeats indefinitely,
-invisibly, because `BLOCK_MARKER` correctly suppresses the repeat Gitea comment. To release
-such a task again, remove and re-add the 🐝 (which changes its `created_at`, and so is a new
-approval), or have a second maintainer add theirs.
+The obvious design — create the task with `--initial-status blocked` and let the 🐝 unblock it
+— does not hold on the hermes this deploys against. On **v0.19.0**, `hermes kanban list`
+*promotes a blocked task by reading it*: `show` reports `blocked`, one `list` runs, and the
+next `show` reports `ready` with a `promoted` event appended to the trail. Both spellings do
+it, plain and `--status blocked` (probed twice on a scratch board, 2026-08-04). Since the 🐝
+sweep's very first call is a `kanban list`, the sweep looking for a task to release was itself
+what released every gated task to a worker — no human involved, nothing in the log, and then an
+empty list. The gate was not merely weak; the leg that implemented it was what defeated it.
+
+Nothing in this crate can hold a task kanban will not hold. So the gate moved to the only side
+that can: with `kanban.require_approval` on (the default), **inbound creates no kanban task at
+all**. It records the ready issue in `state_file` (`bridge-state.json` by default), and the
+approval leg runs `hermes kanban create` the moment an authorized 🐝 appears. An issue with no
+task cannot be listed, promoted or claimed, so there is nothing for hermes to release.
+
+Consequences worth stating:
+
+* `state_file` is operational state. Back it up with the deployment, and give the daemon write
+  access to it and its directory. It is rewritten (temp file + rename) on every hold and
+  release, so a crash mid-write leaves the previous contents rather than a truncated file.
+* Losing it is safe in both directions: nothing is released that was not approved, and the held
+  set is rebuilt by the next inbound sweep, because an issue with no task is still ready. One
+  ready interval of memory is the whole cost.
+* `check` prints the path and how many issues are held; `run` logs the same at startup.
+* `hermes kanban create` is still `ready`-by-default and that is now correct — by the time the
+  argv is built, a human has approved.
+
+**A 🐝 is spent when it is used.** A reaction is durable on the issue and Gitea records nothing
+about it having been acted on, so the bridge records that itself: releasing a task writes a
+`gitea-bridge: approval-consumed <user>@<created_at>` comment on the kanban task. Without it, a
+task approved once — which later blocks with `needs_input` or `transient` — is unblocked again
+by the *same* 🐝 on every 60s sweep: it runs, blocks, and repeats indefinitely, invisibly,
+because `BLOCK_MARKER` correctly suppresses the repeat Gitea comment.
+
+And every authorized approval standing at that moment is marked, not just the one that did the
+releasing. A 🐝 nobody has consumed is a *stored* release: two maintainers approving an issue
+before it ran used to mean alex's released it and bo's sat pending, so when the worker later
+blocked with `needs_input`, the next sweep spent bo's and re-dispatched the agent onto a
+question nobody had answered. To release a task again, remove and re-add the 🐝 (which changes
+its `created_at`, and so is a new approval), or have a maintainer who has not yet reacted add
+theirs — a genuinely new fingerprint is never one of the marked ones.
 
 **A base branch may not contain a slash.** The existence probe is
 `GET /repos/{o}/{r}/pulls/{base}/{head}` and only `{head}` is a catch-all segment
@@ -293,8 +336,12 @@ cargo test --manifest-path crates/Cargo.toml --test live_kanban -- --ignored --t
 / 403 / no-token reaction cases, and the token preflight). `tests/inbound_dedup.rs` drives
 two full poll cycles against wiremock plus a stub kanban and asserts one task results — and,
 for the cap, that a five-issue board produces exactly two `create` calls for the two highest
-PageRanks and reports the other three as deferred. `tests/live_kanban.rs` is the opt-in live
-half.
+PageRanks and reports the other three as deferred. It also pins the approval gate, which is a
+claim about a call that must *not* happen: with `require_approval` on, the stub kanban records
+no invocation at all, and the held issue is in the state file with the `gitea-ref:` trailer a
+later `create` needs. `tests/live_kanban.rs` is the opt-in live half, and is where the
+promote-on-read behaviour that forced the gate out of kanban is documented against a real
+hermes.
 
 All three Rust gates run in CI: `.github/workflows/pull-compliance.yml` has a `rust` job, fired
 by the `crates/**` and `cmd/gitea-robot/**` filters in `files-changed.yml` — or by the

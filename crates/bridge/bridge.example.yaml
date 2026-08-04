@@ -41,12 +41,17 @@ kanban:
   max_runtime: 2h
   max_retries: 2
   created_by: gitea-automations
-  # Create tasks blocked, so a 🐝 is what releases them to a worker.
+  # Hold each ready issue until a 🐝, and create NO kanban task before it arrives.
   #
-  # `hermes kanban create` has no --status flag and its default is `ready`, which is
-  # immediately claimable. With this off, an issue reaching the ready endpoint is dispatched
-  # to an agent with no human in the loop, and the approval sweep below - which covers
-  # `blocked` and `todo` - never sees a bridge-created task at all.
+  # The hold is bridge-side (see state_file at the bottom of this file), not a kanban status,
+  # and that is not a stylistic choice: on hermes v0.19.0 `hermes kanban list` PROMOTES a
+  # blocked task by reading it - plain and with --status blocked, both probed live. The
+  # approval sweep's first call is a `kanban list`, so a task created --initial-status blocked
+  # was released to a worker by the very sweep that went looking for one to release, with no
+  # human involved and nothing in the log. With no task created there is nothing to promote.
+  #
+  # With this off, every ready issue becomes a task at once and `hermes kanban create` defaults
+  # to `ready` - immediately claimable - so an agent runs it with no human in the loop.
   require_approval: true
 
 robot:
@@ -87,10 +92,11 @@ poll:
   reconcile_interval_secs: 300
   # The only bound on this daemon's steady-state cost. /api/v1/robot/ready returns EVERY
   # unblocked open issue - no limit, no paging (routers/api/v1/robot/ready_graph.go:192-276) -
-  # so uncapped, a board with 300 open issues means 300 `hermes kanban create` subprocesses
-  # per sweep, 300 tasks polled for a 🐝 every approval_interval_secs and 300 `kanban show`
-  # subprocesses per reconcile sweep, permanently: a task the bridge blocked still leaves its
-  # issue "ready" as far as getInProgressIssues is concerned.
+  # so uncapped, a board with 300 open issues means 300 entries at the approval gate per sweep
+  # (or 300 `hermes kanban create` subprocesses with the gate off), 300 issues polled for a 🐝
+  # every approval_interval_secs and 300 `kanban show` subprocesses per reconcile sweep,
+  # permanently: an issue the bridge is holding, or whose task is merely blocked, still counts
+  # as "ready" as far as getInProgressIssues is concerned.
   #
   # Selection is PageRank descending, ties broken by issue index, so consecutive sweeps pick
   # the SAME issues and re-creating them is deduplicated by idempotency key - the cap bounds
@@ -116,3 +122,14 @@ approval:
 # makes `check` parse the file and fail on a bad one; it does not change what the daemon
 # does. See rules.example.yaml.
 # rules_file: rules.yaml
+
+# Where the approval gate keeps the ready issues it is holding (see kanban.require_approval).
+# The daemon needs write access to this file and its directory; it is rewritten through a
+# temporary file and a rename on every hold and release, so a crash leaves the previous
+# contents rather than a truncated file.
+#
+# Back it up with the deployment, but losing it is not a safety failure in either direction:
+# nothing is released that was not approved, and the held set is rebuilt by the next inbound
+# sweep, because an issue with no task is still ready. `check` prints this path and how many
+# issues are held right now.
+state_file: bridge-state.json

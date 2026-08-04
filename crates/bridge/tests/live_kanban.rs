@@ -122,16 +122,17 @@ async fn the_idempotency_key_dedups_against_real_kanban() {
     );
 }
 
-/// Pins the fact the whole approval gate rests on: what status `hermes kanban create` yields.
+/// Pins the fact the whole approval gate now rests on: `hermes kanban create` yields a
+/// **claimable** task, whatever the bridge's `require_approval` setting says.
 ///
-/// `create` has no `--status` flag, and its default is `ready` — immediately claimable. So
-/// with `require_approval` off, an issue reaching the ready endpoint is dispatched to an
-/// agent with no human in the loop, and the approval sweep (which covers `blocked` and
-/// `todo`) never sees a bridge-created task: AC5's promote/unblock branch would be dead code.
-/// Nothing in-repo could pin this down but this test.
+/// That used to be the bug the `--initial-status blocked` flag existed to fix. It is now the
+/// premise: the gate is bridge-side, so by the time this argv is built a human has already
+/// approved, and `ready` is exactly right. What must hold is that `require_approval` no longer
+/// changes what kanban is asked for — because if it did, an *approved* task would land in a
+/// status a second human decision has to move it out of.
 #[tokio::test]
 #[ignore = "runs a real hermes kanban on a throwaway board"]
-async fn create_lands_in_a_status_the_approval_sweep_covers() {
+async fn create_lands_in_a_claimable_status_whatever_the_gate_setting_is() {
     let Some(board) = ScratchBoard::new("gate") else {
         return;
     };
@@ -147,11 +148,10 @@ async fn create_lands_in_a_status_the_approval_sweep_covers() {
         .expect("create");
     let detail = gated.show(&id).await.expect("show");
     assert_eq!(
-        detail.task.status, "blocked",
-        "a gated task must land in a status the approval sweep covers"
+        detail.task.status, "ready",
+        "a task created after approval must be immediately claimable, not gated a second time"
     );
 
-    // …and what happens without the gate, which is why it defaults on.
     let ungated = Kanban::new(&KanbanConfig {
         board: Some(board.slug.clone()),
         created_by: "gitea-automations-test".into(),
@@ -165,18 +165,18 @@ async fn create_lands_in_a_status_the_approval_sweep_covers() {
     let detail = ungated.show(&open_id).await.expect("show");
     assert_eq!(
         detail.task.status, "ready",
-        "kanban's own default is immediately claimable"
+        "kanban's own default, and the setting must not change it"
     );
 }
 
 /// The reconciliation sweep keys on the event trail, not the status — and this is why.
 ///
-/// A task created blocked to await a 🐝 is `blocked` and has never run. Keying on status
-/// would label its Gitea issue `status/blocked` and comment that it was blocked, about work
-/// that has not started.
+/// A freshly created task has never run, whatever status it holds. Keying on status would
+/// label its Gitea issue `status/blocked` and comment that it was blocked, about work that has
+/// not started — and `blocked` is a status a task can hold for reasons that are not a report.
 #[tokio::test]
 #[ignore = "runs a real hermes kanban on a throwaway board"]
-async fn an_approval_gated_task_has_nothing_to_reconcile() {
+async fn a_freshly_created_task_has_nothing_to_reconcile() {
     let Some(board) = ScratchBoard::new("gated") else {
         return;
     };
@@ -187,19 +187,17 @@ async fn an_approval_gated_task_has_nothing_to_reconcile() {
         .expect("create");
 
     let detail = kanban.show(&id).await.expect("show");
-    assert_eq!(detail.task.status, "blocked");
+    assert_eq!(detail.task.status, "ready");
     assert!(
         latest_terminal_kind(&detail).is_none(),
         "a task that never ran has no terminal event: {:?}",
         detail.events
     );
 
-    // Once it really is blocked by a worker, there is something to report. `unblock` first
-    // is the 🐝 leg's move, and it is not optional: kanban refuses to block an already
-    // blocked task, so this is the only order in which the real lifecycle reaches `blocked`.
-    board.run(&["unblock", &id]);
+    // Once it really is blocked by a worker, there is something to report.
     board.run(&["block", "--kind", "transient", &id, "flaked"]);
     let detail = kanban.show(&id).await.expect("show");
+    assert_eq!(detail.task.status, "blocked");
     assert_eq!(latest_terminal_kind(&detail), Some(TerminalKind::Blocked));
 }
 
@@ -228,9 +226,9 @@ async fn every_reconcile_status_is_one_kanban_will_list() {
     }
 
     // …and the sweep really finds the task through one of them. Which one is deliberately not
-    // asserted here — that is `a_gated_task_stays_where_the_approval_sweep_looks_for_it`'s
-    // subject, and it has its own answer. The reconcile sweep enumerates all nine and dedups
-    // by id, so being listed by *some* status is exactly what it needs.
+    // asserted here — hermes moves a task between statuses on its own (see
+    // `the_approval_gate_does_not_rely_on_kanban_holding_a_task`). The reconcile sweep
+    // enumerates all nine and dedups by id, so being listed by *some* status is what it needs.
     let mut listed = None;
     for status in RECONCILE_STATUSES {
         let tasks = kanban.list(Some(status)).await.expect("list");
@@ -258,51 +256,66 @@ async fn every_reconcile_status_is_one_kanban_will_list() {
     );
 }
 
-/// The approval gate's other half: a gated task must still be gated when the sweep looks.
+/// The approval gate does not depend on kanban holding a task still — and this is the probe
+/// that says why it cannot.
 ///
-/// `create_lands_in_a_status_the_approval_sweep_covers` pins where a gated task *starts*.
-/// This pins that it is still there one `kanban list` later — which is the only moment that
-/// matters, because `approval_sweep`'s first act is `kanban.list(Some("blocked"))`.
+/// **Observed on hermes v0.19.0** (probed twice on 2026-08-04, on a scratch board): `hermes
+/// kanban list` *promotes* a blocked task by reading it. `show` reports `blocked` across
+/// repeated calls; one `list` runs; the next `show` reports `ready` with a `promoted` event
+/// appended to the trail. Both spellings do it — plain `list` and `list --status blocked`.
 ///
-/// **Known red against hermes v0.19.0** (probed 2026-08-04, `hermes kanban list --status
-/// blocked` on a scratch board): that call *promotes* the task. `show` reports `blocked`
-/// across repeated calls, one `list` runs, and the next `show` reports `ready` with a
-/// `promoted` event appended to the trail. So on this hermes the approval sweep releases every
-/// gated task to a worker by the act of looking for one to release, no 🐝 involved, and then
-/// finds an empty list — the gate is not merely unreachable, the sweep is what defeats it.
+/// The old design put the gate exactly there: inbound created the task `--initial-status
+/// blocked`, and the 🐝 sweep unblocked it. `approval_sweep`'s first act was
+/// `kanban.list(Some("blocked"))`, so the sweep looking for a task to release was itself what
+/// released every gated task to a worker — no 🐝, no log line — and then found an empty list.
 ///
-/// Left failing on purpose. It is the F4 approval gate's central claim, nothing else in-repo
-/// asserts it, and it cannot be fixed from this crate: the gate needs a hold kanban will not
-/// lift by itself, or it needs to move out of kanban's status entirely.
+/// So the gate moved out of kanban entirely: with `require_approval` on the bridge creates no
+/// task at all until an authorized 🐝 arrives, and holds the issue in
+/// `bridge::state::PendingApprovals` meanwhile
+/// (`a_gated_sweep_creates_no_kanban_task_at_all`, which runs in CI, pins that half). What is
+/// left to check against a real hermes is that the promote-on-read behaviour can no longer
+/// touch the gate: whatever `list` does to a `blocked` task, the bridge is not relying on it.
+///
+/// This test therefore *documents* the behaviour rather than asserting a hold. It is not a
+/// contradiction that it passes either way — that is the point of the redesign. It fails only
+/// if `create` starts gating tasks again, which would put an approved task behind a second
+/// human decision that nothing would ever make.
 #[tokio::test]
 #[ignore = "runs a real hermes kanban on a throwaway board"]
-async fn a_gated_task_stays_where_the_approval_sweep_looks_for_it() {
+async fn the_approval_gate_does_not_rely_on_kanban_holding_a_task() {
     let Some(board) = ScratchBoard::new("gatehold") else {
         return;
     };
     let kanban = board.kanban();
+    assert!(kanban.require_approval(), "the shipped default gates");
     let id = kanban
         .create(&create_request(63, "live gate hold probe"))
         .await
         .expect("create");
     assert_eq!(
         kanban.show(&id).await.expect("show").task.status,
-        "blocked",
-        "a gated task must start blocked"
+        "ready",
+        "an approved task is claimable; the gate was upstream of this call ever being made"
     );
 
-    // Exactly what `approval_sweep` does, in the order it does it.
-    let blocked = kanban.list(Some("blocked")).await.expect("list blocked");
+    // The probe that killed the old design, kept because it is the only in-repo record of it
+    // and because a future hermes fixing it must not silently move the gate back into kanban.
+    board.run(&["block", "--kind", "needs_input", &id, "waiting for spec"]);
+    assert_eq!(kanban.show(&id).await.expect("show").task.status, "blocked");
+    let listed = kanban.list(Some("blocked")).await.expect("list blocked");
+    let after = kanban.show(&id).await.expect("show").task.status;
+    if after != "blocked" {
+        eprintln!(
+            "hermes still promotes on read: `kanban list --status blocked` moved {id} to \
+             {after:?} (listed {} task(s)). This is why the approval gate is bridge-side.",
+            listed.len()
+        );
+    }
+    // Whatever hermes did to it, the gate is unaffected: it is a file in this process's state
+    // directory, and nothing on a board can open it.
     assert!(
-        blocked.iter().any(|t| t.id == id),
-        "a gated task must be listed by the status it holds, or the 🐝 leg never sees it: \
-         {blocked:?}"
-    );
-    let detail = kanban.show(&id).await.expect("show");
-    assert_eq!(
-        detail.task.status, "blocked",
-        "listing the blocked tasks must not release them: {:?}",
-        detail.events
+        after == "blocked" || after == "ready",
+        "unexpected status after a plain list: {after:?}"
     );
 }
 
