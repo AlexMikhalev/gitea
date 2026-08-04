@@ -480,10 +480,8 @@ async fn create_then_block_plans_the_blocked_label_and_a_reason_comment() {
         .create(&create_request(58, "live block probe"))
         .await
         .expect("create");
-    // The task is created blocked so a human's 🐝 releases it; `unblock` stands in for the
-    // approval leg here. kanban refuses to block a task that is already blocked, so without
-    // this the `blocked` event below would never be recorded.
-    board.run(&["unblock", &id]);
+    // Post-R6 semantics: the kanban task is only created after approval, so it starts
+    // unblocked; we block it directly (needs_input) to exercise the blocked terminal leg.
     board.run(&["block", "--kind", "needs_input", &id, "waiting for spec"]);
 
     let detail = kanban.show(&id).await.expect("show");
