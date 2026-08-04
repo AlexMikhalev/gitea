@@ -3,11 +3,12 @@
 
 //! `gitea-automations` — the F4 bridge daemon.
 //!
-//! Three concurrent legs, all of them stateless in this process:
+//! Four concurrent legs, all of them stateless in this process:
 //!
 //! * inbound — poll ready issues, create kanban tasks (deduplicated by idempotency key);
 //! * outbound — watch the five terminal kanban events, return PRs / blocks to Gitea;
-//! * approval — poll 🐝 reactions, promote the tasks a human blessed.
+//! * approval — poll 🐝 reactions, promote the tasks a human blessed;
+//! * reconcile — replay the terminal tasks whose Gitea feedback never landed.
 //!
 //! Nothing here owns liveness. Claims, heartbeats, reclaim and the circuit breaker are
 //! kanban's, so killing this process orphans nothing and restarting it duplicates nothing.
@@ -27,7 +28,7 @@ use bridge::outbound::{
     OutboundPlan, PlanError, PlannedAction, TerminalKind, WatchLine, classify_watch_line, escalation_actions,
     latest_terminal_kind, plan,
 };
-use bridge::robot::Robot;
+use bridge::robot::{LabelCheck, Robot, check_blocked_label};
 use bridge::rules::{Action, RuleSet};
 use bridge::state::{BridgeState, ESCALATE_AFTER, MARKER_ATTEMPTS};
 
@@ -49,7 +50,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run all three legs until interrupted.
+    /// Run all four legs until interrupted.
     Run,
     /// Run one inbound sweep and exit. Safe to repeat: the idempotency key dedups.
     PollOnce,
@@ -145,6 +146,21 @@ async fn main() -> Result<()> {
                     println!("warning: approvals will fail closed — {reason}")
                 }
             }
+            // The label is action 0 of every non-`completed` plan and `edit-issue` fails hard
+            // on one the repository does not have, so a missing label does not merely skip the
+            // label: it stops the reason comment behind it from ever being posted. Nothing in
+            // the bridge creates repository labels, so this is the only place it can be said
+            // before the fact rather than once per sweep in the daemon's log.
+            match check_blocked_label(&gitea, robot.blocked_label(), &cfg.repos).await {
+                LabelCheck::Present => println!(
+                    "blocked label OK: {:?} exists in every configured repository",
+                    robot.blocked_label()
+                ),
+                LabelCheck::Missing { reason } => println!("warning: {reason}"),
+                LabelCheck::Unknown { reason } => {
+                    println!("warning: cannot verify robot.blocked_label — {reason}")
+                }
+            }
             Ok(())
         }
         Command::PollOnce => {
@@ -177,10 +193,29 @@ async fn run(cfg: Arc<Config>, gitea: GiteaClient, kanban: Kanban, robot: Robot)
         ),
     }
 
-    let inbound = {
+    // Said once at startup for the same reason: a `status/blocked` the repository does not
+    // have fails the *first* action of every blocked/gave_up/crashed/timed_out plan, so the
+    // reason comment behind it never posts and the issue stays silent. The daemon still runs —
+    // `completed` is unaffected, and the escalation comment reports the failure on the issue
+    // once it has retried — but this is the line that says why.
+    match check_blocked_label(&gitea, robot.blocked_label(), &cfg.repos).await {
+        LabelCheck::Present => {
+            tracing::info!(label = robot.blocked_label(), "blocked-label preflight passed")
+        }
+        LabelCheck::Missing { reason } => tracing::error!(
+            %reason,
+            "blocked-label preflight failed: every non-completed terminal event will fail at its \
+             first action until the label exists"
+        ),
+        LabelCheck::Unknown { reason } => {
+            tracing::warn!(%reason, "cannot verify robot.blocked_label")
+        }
+    }
+
+    let mut inbound = {
         let (cfg, gitea, kanban) = (cfg.clone(), gitea.clone(), kanban.clone());
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(cfg.ready_interval());
+            let mut ticker = interval(cfg.ready_interval());
             loop {
                 ticker.tick().await;
                 for repo in &cfg.repos {
@@ -195,10 +230,10 @@ async fn run(cfg: Arc<Config>, gitea: GiteaClient, kanban: Kanban, robot: Robot)
     // stops a marker write that failed *after its retries* from becoming an endless loop.
     let state = Arc::new(BridgeState::new());
 
-    let approval = {
+    let mut approval = {
         let (cfg, gitea, kanban, state) = (cfg.clone(), gitea.clone(), kanban.clone(), state.clone());
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(cfg.approval_interval());
+            let mut ticker = interval(cfg.approval_interval());
             loop {
                 ticker.tick().await;
                 approval_sweep(&gitea, &kanban, &cfg, &state).await;
@@ -206,7 +241,7 @@ async fn run(cfg: Arc<Config>, gitea: GiteaClient, kanban: Kanban, robot: Robot)
         })
     };
 
-    let outbound = {
+    let mut outbound = {
         let (cfg, kanban, robot, state) = (cfg.clone(), kanban.clone(), robot.clone(), state.clone());
         tokio::spawn(async move { outbound_loop(cfg, kanban, robot, state).await })
     };
@@ -215,10 +250,10 @@ async fn run(cfg: Arc<Config>, gitea: GiteaClient, kanban: Kanban, robot: Robot)
     // `watch` is a live stream and a terminal event fires exactly once, so a single failed
     // `gitea-robot` call — or a daemon that was down when the event fired — would otherwise
     // drop that issue's feedback for good.
-    let reconcile = {
+    let mut reconcile = {
         let (cfg, kanban, robot, state) = (cfg.clone(), kanban.clone(), robot.clone(), state.clone());
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(cfg.reconcile_interval());
+            let mut ticker = interval(cfg.reconcile_interval());
             loop {
                 ticker.tick().await;
                 reconcile_sweep(&cfg, &kanban, &robot, &state).await;
@@ -226,13 +261,58 @@ async fn run(cfg: Arc<Config>, gitea: GiteaClient, kanban: Kanban, robot: Robot)
         })
     };
 
-    tokio::signal::ctrl_c().await.context("waiting for ctrl-c")?;
-    tracing::info!("shutting down; kanban keeps every claim and heartbeat");
+    // Each leg is an endless loop, so *any* completion is a panic or an abort — and none of
+    // them is visible from outside: the process stays up, reports nothing, and a dead outbound
+    // or reconcile leg looks exactly like an idle board. That is the same failure
+    // `outbound_loop` guards against internally, so it is guarded around as well. Exiting
+    // non-zero hands the restart to the supervisor, which is the only thing here that can
+    // actually rebuild the leg's state.
+    let died = tokio::select! {
+        signal = tokio::signal::ctrl_c() => {
+            signal.context("waiting for ctrl-c")?;
+            None
+        }
+        outcome = &mut inbound => Some(("inbound", outcome)),
+        outcome = &mut approval => Some(("approval", outcome)),
+        outcome = &mut outbound => Some(("outbound", outcome)),
+        outcome = &mut reconcile => Some(("reconcile", outcome)),
+    };
     inbound.abort();
     approval.abort();
     outbound.abort();
     reconcile.abort();
-    Ok(())
+    match died {
+        None => {
+            tracing::info!("shutting down; kanban keeps every claim and heartbeat");
+            Ok(())
+        }
+        Some((leg, outcome)) => {
+            let how = match &outcome {
+                Ok(()) => "returned".to_string(),
+                Err(err) if err.is_panic() => "panicked".to_string(),
+                Err(err) => format!("ended ({err})"),
+            };
+            tracing::error!(leg, how, "a bridge leg stopped; shutting the daemon down");
+            Err(anyhow::anyhow!(
+                "the {leg} leg {how} and cannot be resumed in place; exiting so the supervisor \
+                 restarts the daemon rather than leaving it running with a dead leg"
+            ))
+        }
+    }
+}
+
+/// A ticker that does **not** burst.
+///
+/// [`tokio::time::interval`] defaults to [`MissedTickBehavior::Burst`], which replays every
+/// tick a slow sweep overran back to back with no delay. An unwarmed reconcile sweep is nine
+/// `kanban list` calls plus a `kanban show` subprocess per unsettled task, so overrunning is
+/// most likely exactly when the board is already slow — and bursting answers that by stacking
+/// more subprocesses onto it. Delaying is the intended semantics for every timed leg: the
+/// sweeps are idempotent, so a skipped tick costs nothing.
+fn interval(period: std::time::Duration) -> tokio::time::Interval {
+    let mut ticker = tokio::time::interval(period);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker
 }
 
 async fn inbound_sweep(gitea: &GiteaClient, kanban: &Kanban, cfg: &Config, repo: &RepoRef) {
@@ -622,13 +702,24 @@ async fn apply_plan(
         }
         Err((action, err)) => {
             let failures = state.record_plan_failure(task_id);
-            // A `completed` task whose head branch was never pushed fails here every time,
-            // and the retry has no ceiling: the only signal is a recurring `error!` line in
-            // the daemon's log, while the Gitea issue stays silent about work that finished
-            // and produced nothing — indistinguishable, to a human watching the board, from
-            // an issue nobody picked up. After enough failures, say so where they are looking.
-            if action == Action::OpenPr && failures >= ESCALATE_AFTER {
-                escalate_pull_failure(kanban, robot, state, plan, detail, failures, &err).await;
+            // Two failures reach here and neither one ever stops on its own: a `completed`
+            // task whose head branch was never pushed, and — for every other terminal kind —
+            // a `status/blocked` the repository does not have, which `edit-issue` refuses
+            // outright at action 0, taking the reason comment behind it with it. The retry has
+            // no ceiling either way: the only signal is a recurring `error!` line in the
+            // daemon's log, while the Gitea issue stays silent about work that ran and
+            // stopped — indistinguishable, to a human watching the board, from an issue nobody
+            // picked up. After enough failures, say so where they are looking.
+            //
+            // Gated on the *count*, not on which action failed: gating on `OpenPr` left the
+            // label case — four of the five terminal kinds — with no escalation at all.
+            if failures >= ESCALATE_AFTER {
+                let failure = PlanFailure {
+                    action,
+                    failures,
+                    error: &err,
+                };
+                escalate_plan_failure(kanban, robot, state, plan, detail, failure).await;
             }
         }
     }
@@ -704,37 +795,57 @@ async fn record_marker(kanban: &Kanban, state: &BridgeState, task_id: &str, mark
     }
 }
 
-/// Surfaces a pull request that repeatedly cannot be opened on the Gitea issue itself.
+/// One repeatedly-failing action of a plan, as the escalation path needs it.
+struct PlanFailure<'a> {
+    /// The action that failed — the plan stops at it, so it is also the *first* failure.
+    action: Action,
+    /// Consecutive failed applications of this task's plan.
+    failures: u32,
+    /// What the failing call said.
+    error: &'a str,
+}
+
+/// Surfaces a repeatedly-failing report on the Gitea issue itself.
 ///
-/// The retry is not abandoned — if the missing head branch is pushed later, the pull request
-/// still opens on a subsequent sweep — but the escalation comment is posted exactly once,
-/// guarded by its own durable marker so it survives a restart and does not collide with a
-/// genuine later block.
-async fn escalate_pull_failure(
+/// The retry is not abandoned — push the missing head branch, or create the missing label, and
+/// the original plan applies on a subsequent sweep — but the escalation comment is posted
+/// exactly once per failing action, guarded by its own durable marker so it survives a restart
+/// and does not collide with a genuine later report.
+///
+/// The escalation is a comment and nothing else. That is what makes it reachable for the case
+/// it most needs to cover: when the *label* is what cannot be applied, an escalation leading
+/// with a label would be retrying the one call that is broken.
+async fn escalate_plan_failure(
     kanban: &Kanban,
     robot: &Robot,
     state: &BridgeState,
     plan: &OutboundPlan,
     detail: &TaskDetail,
-    failures: u32,
-    error: &str,
+    failure: PlanFailure<'_>,
 ) {
+    let PlanFailure {
+        action,
+        failures,
+        error,
+    } = failure;
     let task_id = detail.task.id.as_str();
-    let Some(head) = plan.actions.iter().find_map(|a| match a {
-        PlannedAction::OpenPull(pr) => Some(pr.head.as_str()),
+    // The one fact that tells a human which failure this is — the head branch, or the label —
+    // read off the action that actually failed rather than assumed.
+    let context = plan.actions.iter().find_map(|a| match (action, a) {
+        (Action::OpenPr, PlannedAction::OpenPull(pr)) => Some(pr.head.clone()),
+        (Action::Label, PlannedAction::Label(labels)) => Some(labels.join(", ")),
         _ => None,
-    }) else {
-        return;
-    };
-    let actions = match escalation_actions(detail, robot.blocked_label(), head, failures, error) {
+    });
+    let actions = match escalation_actions(detail, action, context.as_deref(), failures, error) {
         Ok(actions) => actions,
         // Already escalated: keep retrying quietly rather than commenting again.
         Err(_) => return,
     };
     let (owner, repo, index) = (&plan.gitea_ref.owner, &plan.gitea_ref.repo, plan.gitea_ref.index);
     tracing::warn!(
-        task = task_id, %owner, %repo, index, head, failures,
-        "a completed task's pull request has failed repeatedly; reporting it on the issue"
+        task = task_id, %owner, %repo, index, failures,
+        action = action.name(), context = context.as_deref().unwrap_or("-"),
+        "a terminal task's report to gitea has failed repeatedly; reporting that on the issue"
     );
     if let Ok(Some(marker)) = apply_actions(robot, task_id, owner, repo, index, &actions).await {
         record_marker(kanban, state, task_id, &marker).await;
@@ -750,7 +861,9 @@ fn first_line(body: &str) -> Option<&str> {
 mod tests {
     use super::*;
     use bridge::hermes::{Task, TaskComment, TaskDetail, TaskEvent};
-    use bridge::outbound::{BLOCK_MARKER, PR_MARKER, blocked_comment, completed_comment};
+    use bridge::outbound::{
+        BLOCK_MARKER, PR_MARKER, blocked_comment, completed_comment, escalation_comment, escalation_marker,
+    };
 
     fn task_detail(events: &[(&str, i64)], comments: &[&str]) -> TaskDetail {
         TaskDetail {
@@ -830,6 +943,38 @@ mod tests {
         assert!(plan(&reclaimed, kind, "status/blocked", true).is_ok());
     }
 
+    /// The P1 this closes, stated as the shape that caused it.
+    ///
+    /// Escalation used to be gated on `action == Action::OpenPr`. Four of the five terminal
+    /// kinds never produce that action — they lead with `Label`, and `apply_actions` stops at
+    /// the first failure — so a `status/blocked` the repository does not have failed at action
+    /// 0 with no escalation possible: no label, no reason comment, nothing on the issue, and
+    /// the reconcile sweep replaying it every 300s forever.
+    #[test]
+    fn the_escalation_gate_covers_the_action_every_non_completed_plan_leads_with() {
+        for kind in [
+            TerminalKind::Blocked,
+            TerminalKind::GaveUp,
+            TerminalKind::Crashed,
+            TerminalKind::TimedOut,
+        ] {
+            let detail = task_detail(&[("created", 1), (kind.event_kind(), 2)], &[]);
+            let plan = plan(&detail, kind, "status/blocked", true).expect("plans");
+            assert_eq!(
+                plan.actions[0].action(),
+                Action::Label,
+                "{} leads with a label, so gating escalation on OpenPr cannot fire",
+                kind.event_kind()
+            );
+            // …and that action can escalate, by comment alone — the verb with no
+            // repository-side precondition, which is the one thing the label case can rely on.
+            let actions = escalation_actions(&detail, Action::Label, Some("status/blocked"), 3, "boom")
+                .expect("escalates");
+            assert_eq!(actions.len(), 1);
+            assert_eq!(actions[0].action(), Action::Comment);
+        }
+    }
+
     #[test]
     fn cli_parses_the_documented_invocations() {
         let cli = Cli::try_parse_from(["gitea-automations", "--config", "/etc/bridge.yaml", "run"])
@@ -869,6 +1014,17 @@ mod tests {
             )),
             Some(BLOCK_MARKER)
         );
+        // The escalation runs the same round trip — `record_marker` writes `first_line` of
+        // what was posted, and `escalation_actions` looks for `escalation_marker` — so a
+        // drift here would repost the escalation comment on every sweep.
+        for action in [Action::OpenPr, Action::Label, Action::Comment] {
+            assert_eq!(
+                first_line(&escalation_comment("t_1", action, Some("ctx"), 3, "boom")),
+                Some(escalation_marker(action).as_str()),
+                "{}",
+                action.name()
+            );
+        }
     }
 
     #[test]

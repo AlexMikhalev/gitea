@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"code.gitea.io/gitea/modules/nostr"
 	"code.gitea.io/gitea/modules/robotroom"
@@ -36,6 +37,18 @@ var (
 
 // nip98Kind is the NIP-98 "HTTP Auth" event kind.
 const nip98Kind = 27235
+
+// httpTimeout bounds one API round trip.
+//
+// http.DefaultClient has no timeout at all, so a half-open connection to the instance is not
+// an error: the request never returns and the process never exits. That is a wedged CLI when
+// a human runs it, and worse when the gitea-automations bridge does - it shells out to these
+// verbs from inside its outbound leg, which then stops reading kanban events while still
+// looking alive. Every request in this binary goes through httpClient for that reason.
+const httpTimeout = 60 * time.Second
+
+// httpClient is the only client this CLI makes requests with. See httpTimeout.
+var httpClient = &http.Client{Timeout: httpTimeout}
 
 // setRequestAuth sets the Authorization header for one API request.
 //
@@ -356,7 +369,7 @@ func addDepCmd() {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -405,7 +418,7 @@ func apiSendSafe(method, url, body string) (string, error) {
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("error making request: %v", err)
 	}

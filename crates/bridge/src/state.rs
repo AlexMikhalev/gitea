@@ -45,6 +45,16 @@ pub const ESCALATE_AFTER: u32 = 3;
 /// again, which is a bounded cost, whereas retaining the map is not.
 const SETTLED_CAP: usize = 50_000;
 
+/// Upper bound on the plan-failure counters.
+///
+/// Same argument as [`SETTLED_CAP`], and it bites sooner: an entry is removed only by
+/// [`BridgeState::clear_plan_failures`], on full success, so a task that can *never* succeed —
+/// a head branch nobody ever pushes, a label nobody ever creates — keeps its counter for the
+/// lifetime of a process meant to run for months. At the cap the counters are dropped whole:
+/// the cost is that an already-escalated task counts up to [`ESCALATE_AFTER`] again, and its
+/// escalation is a no-op the second time because that marker is durable in kanban.
+const FAILURES_CAP: usize = 10_000;
+
 /// Per-process guards shared by the approval, outbound and reconcile legs.
 #[derive(Debug, Default)]
 pub struct BridgeState {
@@ -131,6 +141,9 @@ impl BridgeState {
     /// Counts one failed application of a task's plan and returns the running total.
     pub fn record_plan_failure(&self, task_id: &str) -> u32 {
         let mut inner = self.lock();
+        if inner.failures.len() >= FAILURES_CAP && !inner.failures.contains_key(task_id) {
+            inner.failures.clear();
+        }
         let counter = inner.failures.entry(task_id.to_string()).or_insert(0);
         *counter = counter.saturating_add(1);
         *counter
@@ -206,5 +219,16 @@ mod tests {
         assert_eq!(state.record_plan_failure("t_2"), 1);
         state.clear_plan_failures("t_1");
         assert_eq!(state.record_plan_failure("t_1"), 1);
+    }
+
+    /// Counters are only removed on success, so the permanently-failing tasks — the ones this
+    /// map exists for — are exactly the entries that would never leave it.
+    #[test]
+    fn the_failure_counters_are_bounded() {
+        let state = BridgeState::new();
+        for i in 0..FAILURES_CAP + 10 {
+            state.record_plan_failure(&format!("t_{i}"));
+        }
+        assert!(state.lock().failures.len() <= FAILURES_CAP);
     }
 }

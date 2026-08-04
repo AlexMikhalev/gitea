@@ -249,7 +249,11 @@ jobs:
   # this file reaches it: without this job its tests are manual-only, and only the Go half
   # of the write-leg contract (TestBridgeWriteVerbsExist) would actually be enforced.
   rust:
-    if: needs.files-changed.outputs.rust == 'true'
+    # ORed with `actions`, like every other job in this file: the `rust` filter is
+    # `crates/**` + `Makefile` (files-changed.yml), so a PR that bumps the pinned toolchain
+    # below or edits these steps touches neither path and would ship without this job ever
+    # having run on it.
+    if: needs.files-changed.outputs.rust == 'true' || needs.files-changed.outputs.actions == 'true'
     needs: files-changed
     runs-on: ubuntu-latest
     permissions:

@@ -283,6 +283,33 @@ impl Config {
                 self.robot.base_branch
             )));
         }
+        // The label is the first action of every non-`completed` plan, and `gitea-robot
+        // edit-issue` fails hard on one the repository does not have — so a label that cannot
+        // be applied silences the reason comment behind it. Two spellings never can be, and
+        // both are caught here rather than once per terminal event:
+        //
+        // * empty — `--add-labels` rejects it as a usage error;
+        // * containing a comma — `add_labels_args` joins on commas and `splitLabels`
+        //   (cmd/gitea-robot/write.go) splits on them, so `needs,triage` is sent as two label
+        //   names, neither of which is the configured one.
+        //
+        // Whether the label *exists* is a question for the server, not for a YAML file:
+        // `crate::robot::check_blocked_label` asks it in `check` and at startup.
+        if self.robot.blocked_label.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "robot.blocked_label is required: it is the first action of every \
+                 blocked/gave_up/crashed/timed_out plan"
+                    .into(),
+            ));
+        }
+        if self.robot.blocked_label.contains(',') {
+            return Err(ConfigError::Invalid(format!(
+                "robot.blocked_label {:?} contains a comma; `gitea-robot edit-issue --add-labels` \
+                 takes a comma-separated list and splits on it, so this would be sent as two \
+                 label names rather than one",
+                self.robot.blocked_label
+            )));
+        }
         if self.approval.reaction.trim().is_empty() {
             return Err(ConfigError::Invalid("approval.reaction is required".into()));
         }
@@ -451,6 +478,21 @@ mod tests {
         let err = cfg.validate().expect_err("must reject");
         assert!(err.to_string().contains("release/1.0"), "{err}");
         assert!(err.to_string().contains("catch-all"), "{err}");
+    }
+
+    /// A blocked label that cannot be applied silences four of the five terminal kinds:
+    /// it is action 0 of their plan, and `edit-issue` fails hard on a label the repository
+    /// does not have, so the reason comment behind it is never posted.
+    #[test]
+    fn a_blocked_label_that_could_never_be_applied_is_rejected() {
+        for (yaml, needle) in [
+            ("robot:\n  blocked_label: \"\"\n", "required"),
+            ("robot:\n  blocked_label: needs,triage\n", "comma"),
+        ] {
+            let cfg: Config = serde_norway::from_str(&format!("{}{yaml}", minimal())).expect("parses");
+            let err = cfg.validate().expect_err("must reject");
+            assert!(err.to_string().contains(needle), "{err}");
+        }
     }
 
     #[test]

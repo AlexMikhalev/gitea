@@ -11,6 +11,7 @@
 use bridge::approval::{ApprovalOutcome, evaluate, preflight};
 use bridge::config::{ApprovalConfig, GiteaConfig, RepoRef};
 use bridge::gitea::{GiteaClient, GiteaError};
+use bridge::robot::{LabelCheck, check_blocked_label};
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -621,4 +622,86 @@ async fn preflight_rejects_a_missing_token() {
     let outcome = preflight(&client, &ApprovalConfig::default(), &repos()).await;
     assert!(!outcome.is_usable());
     assert!(outcome.reason().contains("gitea.token"), "{}", outcome.reason());
+}
+
+/// Mounts a paged label listing: `body` as page 1, an empty page 2.
+async fn mount_labels(server: &MockServer, body: &str) {
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/terraphim/gitea/labels"))
+        .and(query_param("page", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/terraphim/gitea/labels"))
+        .and(query_param("page", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+        .mount(server)
+        .await;
+}
+
+/// The P1 this covers: `status/blocked` is action 0 of every non-`completed` plan, and
+/// `gitea-robot edit-issue` fails hard on a label the repository does not have — so a
+/// missing label does not merely skip the label, it stops the reason comment behind it
+/// from ever being posted, on every sweep, forever, in silence. Nothing in the bridge
+/// creates repository labels, so probing for it is the only defence before the fact.
+#[tokio::test]
+async fn the_blocked_label_preflight_finds_a_label_that_exists() {
+    let server = MockServer::start().await;
+    mount_labels(
+        &server,
+        r#"[{"id":1,"name":"bug"},{"id":2,"name":"status/blocked"}]"#,
+    )
+    .await;
+    let client = GiteaClient::new(&config(&server)).expect("client");
+    let outcome = check_blocked_label(&client, "status/blocked", &repos()).await;
+    assert_eq!(outcome, LabelCheck::Present, "{}", outcome.reason());
+}
+
+#[tokio::test]
+async fn the_blocked_label_preflight_names_the_repo_that_lacks_it() {
+    let server = MockServer::start().await;
+    mount_labels(&server, r#"[{"id":1,"name":"bug"}]"#).await;
+    let client = GiteaClient::new(&config(&server)).expect("client");
+    let outcome = check_blocked_label(&client, "status/blocked", &repos()).await;
+    assert!(!outcome.is_present());
+    assert!(matches!(outcome, LabelCheck::Missing { .. }), "{outcome:?}");
+    assert!(
+        outcome.reason().contains("terraphim/gitea"),
+        "{}",
+        outcome.reason()
+    );
+}
+
+/// A case variant is not a match: the server resolves label names with a SQL `IN`
+/// (`models/issues/label.go:333-341`), which is case-sensitive on sqlite and Postgres, so
+/// `Status/Blocked` would be dropped exactly like a label that does not exist at all.
+#[tokio::test]
+async fn the_blocked_label_preflight_calls_out_a_case_mismatch() {
+    let server = MockServer::start().await;
+    mount_labels(&server, r#"[{"id":1,"name":"Status/Blocked"}]"#).await;
+    let client = GiteaClient::new(&config(&server)).expect("client");
+    let outcome = check_blocked_label(&client, "status/blocked", &repos()).await;
+    assert!(!outcome.is_present());
+    assert!(outcome.reason().contains("case"), "{}", outcome.reason());
+    assert!(
+        outcome.reason().contains("Status/Blocked"),
+        "{}",
+        outcome.reason()
+    );
+}
+
+/// A listing that fails is *not* an answer either way: reporting "missing" from a 500
+/// would send an operator hunting a label that is already there.
+#[tokio::test]
+async fn a_label_listing_that_fails_is_unknown_rather_than_missing() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/terraphim/gitea/labels"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let client = GiteaClient::new(&config(&server)).expect("client");
+    let outcome = check_blocked_label(&client, "status/blocked", &repos()).await;
+    assert!(matches!(outcome, LabelCheck::Unknown { .. }), "{outcome:?}");
 }

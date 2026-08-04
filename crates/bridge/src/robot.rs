@@ -15,7 +15,8 @@
 //!
 //! As everywhere in this crate, invocation is by argv — never `sh -c`.
 
-use crate::config::RobotConfig;
+use crate::config::{RepoRef, RobotConfig};
+use crate::gitea::GiteaClient;
 use crate::hermes::{KanbanError, run_argv};
 
 /// Handle on the `gitea-robot` CLI.
@@ -154,6 +155,99 @@ impl Robot {
     ) -> Result<String, KanbanError> {
         run_argv(&self.binary, &self.create_pull_args(owner, repo, pr)).await
     }
+}
+
+/// What the blocked-label preflight concluded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LabelCheck {
+    /// The label exists in every configured repository.
+    Present,
+    /// It is missing from at least one, where four of the five terminal kinds will fail.
+    Missing {
+        /// Human-readable explanation, naming the repositories and how to fix it.
+        reason: String,
+    },
+    /// The check could not be made — no answer either way.
+    Unknown {
+        /// Why it could not be made.
+        reason: String,
+    },
+}
+
+impl LabelCheck {
+    /// Whether the label is known to exist everywhere it is needed.
+    pub fn is_present(&self) -> bool {
+        matches!(self, Self::Present)
+    }
+
+    /// The explanation, whichever variant this is.
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::Present => "the blocked label exists in every configured repository",
+            Self::Missing { reason } | Self::Unknown { reason } => reason,
+        }
+    }
+}
+
+/// Probes whether [`RobotConfig::blocked_label`] actually exists in each configured repo.
+///
+/// A label name Gitea cannot resolve is not applied and not reported: `POST
+/// /issues/{index}/labels` answers 200 having silently dropped it, because
+/// `GetLabelIDsInRepoByNames` returns only what it found (`models/issues/label.go:333-341`).
+/// `gitea-robot edit-issue` turns that into a hard error by re-reading the issue's label set
+/// (`cmd/gitea-robot/write.go`) — which is right, but it means a missing label fails the
+/// *first* action of every `blocked`/`gave_up`/`crashed`/`timed_out` plan, so the reason
+/// comment never posts and the issue stays completely silent about work that ran and stopped.
+///
+/// Nothing in the bridge creates the label — creating repository labels is not one of the
+/// five allowlisted actions — so the only defence is to say so before the fact, here and in
+/// `check`, rather than once per sweep in a log nobody is reading.
+pub async fn check_blocked_label(gitea: &GiteaClient, label: &str, repos: &[RepoRef]) -> LabelCheck {
+    let want = label.trim();
+    if want.is_empty() {
+        return LabelCheck::Unknown {
+            reason: "robot.blocked_label is empty".into(),
+        };
+    }
+    let (mut missing, mut case_variants) = (Vec::new(), Vec::new());
+    for repo in repos {
+        let labels = match gitea.repo_labels(&repo.owner, &repo.repo).await {
+            Ok(labels) => labels,
+            Err(err) => {
+                return LabelCheck::Unknown {
+                    reason: format!("cannot list the labels of {}: {err}", repo.slug()),
+                };
+            }
+        };
+        if labels.iter().any(|l| l.name.trim() == want) {
+            continue;
+        }
+        // Reported apart from "absent" because it is a different fix and an easy one to
+        // stare past: `IN (name)` is case-sensitive on sqlite and Postgres, so `Status/Blocked`
+        // is simply not `status/blocked` there, however much it looks like it.
+        if let Some(found) = labels.iter().find(|l| l.name.trim().eq_ignore_ascii_case(want)) {
+            case_variants.push(format!("{} has {:?}", repo.slug(), found.name.trim()));
+        }
+        missing.push(repo.slug());
+    }
+    if missing.is_empty() {
+        return LabelCheck::Present;
+    }
+    let mut reason = format!(
+        "robot.blocked_label {want:?} does not exist in {} — a label Gitea cannot resolve is \
+         dropped from POST /issues/{{index}}/labels in silence (models/issues/label.go:333-341), \
+         so every blocked/gave_up/crashed/timed_out task will fail at its first action and its \
+         reason comment will never be posted. Create the label in each repository",
+        missing.join(", ")
+    );
+    if !case_variants.is_empty() {
+        reason.push_str(&format!(
+            "; note the case: {} (label lookup is a SQL IN, which is case-sensitive on sqlite \
+             and Postgres)",
+            case_variants.join(", ")
+        ));
+    }
+    LabelCheck::Missing { reason }
 }
 
 #[cfg(test)]

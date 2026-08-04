@@ -205,6 +205,20 @@ impl TaskDetail {
 /// First delay between marker-write attempts; doubled on each further attempt.
 const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// Deadline on one `hermes` / `gitea-robot` invocation.
+///
+/// Every subprocess this crate runs is a *request*, and both binaries talk to a server over
+/// HTTP. Without a deadline a half-open connection is not an error: the child simply never
+/// exits, and `run_argv` waits for it forever. That is worse here than a failure would be,
+/// because the caller of the failed call is a loop that would otherwise retry — the outbound
+/// leg wedges inside the `watch` line loop, and the "a dead watcher is silent" guard around it
+/// never fires, because the watcher is not dead, it is merely never read from again.
+///
+/// A minute is far longer than any of these calls should take (a local kanban subprocess, or
+/// one Gitea API round trip) and short enough that a wedged call is a log line rather than a
+/// silently dead leg. The child is killed on the way out, not leaked: [`Command::kill_on_drop`].
+const RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// A request to create a kanban task.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateTask {
@@ -257,6 +271,16 @@ pub enum KanbanError {
         args: String,
         /// What was missing.
         reason: String,
+    },
+    /// The command was still running when its deadline passed, and was killed.
+    #[error("{binary} {args} did not finish within {seconds}s and was killed")]
+    Timeout {
+        /// Executable name.
+        binary: String,
+        /// Joined arguments, for the log.
+        args: String,
+        /// The deadline that passed.
+        seconds: u64,
     },
     /// A created task came back without an id.
     #[error("kanban create returned no task id")]
@@ -569,17 +593,42 @@ impl Kanban {
 /// Runs `binary` with `args` and returns stdout.
 ///
 /// `args` is passed as an argv vector — no shell is involved, so no argument can be
-/// interpreted as shell syntax.
+/// interpreted as shell syntax. The call is bounded by [`RUN_TIMEOUT`].
 pub(crate) async fn run_argv(binary: &str, args: &[String]) -> Result<String, KanbanError> {
-    let out = Command::new(binary)
+    run_argv_within(binary, args, RUN_TIMEOUT).await
+}
+
+/// [`run_argv`] with an explicit deadline, so the timeout itself is testable.
+pub(crate) async fn run_argv_within(
+    binary: &str,
+    args: &[String],
+    limit: std::time::Duration,
+) -> Result<String, KanbanError> {
+    let spawn_err = |source| KanbanError::Spawn {
+        binary: binary.to_string(),
+        source,
+    };
+    // Spawned rather than `.output()`ed so the deadline has something to kill: dropping the
+    // child at the timeout is what stops a wedged request from becoming an orphan process
+    // holding the board's lock.
+    let child = Command::new(binary)
         .args(args)
         .stdin(Stdio::null())
-        .output()
-        .await
-        .map_err(|source| KanbanError::Spawn {
-            binary: binary.to_string(),
-            source,
-        })?;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(spawn_err)?;
+    let out = match tokio::time::timeout(limit, child.wait_with_output()).await {
+        Ok(result) => result.map_err(spawn_err)?,
+        Err(_) => {
+            return Err(KanbanError::Timeout {
+                binary: binary.to_string(),
+                args: redact(args),
+                seconds: limit.as_secs(),
+            });
+        }
+    };
     if !out.status.success() {
         return Err(KanbanError::Exit {
             binary: binary.to_string(),
@@ -856,6 +905,34 @@ mod tests {
             .await
             .expect_err("a missing binary cannot be retried into success");
         assert!(matches!(err, KanbanError::Spawn { .. }), "{err:?}");
+    }
+
+    /// A subprocess that never exits must become an error, not a wedged leg.
+    ///
+    /// Both binaries this crate runs talk to a server over HTTP, and a half-open connection
+    /// does not fail — it hangs. Unbounded, that hang happens *inside* the outbound leg's
+    /// `watch` line loop, so the leg stops reading events while still looking alive.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_subprocess_that_never_exits_is_killed_and_reported() {
+        let err = run_argv_within(
+            "/bin/sh",
+            &["-c".into(), "sleep 30".into()],
+            std::time::Duration::from_millis(150),
+        )
+        .await
+        .expect_err("must not wait for the child forever");
+        assert!(matches!(err, KanbanError::Timeout { .. }), "{err:?}");
+
+        // …and the deadline does not truncate a call that answers within it.
+        let out = run_argv_within(
+            "/bin/sh",
+            &["-c".into(), "printf ok".into()],
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect("a prompt command still succeeds");
+        assert_eq!(out, "ok");
     }
 
     #[test]

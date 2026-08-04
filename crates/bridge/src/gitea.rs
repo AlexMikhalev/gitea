@@ -93,6 +93,18 @@ pub struct Reaction {
     pub created_at: Option<String>,
 }
 
+/// One repository label (`modules/structs/issue_label.go:13-22`).
+///
+/// Only the name is read. It is what `POST /issues/{index}/labels` resolves against —
+/// `GetLabelIDsInRepoByNames` — and a name it cannot resolve is dropped in silence there,
+/// which is why the bridge probes for it up front instead.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Label {
+    /// Label name, as a human typed it.
+    #[serde(default)]
+    pub name: String,
+}
+
 /// The user a token authenticates as (`GET /api/v1/user`, `modules/structs/user.go`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuthenticatedUser {
@@ -216,6 +228,11 @@ const REACTION_PAGE_SIZE: u32 = 50;
 /// truncated reaction list would read as "nobody approved".
 const REACTION_PAGE_LIMIT: u32 = 100;
 
+/// Page cap for the label walk. Same reasoning as [`REACTION_PAGE_LIMIT`]: a truncated
+/// label list would read as "the label does not exist", which is the opposite of what a
+/// preflight is for.
+const LABEL_PAGE_LIMIT: u32 = 20;
+
 /// Read-side Gitea client with bounded retry on 5xx and transport errors.
 #[derive(Debug, Clone)]
 pub struct GiteaClient {
@@ -300,6 +317,28 @@ impl GiteaClient {
         Err(GiteaError::Truncated {
             path,
             pages: REACTION_PAGE_LIMIT,
+        })
+    }
+
+    /// `GET /api/v1/repos/{owner}/{repo}/labels` (`routers/api/v1/api.go`), every page of it.
+    ///
+    /// Paged for the same reason reactions are: the handler applies `utils.GetListOptions`,
+    /// so an unpaged request answers with at most `setting.API.DefaultPagingNum` (30) and a
+    /// repository with more labels than that would report the bridge's label as missing.
+    pub async fn repo_labels(&self, owner: &str, repo: &str) -> Result<Vec<Label>, GiteaError> {
+        let path = format!("/api/v1/repos/{}/{}/labels", urlencode(owner), urlencode(repo));
+        let mut all: Vec<Label> = Vec::new();
+        for page in 1..=LABEL_PAGE_LIMIT {
+            let paged = format!("{path}?page={page}&limit={REACTION_PAGE_SIZE}");
+            let batch: Vec<Label> = self.get_json(&paged).await?;
+            if batch.is_empty() {
+                return Ok(all);
+            }
+            all.extend(batch);
+        }
+        Err(GiteaError::Truncated {
+            path,
+            pages: LABEL_PAGE_LIMIT,
         })
     }
 

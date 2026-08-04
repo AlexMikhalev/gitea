@@ -27,12 +27,21 @@ pub const PR_MARKER: &str = "gitea-bridge: pr-opened";
 /// Marker comment written on the kanban task once its block was reported to Gitea.
 pub const BLOCK_MARKER: &str = "gitea-bridge: blocked-reported";
 
-/// Marker comment written once a repeatedly-unopenable pull request was reported to Gitea.
+/// Prefix of the marker written once a repeatedly-failing action was reported to Gitea.
 ///
-/// Distinct from [`BLOCK_MARKER`] so that escalating a `completed` task does not suppress a
-/// genuine later block, and so the escalation itself is posted exactly once however long the
+/// Distinct from [`BLOCK_MARKER`] and [`PR_MARKER`] so that escalating does not suppress a
+/// genuine later report, and so the escalation itself is posted exactly once however long the
 /// underlying failure lasts.
-pub const PR_ESCALATION_MARKER: &str = "gitea-bridge: pr-blocked";
+///
+/// The failing action's name is part of the marker: a task whose label cannot be applied and
+/// a task whose pull request cannot be opened are two different things to tell a human, and
+/// one must not silence the other.
+pub const ESCALATION_MARKER_PREFIX: &str = "gitea-bridge: report-failed";
+
+/// The marker recording that `action`'s repeated failure has been reported on the issue.
+pub fn escalation_marker(action: Action) -> String {
+    format!("{ESCALATION_MARKER_PREFIX} {}", action.name())
+}
 
 /// The five terminal kanban events the bridge acts on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -229,45 +238,79 @@ pub fn blocked_comment(
     body
 }
 
-/// Builds the comment posted when a `completed` task's pull request cannot be opened.
-pub fn escalation_comment(task_id: &str, head: &str, attempts: u32, error: &str) -> String {
-    format!(
-        "{PR_ESCALATION_MARKER}\n\nKanban task `{task_id}` completed, but opening its pull \
-         request has failed {attempts} times and the bridge will keep retrying.\n\nHead branch \
-         `{head}` — if it was never pushed to this instance, no pull request can be opened \
-         until it is. Pushing is the worker's job, not the bridge's.\n\n> {error}\n"
-    )
+/// Builds the comment posted when one action of a plan keeps failing.
+///
+/// `context` is the one fact that tells a human *which* failure this is: the head branch for
+/// a pull request, the label name for a label.
+pub fn escalation_comment(
+    task_id: &str,
+    action: Action,
+    context: Option<&str>,
+    attempts: u32,
+    error: &str,
+) -> String {
+    let mut body = format!(
+        "{marker}\n\nKanban task `{task_id}` reached a terminal state, but the `{action}` step \
+         of reporting it here has failed {attempts} times. The bridge will keep retrying.\n\n",
+        marker = escalation_marker(action),
+        action = action.name(),
+    );
+    match (action, context) {
+        (Action::OpenPr, Some(head)) => body.push_str(&format!(
+            "Head branch `{head}` — if it was never pushed to this instance, no pull request \
+             can be opened until it is. Pushing is the worker's job, not the bridge's.\n\n"
+        )),
+        (Action::Label, Some(label)) => body.push_str(&format!(
+            "Label `{label}` — a label that does not exist in this repository is dropped by the \
+             API in silence, so it most likely needs creating. Until it does, this comment is \
+             the only report this task gets.\n\n"
+        )),
+        _ => {}
+    }
+    body.push_str(&format!("> {error}\n"));
+    body
 }
 
-/// The actions that surface a repeatedly-unopenable pull request on the Gitea issue.
+/// The actions that surface a repeatedly-failing report on the Gitea issue.
 ///
-/// `completed` returns work as a pull request against a head branch the bridge does not
-/// push: it reads `branch_name`, or derives `task/<index>-<slug>` from the title. When that
-/// branch is not on the server, `create-pull` fails and the reconcile sweep replays it every
-/// 300s indefinitely — with the only signal a recurring `error!` line in the daemon's log,
-/// while the Gitea issue stays completely silent about work that finished and produced
-/// nothing. A human watching the board cannot tell that from an issue nobody picked up.
+/// Two failures are reachable here and both used to be silent. A `completed` task returns work
+/// as a pull request against a head branch the bridge does not push, so `create-pull` fails
+/// until someone pushes it; and every other terminal kind leads with a label, which
+/// `gitea-robot edit-issue` refuses outright when the repository does not have it
+/// (`cmd/gitea-robot/write.go`). Either way [`crate::main`]'s `apply_actions` stops at the
+/// failing action, the task is left unmarked, and the reconcile sweep replays the same plan
+/// every 300s indefinitely — with the only signal a recurring `error!` line in the daemon's
+/// log, while the Gitea issue stays completely silent about work that ran and stopped. A human
+/// watching the board cannot tell that from an issue nobody picked up.
 ///
-/// So after [`crate::state::ESCALATE_AFTER`] failures the failure is said where the humans
-/// are looking. The retry is *not* abandoned — if the branch is pushed later the pull request
-/// still opens — but [`PR_ESCALATION_MARKER`] makes this comment land exactly once.
+/// So after [`crate::state::ESCALATE_AFTER`] failures the failure is said where the humans are
+/// looking, and [`escalation_marker`] makes each one land exactly once. The retry is *not*
+/// abandoned: push the branch, or create the label, and the original plan applies.
+///
+/// **This is a comment and nothing else, deliberately.** The escalation must not depend on the
+/// action that is failing — leading with a label, as this once did, means the missing-label
+/// case escalates by trying the very call that is broken, gets nowhere, and stays silent.
+/// A comment is the one verb with no repository-side precondition.
 pub fn escalation_actions(
     detail: &TaskDetail,
-    blocked_label: &str,
-    head: &str,
+    action: Action,
+    context: Option<&str>,
     attempts: u32,
     error: &str,
 ) -> Result<Vec<PlannedAction>, PlanError> {
-    if detail.has_marker(PR_ESCALATION_MARKER) {
+    if detail.has_marker(&escalation_marker(action)) {
         return Err(PlanError::AlreadyReported {
             task: detail.task.id.clone(),
-            kind: "pr-escalation",
+            kind: "escalation",
         });
     }
-    Ok(vec![
-        PlannedAction::Label(vec![blocked_label.to_string()]),
-        PlannedAction::Comment(escalation_comment(&detail.task.id, head, attempts, error)),
-    ])
+    Ok(vec![PlannedAction::Comment(escalation_comment(
+        &detail.task.id,
+        action,
+        context,
+        attempts,
+        error,
+    ))])
 }
 
 /// Maps one terminal event onto Gitea actions.
@@ -610,24 +653,76 @@ mod tests {
     fn a_pull_request_that_cannot_be_opened_is_escalated_to_the_issue_once() {
         let mut d = detail("completed", &[]);
         let actions =
-            escalation_actions(&d, "status/blocked", "task/57-x", 3, "404 not found").expect("escalates");
-        assert_eq!(actions[0], PlannedAction::Label(vec!["status/blocked".into()]));
-        let PlannedAction::Comment(comment) = &actions[1] else {
+            escalation_actions(&d, Action::OpenPr, Some("task/57-x"), 3, "404 not found").expect("escalates");
+        // Comment-only: an escalation that led with a label would be trying the one verb that
+        // is broken whenever the *label* is what failed.
+        assert_eq!(actions.len(), 1);
+        let PlannedAction::Comment(comment) = &actions[0] else {
             panic!("comment")
         };
         // Naming the head branch is the whole point: it is the one fact that tells a human
         // this is "the worker never pushed" rather than "nobody picked it up".
         assert!(comment.contains("task/57-x"), "{comment}");
         assert!(comment.contains("404 not found"), "{comment}");
-        assert_eq!(comment.lines().next(), Some(PR_ESCALATION_MARKER));
+        assert_eq!(
+            comment.lines().next(),
+            Some(escalation_marker(Action::OpenPr).as_str())
+        );
 
         // Once reported, it is not reported again — the retry continues, the noise does not.
         d.comments.push(TaskComment {
             author: Some("bridge".into()),
-            body: PR_ESCALATION_MARKER.into(),
+            body: escalation_marker(Action::OpenPr),
         });
         assert!(matches!(
-            escalation_actions(&d, "status/blocked", "task/57-x", 9, "404 not found"),
+            escalation_actions(&d, Action::OpenPr, Some("task/57-x"), 9, "404 not found"),
+            Err(PlanError::AlreadyReported { .. })
+        ));
+    }
+
+    /// The P1 this closes: `blocked`/`gave_up`/`crashed`/`timed_out` plans lead with a label,
+    /// `edit-issue` fails hard on a label the repository does not have, and `apply_actions`
+    /// stops there — so the reason comment never posted and the issue stayed silent while the
+    /// reconcile sweep replayed the same failing plan every 300s forever.
+    #[test]
+    fn a_label_that_cannot_be_applied_is_escalated_by_comment_alone() {
+        let d = detail("blocked", &[("kind", serde_json::json!("needs_input"))]);
+        let actions = escalation_actions(
+            &d,
+            Action::Label,
+            Some("status/blocked"),
+            3,
+            "labels status/blocked are not present after the request",
+        )
+        .expect("escalates");
+        assert_eq!(actions.len(), 1, "a label escalation must not use the label verb");
+        let PlannedAction::Comment(comment) = &actions[0] else {
+            panic!("comment")
+        };
+        assert!(comment.contains("status/blocked"), "{comment}");
+        assert!(comment.contains("does not exist in this repository"), "{comment}");
+        assert_eq!(
+            comment.lines().next(),
+            Some(escalation_marker(Action::Label).as_str())
+        );
+    }
+
+    /// One failing action's escalation must not silence another's: a task can complete, have
+    /// its label fail, and later block for real.
+    #[test]
+    fn each_failing_action_escalates_under_its_own_marker() {
+        let mut d = detail("completed", &[]);
+        d.comments.push(TaskComment {
+            author: Some("bridge".into()),
+            body: escalation_marker(Action::Label),
+        });
+        assert_ne!(
+            escalation_marker(Action::Label),
+            escalation_marker(Action::OpenPr)
+        );
+        assert!(escalation_actions(&d, Action::OpenPr, Some("task/57-x"), 3, "404").is_ok());
+        assert!(matches!(
+            escalation_actions(&d, Action::Label, Some("status/blocked"), 3, "nope"),
             Err(PlanError::AlreadyReported { .. })
         ));
     }
@@ -637,7 +732,7 @@ mod tests {
         let mut d = detail("completed", &[]);
         d.comments.push(TaskComment {
             author: Some("bridge".into()),
-            body: PR_ESCALATION_MARKER.into(),
+            body: escalation_marker(Action::OpenPr),
         });
         // The pull request is still attempted: if the branch is pushed later, it opens.
         assert!(plan(&d, TerminalKind::Completed, "status/blocked", true).is_ok());

@@ -42,7 +42,7 @@ func apiGetStatus(rawURL string) (string, int, error) {
 	if err := setRequestAuth(req, ""); err != nil {
 		return "", 0, err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", 0, fmt.Errorf("error making request: %v", err)
 	}

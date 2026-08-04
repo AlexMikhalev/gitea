@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 )
@@ -469,5 +470,35 @@ func TestSplitLabelsTrimsAndDropsEmpties(t *testing.T) {
 	got := splitLabels(" a , ,b ,")
 	if len(got) != 2 || got[0] != "a" || got[1] != "b" {
 		t.Errorf("splitLabels() = %#v", got)
+	}
+}
+
+// TestEveryRequestIsBounded pins the deadline on the CLI's HTTP client.
+//
+// http.DefaultClient has none, so a half-open connection to the instance does not fail - it
+// hangs, and the process never exits. The gitea-automations bridge shells out to these verbs
+// from inside its outbound leg, so an unbounded write there stops it reading kanban events
+// while it still looks alive: the "a dead watcher is silent" guard cannot fire, because the
+// watcher is not dead.
+func TestEveryRequestIsBounded(t *testing.T) {
+	if httpClient.Timeout <= 0 {
+		t.Fatal("httpClient must carry a timeout; http.DefaultClient's zero value never returns")
+	}
+	// And that no request goes around it. One file left on http.DefaultClient is one
+	// unbounded call, which is all it takes; comment lines are skipped so the explanation
+	// above the client may name it.
+	for _, path := range []string{"main.go", "write.go"} {
+		src, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("cannot read %s: %v", path, err)
+		}
+		for i, line := range strings.Split(string(src), "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "//") {
+				continue
+			}
+			if strings.Contains(line, "http.DefaultClient") {
+				t.Errorf("%s:%d uses http.DefaultClient, which has no timeout; use httpClient", path, i+1)
+			}
+		}
 	}
 }

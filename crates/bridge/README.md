@@ -42,12 +42,19 @@ a task already settled in the status it was listed under is skipped without payi
 worktrees are local, so if the agent did not push its branch to the Gitea remote,
 `create-pull` fails — loudly, and the reconcile sweep will keep retrying it, but no pull
 request appears until the branch exists on the server. Pushing is the worker's job, not this
-daemon's. After three failed attempts the bridge stops keeping that to itself: it labels the
-issue `status/blocked` and comments naming the missing head branch, so the failure appears
-where the humans are looking instead of only in the daemon's log, where it is
-indistinguishable from an issue nobody picked up. The retry continues — push the branch and
-the pull request opens — and the escalation comment is posted exactly once, guarded by its
-own durable marker.
+daemon's. After three failed attempts the bridge stops keeping that to itself: it comments on
+the issue naming the missing head branch, so the failure appears where the humans are looking
+instead of only in the daemon's log, where it is indistinguishable from an issue nobody picked
+up. The retry continues — push the branch and the pull request opens — and the escalation
+comment is posted exactly once, guarded by its own durable marker.
+
+The same escalation covers *any* repeatedly failing action, not only the pull request, and it
+is a comment and nothing else. Both parts are load-bearing: every non-`completed` plan leads
+with a label, so gating escalation on `open_pr` left four of the five terminal kinds with no
+escalation at all — and an escalation that itself led with a label would, in the case that
+needs it most, be retrying the very call that is broken. A comment is the one verb with no
+repository-side precondition. Each failing action escalates under its own marker, so a label
+escalation cannot silence a later pull-request one.
 
 `src/rules.rs` parses the declarative rules file; `src/config.rs` is the daemon config;
 `src/gitea.rs` is the read client and `src/robot.rs` the write side. The three write verbs
@@ -68,7 +75,29 @@ gitea-automations --config bridge.yaml run            # all four legs
 
 See `bridge.example.yaml` and `rules.example.yaml`.
 
-## Four things that bite
+## Five things that bite
+
+**`robot.blocked_label` must already exist in every repository.** Nothing here creates
+repository labels — creating one is not in the action space — and a label name Gitea cannot
+resolve is *dropped in silence* by `POST /issues/{index}/labels`: `GetLabelIDsInRepoByNames`
+returns only what it found (`models/issues/label.go:333-341`) and the request still answers
+200. `gitea-robot edit-issue` turns that into a hard error by re-reading the issue's label set,
+which is right — but that error lands on action **0** of every `blocked`/`gave_up`/`crashed`/
+`timed_out` plan, so the reason comment behind it is never posted either. Undetected, the issue
+stays completely silent about work that ran and stopped, and the reconcile sweep replays the
+same failing plan every 300s forever.
+
+So `check` probes for it, `run` says so at startup, and after three failures the bridge
+comments the failure onto the issue itself:
+
+```console
+$ gitea-automations --config bridge.yaml check
+warning: robot.blocked_label "status/blocked" does not exist in terraphim/gitea — …
+```
+
+Create it once per repository (Issues → Labels, or `POST /repos/{o}/{r}/labels`). Mind the
+case: the server resolves label names with a SQL `IN`, which is case-sensitive on sqlite and
+Postgres, so `Status/Blocked` is not `status/blocked` — `check` calls that out separately.
 
 **🐝 needs an `app.ini` change.** Reactions are rejected on write unless the type is in
 `setting.UI.ReactionsLookup` (`models/issues/reaction.go:223`), and reads filter on the same
@@ -181,6 +210,15 @@ output. Treat the file as a validated declaration of intent for a future release
   gives — rather than one per sweep.
 * **Crashes orphan nothing.** Claims, heartbeats, reclaim and the circuit breaker are
   kanban's. Killing the bridge stops the bridge.
+* **Nothing waits forever, and nothing dies quietly.** Every subprocess is run with a deadline
+  and killed at it, and `gitea-robot` gives its HTTP client one too — without both, a half-open
+  connection is not an error but a hang, and it happens *inside* the outbound leg's `watch`
+  loop, which then stops reading events while still looking alive. The four legs are awaited
+  alongside `ctrl-c` rather than left unjoined for the same reason: a leg that ends is a leg
+  whose silence reads as an idle board, so the daemon exits non-zero and lets its supervisor
+  rebuild it. The three tickers use `MissedTickBehavior::Delay`, so a sweep that overruns its
+  interval does not come back to a burst of missed ticks stacking subprocesses onto a board
+  that is already slow.
 
 ## Multi-box
 
@@ -211,7 +249,8 @@ two full poll cycles against wiremock plus a stub kanban and asserts one task re
 `tests/live_kanban.rs` is the opt-in live half.
 
 Both Rust gates run in CI: `.github/workflows/pull-compliance.yml` has a `rust` job, fired by
-the `crates/**` filter in `files-changed.yml`.
+the `crates/**` filter in `files-changed.yml` — or by the `actions` filter, so that a PR which
+changes only the job's own wiring (the pinned toolchain, the steps) still runs it.
 
 The Gitea *write* leg is checked in two places, because the argv tests in `src/robot.rs` can
 only assert the bridge agrees with itself. The two halves are **not** symmetric:

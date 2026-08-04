@@ -59,6 +59,11 @@ robot:
   # would miss, and Gitea's own duplicate check would then reject every pull request.
   # `check` refuses one rather than letting it wedge later.
   base_branch: main
+  # Must already exist in every repository above, spelled exactly like this — nothing here
+  # creates repository labels, and a name Gitea cannot resolve is dropped from
+  # POST /issues/{index}/labels in silence (models/issues/label.go:333-341). It is action 0
+  # of every blocked/gave_up/crashed/timed_out plan, so a missing one takes the reason
+  # comment behind it down with it. `check` probes for it.
   blocked_label: status/blocked
   draft_pulls: false
 
