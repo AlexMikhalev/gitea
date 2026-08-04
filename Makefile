@@ -348,6 +348,24 @@ lint-go-gitea-vet: ## lint go files with gitea-vet
 	@echo "Running gitea-vet..."
 	@$(GO) vet -vettool="$(shell GOOS= GOARCH= go tool -n gitea-vet)" ./...
 
+# The gitea-automations bridge daemon under crates/ is a Rust workspace, so it is not
+# reached by lint-backend or test-backend. It is kept out of `lint`/`test` because it needs a
+# cargo toolchain the rest of the build does not; CI runs these two targets directly when
+# anything under crates/ changes (.github/workflows/pull-compliance.yml).
+.PHONY: lint-rust
+lint-rust: ## lint rust files (crates/, the gitea-automations bridge)
+	cargo fmt --manifest-path crates/Cargo.toml --all -- --check
+	cargo clippy --manifest-path crates/Cargo.toml --all-targets -- -D warnings
+
+.PHONY: lint-rust-fix
+lint-rust-fix: ## lint rust files and fix issues
+	cargo fmt --manifest-path crates/Cargo.toml --all
+	cargo clippy --manifest-path crates/Cargo.toml --all-targets --fix --allow-dirty -- -D warnings
+
+.PHONY: test-rust
+test-rust: ## test rust files (crates/, the gitea-automations bridge)
+	cargo test --manifest-path crates/Cargo.toml --all
+
 .PHONY: lint-editorconfig
 lint-editorconfig:
 	@echo "Running editorconfig check..."

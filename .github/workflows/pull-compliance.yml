@@ -244,3 +244,21 @@ jobs:
           go-version-file: go.mod
           check-latest: true
       - run: make lint-actions
+
+  # The gitea-automations bridge daemon (crates/) is a Rust workspace, so nothing else in
+  # this file reaches it: without this job its tests are manual-only, and only the Go half
+  # of the write-leg contract (TestBridgeWriteVerbsExist) would actually be enforced.
+  rust:
+    if: needs.files-changed.outputs.rust == 'true'
+    needs: files-changed
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      # ubuntu-latest ships rustup. crates/Cargo.toml sets rust-version = 1.88: main.rs uses
+      # a let-chain, which a 1.85 toolchain does not build.
+      - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+      - run: rustup default stable
+      - run: make lint-rust
+      - run: make test-rust

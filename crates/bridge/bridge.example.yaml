@@ -1,0 +1,95 @@
+# Example configuration for the gitea-automations bridge daemon (issue #57, phase F4).
+#
+# Copy to bridge.yaml and edit. Validate with:
+#   gitea-automations --config bridge.yaml check
+
+gitea:
+  base_url: https://git.example.org
+
+  # Reads only. The ready and reactions endpoints allow anonymous reads on public
+  # repositories, but GET /repos/{o}/{r}/collaborators/{u}/permission sits behind
+  # reqToken() (routers/api/v1/api.go:1464,1466). Without a token the bridge cannot tell a
+  # maintainer's 🐝 from a passer-by's, and every approval fails closed.
+  #
+  # A token is necessary but NOT sufficient: that endpoint answers for a user other than
+  # the caller only for a site admin or an admin of the repository
+  # (routers/api/v1/repo/collaborators.go:279) - anyone else gets 403. The bridge always
+  # asks about somebody else, namely whoever reacted, so this token must belong to a site
+  # admin or to an admin of every repo listed below. `check` probes exactly that and says
+  # so; without it the only symptom is every 🐝 resolving to Undetermined, forever.
+  # token: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+  request_timeout_secs: 30
+  max_retries: 3
+  retry_backoff_ms: 250
+
+# The ready endpoint returns repo_id and repo_name but no owner
+# (routers/api/v1/robot/ready_graph.go:25-42), so the owner is config, never inferred.
+repos:
+  - owner: terraphim
+    repo: gitea
+
+kanban:
+  binary: hermes
+  # Boards are the isolation unit: each has its own DB, workspaces directory and
+  # dispatcher loop.
+  board: f4
+  # Multi-box deployment is one bridge per host with *disjoint* assignees. Two bridges
+  # sharing an assignee would both act on the same terminal events.
+  assignee: codex
+  workspace: worktree
+  max_runtime: 2h
+  max_retries: 2
+  created_by: gitea-automations
+  # Create tasks blocked, so a 🐝 is what releases them to a worker.
+  #
+  # `hermes kanban create` has no --status flag and its default is `ready`, which is
+  # immediately claimable. With this off, an issue reaching the ready endpoint is dispatched
+  # to an agent with no human in the loop, and the approval sweep below - which covers
+  # `blocked` and `todo` - never sees a bridge-created task at all.
+  require_approval: true
+
+robot:
+  # Writes go through gitea-robot so they carry the NIP-98 agent identity from F1 —
+  # attributable to the agent key, and revocable with it.
+  binary: gitea-robot
+  # Must not contain a slash. The pull-request existence probe is
+  # GET /repos/{o}/{r}/pulls/{base}/{head}, where only {head} is a catch-all segment
+  # (routers/api/v1/api.go:1642), so `release/1.0` would be read as base=release - the probe
+  # would miss, and Gitea's own duplicate check would then reject every pull request.
+  # `check` refuses one rather than letting it wedge later.
+  base_branch: main
+  blocked_label: status/blocked
+  draft_pulls: false
+
+poll:
+  ready_interval_secs: 60
+  # Reaction polling is the permanent path, not a stopgap: repoevent.Kind is exactly
+  # action, agent_audit, comment, review, status (services/repoevent/event.go:29-37), so a
+  # reaction is not observable through the F2 event stream at all.
+  approval_interval_secs: 60
+  skip_in_progress: true
+  # `kanban watch` is a live stream and each terminal event fires exactly once, so a single
+  # failed gitea-robot call - or a daemon that was down when the event fired - would drop
+  # that issue's feedback for good. This sweep re-drives terminal tasks that carry no report
+  # marker, which is what makes a half-applied plan actually replayable.
+  reconcile_interval_secs: 300
+
+approval:
+  # The emoji *alias* for U+1F41D (modules/emoji/emoji_data.go:191), which is also the
+  # `content` value the reactions API returns. Never the codepoint.
+  #
+  # This also requires an app.ini change on the Gitea side. Writes are rejected unless the
+  # type is in setting.UI.ReactionsLookup (models/issues/reaction.go:223) and reads filter
+  # on the same allowlist (:165) — an unconfigured 🐝 is invisible, not merely unwritable.
+  # The default omits it (custom/conf/app.example.ini:1361), so set:
+  #
+  #   [ui]
+  #   REACTIONS = +1, -1, laugh, hooray, confused, heart, rocket, eyes, honeybee
+  reaction: honeybee
+  require_write_permission: true
+
+# Optional, and validated only: nothing consults a rule at runtime today. Setting this
+# makes `check` parse the file and fail on a bad one; it does not change what the daemon
+# does. See rules.example.yaml.
+# rules_file: rules.yaml

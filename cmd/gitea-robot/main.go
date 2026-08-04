@@ -165,24 +165,29 @@ func main() {
 	command := os.Args[1]
 	os.Args = os.Args[1:] // Remove command from args
 
-	switch command {
-	case "triage":
-		triageCmd()
-	case "ready":
-		readyCmd()
-	case "graph":
-		graphCmd()
-	case "add-dep":
-		addDepCmd()
-	case "room":
-		roomCmd()
-	case "mcp-server":
-		mcpServerCmd()
-	default:
+	run, ok := commands[command]
+	if !ok {
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
 		printUsage()
 		os.Exit(1)
 	}
+	run()
+}
+
+// commands is the dispatch table. It is a map rather than a switch so that one test can
+// assert every verb another component shells out to actually exists here - in particular
+// the gitea-automations bridge's write leg (crates/bridge/src/robot.rs), whose own tests
+// can only check that the bridge agrees with itself about the argv it builds.
+var commands = map[string]func(){
+	"triage":      triageCmd,
+	"ready":       readyCmd,
+	"graph":       graphCmd,
+	"add-dep":     addDepCmd,
+	"room":        roomCmd,
+	"comment":     commentCmd,
+	"edit-issue":  editIssueCmd,
+	"create-pull": createPullCmd,
+	"mcp-server":  mcpServerCmd,
 }
 
 func printUsage() {
@@ -192,12 +197,15 @@ Usage:
   gitea-robot [command] [flags]
 
 Commands:
-  triage      Get prioritized task list
-  ready       Get unblocked (ready) tasks
-  graph       Get dependency graph
-  add-dep     Add dependency between issues
-  room        Manage a branch room issue: open|status|close
-  mcp-server  Start MCP server exposing gitea-robot functionality
+  triage       Get prioritized task list
+  ready        Get unblocked (ready) tasks
+  graph        Get dependency graph
+  add-dep      Add dependency between issues
+  room         Manage a branch room issue: open|status|close
+  comment      Post an issue comment
+  edit-issue   Edit an issue: --add-labels adds labels, keeping the existing ones
+  create-pull  Open a pull request (a no-op if one already exists for base/head)
+  mcp-server   Start MCP server exposing gitea-robot functionality
 
 Environment:
   GITEA_URL        Gitea instance URL (default: http://localhost:3000)
@@ -239,6 +247,14 @@ Examples:
   gitea-robot room open --owner terraphim --repo gitea --branch feat/foo
   gitea-robot room status --owner terraphim --repo gitea --branch feat/foo --state success
   gitea-robot room close --owner terraphim --repo gitea --branch feat/foo
+
+  # Write back to an issue: comment, add a label, open a pull request. These are the
+  # verbs the gitea-automations bridge shells out to, so that its writes carry the
+  # agent's NIP-98 identity rather than a bearer token.
+  gitea-robot comment --owner terraphim --repo gitea --issue 57 --body "done"
+  gitea-robot edit-issue --owner terraphim --repo gitea --issue 57 --add-labels status/blocked
+  gitea-robot create-pull --owner terraphim --repo gitea --title "issue #57: daemon" \
+      --head task/57-daemon --base main --body "Refs #57"
 
   # Start MCP server
   gitea-robot mcp-server`)
