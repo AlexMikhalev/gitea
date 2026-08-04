@@ -75,7 +75,7 @@ ROOM_HOOK_SECRET =
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `ENABLED` | `true` | Master switch for the issue graph feature |
+| `ENABLED` | `true` | Master switch for the issue graph feature, **including the branch-as-room webhook** — `false` makes all four routes answer 404 |
 | `PAGERANK_CACHE_TTL` | `300` | PageRank cache expiration, seconds |
 | `AUDIT_LOG` | `true` | Write `[ROBOT_AUDIT]` records for Robot API access |
 | `STRICT_MODE` | `false` | Return 404 on any error, never 500 |
@@ -93,6 +93,7 @@ the only one authenticated by a signature rather than a token.
 
 ```ini
 [issue_graph]
+ENABLED = true
 ROOM_HOOK_SECRET = <long random string, e.g. `openssl rand -hex 32`>
 ```
 
@@ -100,6 +101,10 @@ ROOM_HOOK_SECRET = <long random string, e.g. `openssl rand -hex 32`>
 exist.** This is deliberate — a disabled route must not be distinguishable from an absent one — but it
 also means a typo in the key name silently turns the feature off rather than failing loudly. If
 deliveries return 404, check the spelling of the key and the `[issue_graph]` section header first.
+
+**`ENABLED = false` disables it as well**, and it is the switch to reach for to stop robot automation
+in an incident: the master switch turns off the route that *writes*, not just the three read-only
+ones. `ENABLED` is checked first, the secret second, and both answer 404 — so a 404 means either.
 
 ### Per-repository secrets (do not hand out `ROOM_HOOK_SECRET`)
 
@@ -128,6 +133,16 @@ Configure the derived value as the **Secret** of a repository webhook pointing a
 `https://<instance>/api/v1/robot/room/hook`, with the `Push`, `Delete`, `Pull Request` and
 `Repository status` events enabled.
 
+### Content type
+
+Use **`application/json`**. Gitea's `form` content type is accepted too — it sends the same signed
+JSON as a urlencoded `payload` field, and the hook reads it from there — but prefer JSON: the 4 MiB
+cap below is applied at the read for a JSON delivery, while a urlencoded body has already been
+buffered by `net/http`'s own 10 MB `ParseForm` limit before the handler sees it (`sudo()` wraps the
+whole API router and parses the form). Those are the only two content types a Gitea webhook sends;
+anything that is not urlencoded is read as a raw JSON body, and a body that is not the signed JSON
+payload is refused with 400 (`invalid_repo_claim` in the audit log).
+
 ### Authorization of writes
 
 A valid signature authenticates the *repository*, never a user. The `sender` in the payload is
@@ -135,7 +150,8 @@ therefore treated as an attribution preference, not a credential:
 
 | Step | Rule | On failure |
 |------|------|------------|
-| Size | The body is read under a 4 MiB cap, *before* anything else — the signature is over the body, so the body comes first | 413 |
+| Enabled | `[issue_graph] ENABLED` and a non-empty `ROOM_HOOK_SECRET` — checked before the request is looked at | 404 |
+| Size | The payload is read under a 4 MiB cap, *before* anything else — the signature is over the payload, so the payload comes first (see **Content type**: for a `form` delivery the cap applies to the parsed field, not to the read) | 413 |
 | Claim | The payload's `repository` owner/name must be a plausible name: length-capped, no path traversal, no separator or control characters | 400 |
 | Signature | HMAC-SHA256 over the raw body, in `X-Gitea-Signature` (raw hex) or `X-Hub-Signature-256` (`sha256=` prefixed) | 401 |
 | Repository | The repository named in the payload (the same one whose secret verified the delivery) | 404 |
@@ -165,7 +181,7 @@ do not hand out the derived secret.
 
 | Operation | Repeat behaviour |
 |-----------|------------------|
-| Room open (push) | Idempotent — one room per branch, looked up by title and marker; a re-push refreshes the marker head |
+| Room open (push) | Idempotent — one room per branch, looked up by title and marker; a re-push refreshes the marker head, and a push to a branch whose room was closed reopens that room rather than opening a second one. `gitea-robot room open` applies the same rule, so the manual path cannot duplicate a room the hook closed |
 | Room close (delete, merged PR, zero-SHA push) | Idempotent — closing a closed room is a no-op |
 | Status comment | Idempotent **against the room's newest comment only**: a redelivery of the same status writes nothing (`"duplicate"` in the response), but a status that repeats after a *different* comment landed in between is treated as a new event and posts again |
 
@@ -391,7 +407,8 @@ Before deploying to production:
 - [ ] Verify PageRank caching works (second request should be faster)
 - [ ] Check audit logs are being written
 - [ ] Configure log rotation for audit logs
-- [ ] If using branch-as-room: set `ROOM_HOOK_SECRET`, verify the route no longer answers 404
+- [ ] If using branch-as-room: set `ROOM_HOOK_SECRET` (and leave `ENABLED = true`), verify the route no longer answers 404
+- [ ] If using branch-as-room: set each repository webhook's content type to `application/json`
 - [ ] If using branch-as-room: configure each repository's webhook with its **derived** secret, never the master
 - [ ] If using branch-as-room: confirm anonymous API access is allowed (`REQUIRE_SIGNIN_VIEW` not strict)
 

@@ -47,13 +47,14 @@ func TestRoomMarkerRoundTripCLI(t *testing.T) {
 	}
 }
 
-// TestRoomOpenCreatesIssue verifies `room open` searches first and creates the
-// room issue with the marker body when none exists.
+// TestRoomOpenCreatesIssue verifies `room open` searches - open rooms, then
+// closed ones - and creates the room issue with the marker body only when the
+// branch has never had a room.
 func TestRoomOpenCreatesIssue(t *testing.T) {
 	var requests []recordedRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		requests = append(requests, recordedRequest{r.Method, r.URL.Path, string(body)})
+		requests = append(requests, recordedRequest{r.Method, r.URL.Path + "?state=" + r.URL.Query().Get("state"), string(body)})
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/o/r/issues":
 			_, _ = w.Write([]byte(`[]`))
@@ -75,10 +76,16 @@ func TestRoomOpenCreatesIssue(t *testing.T) {
 	if !strings.Contains(out, "#7") {
 		t.Errorf("unexpected output: %q", out)
 	}
-	if len(requests) != 2 {
-		t.Fatalf("expected GET then POST, got %d requests: %+v", len(requests), requests)
+	if len(requests) != 3 {
+		t.Fatalf("expected two GETs then a POST, got %d requests: %+v", len(requests), requests)
 	}
-	if requests[0].Method != "GET" || requests[1].Method != "POST" {
+	if requests[0].Method != http.MethodGet || requests[0].Path != "/api/v1/repos/o/r/issues?state=open" {
+		t.Errorf("first request did not search open rooms: %+v", requests[0])
+	}
+	if requests[1].Method != http.MethodGet || requests[1].Path != "/api/v1/repos/o/r/issues?state=closed" {
+		t.Errorf("second request did not search closed rooms: %+v", requests[1])
+	}
+	if requests[2].Method != http.MethodPost {
 		t.Errorf("unexpected request sequence: %+v", requests)
 	}
 	// The created issue carries the room marker for the branch.
@@ -86,7 +93,7 @@ func TestRoomOpenCreatesIssue(t *testing.T) {
 		Title string `json:"title"`
 		Body  string `json:"body"`
 	}
-	if err := json.Unmarshal([]byte(requests[1].Body), &created); err != nil {
+	if err := json.Unmarshal([]byte(requests[2].Body), &created); err != nil {
 		t.Fatalf("create body is not JSON: %v", err)
 	}
 	if created.Title != "Room: feat/foo" {
@@ -125,6 +132,98 @@ func TestRoomOpenIdempotent(t *testing.T) {
 	}
 	if posts != 0 {
 		t.Errorf("room open created a duplicate: %d POSTs", posts)
+	}
+}
+
+// TestRoomOpenReopensClosedRoom is the regression test for the duplicate-room
+// bug: `room open` used to search open issues only, so once the hook had
+// closed a branch's room (on merge, on delete) the next open created a second
+// issue with a byte-identical title. A branch has one room for its whole life,
+// and the CLI revives the closed one exactly as the hook does.
+func TestRoomOpenReopensClosedRoom(t *testing.T) {
+	closedRoom, _ := json.Marshal([]map[string]any{
+		{"number": 10, "title": robotroom.IssueTitle("feat/foo"), "body": robotroom.IssueBody("feat/foo", ""), "state": "closed"},
+	})
+	var posts int
+	var patchPath, patchBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost:
+			posts++
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"number": 11}`))
+		case r.Method == http.MethodPatch:
+			patchPath = r.URL.Path
+			body, _ := io.ReadAll(r.Body)
+			patchBody = string(body)
+			_, _ = w.Write([]byte(`{"number": 10, "state": "open"}`))
+		case r.URL.Query().Get("state") == "closed" && r.URL.Query().Get("page") == "1":
+			_, _ = w.Write(closedRoom)
+		default:
+			// No open room for the branch, and no second page of closed ones.
+			_, _ = w.Write([]byte(`[]`))
+		}
+	}))
+	defer server.Close()
+	withGiteaURL(t, server.URL)
+	withEnv(t, "tok", "")
+
+	out, err := runRoomAction(roomArgs{Action: "open", Owner: "o", Repo: "r", Branch: "feat/foo"})
+	if err != nil {
+		t.Fatalf("room open failed: %v", err)
+	}
+	if !strings.Contains(out, "reopened") || !strings.Contains(out, "#10") {
+		t.Errorf("unexpected output: %q", out)
+	}
+	if posts != 0 {
+		t.Errorf("room open created a duplicate room: %d POSTs", posts)
+	}
+	if patchPath != "/api/v1/repos/o/r/issues/10" {
+		t.Errorf("reopen PATCH went to %q", patchPath)
+	}
+	if !strings.Contains(patchBody, `"open"`) {
+		t.Errorf("reopen PATCH body = %q", patchBody)
+	}
+}
+
+// TestRoomOpenPrefersTheOpenRoom verifies the closed-room lookup never
+// overrides an open one: a branch with both an open and a closed room (the
+// closed one left over from an earlier life of the branch) is reported as
+// already open, with no PATCH and no POST.
+func TestRoomOpenPrefersTheOpenRoom(t *testing.T) {
+	room := func(number int64) []byte {
+		data, _ := json.Marshal([]map[string]any{
+			{"number": number, "title": robotroom.IssueTitle("feat/foo"), "body": robotroom.IssueBody("feat/foo", "")},
+		})
+		return data
+	}
+	var writes int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writes++
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"number": 0}`))
+			return
+		}
+		if r.URL.Query().Get("state") == "closed" {
+			_, _ = w.Write(room(3))
+			return
+		}
+		_, _ = w.Write(room(5))
+	}))
+	defer server.Close()
+	withGiteaURL(t, server.URL)
+	withEnv(t, "tok", "")
+
+	out, err := runRoomAction(roomArgs{Action: "open", Owner: "o", Repo: "r", Branch: "feat/foo"})
+	if err != nil {
+		t.Fatalf("room open failed: %v", err)
+	}
+	if !strings.Contains(out, "already exists") || !strings.Contains(out, "#5") {
+		t.Errorf("unexpected output: %q", out)
+	}
+	if writes != 0 {
+		t.Errorf("room open wrote %d times to an already-open room", writes)
 	}
 }
 

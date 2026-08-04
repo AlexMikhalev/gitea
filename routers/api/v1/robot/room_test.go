@@ -7,6 +7,10 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -321,6 +325,97 @@ func TestRoomHookSecretForRepo(t *testing.T) {
 	if verifyRoomHookSignature(roomHookSecretForRepo(master, "user2", "repo2"), body, sig, "") {
 		t.Error("repo1's signature verified against repo2's secret")
 	}
+}
+
+// TestRoomHookFormContentType covers the content-type split that decides where
+// a delivery's payload is read from: Gitea's "form" webhook content type sends
+// the JSON as a urlencoded "payload" field (services/webhook/deliver.go), and
+// by the time this handler runs sudo()'s ParseForm has already drained that
+// body - so the two cases cannot share one read.
+func TestRoomHookFormContentType(t *testing.T) {
+	tests := []struct {
+		contentType string
+		want        bool
+	}{
+		{"application/x-www-form-urlencoded", true},
+		{"application/x-www-form-urlencoded; charset=utf-8", true},
+		{"Application/X-WWW-Form-Urlencoded", true},
+		{"application/json", false},
+		{"application/json; charset=utf-8", false},
+		{"multipart/form-data; boundary=x", false},
+		{"", false},
+		{"not a media type", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.contentType, func(t *testing.T) {
+			if got := roomHookFormContentType(tt.contentType); got != tt.want {
+				t.Errorf("roomHookFormContentType(%q) = %v, want %v", tt.contentType, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestRoomHookPayload covers where the signed payload is read from, for both
+// webhook content types, *after* the request has been through the middleware
+// that broke the form case: sudo() wraps the whole API router and calls
+// ctx.FormString("sudo"), which is a Req.FormValue and so runs ParseForm.
+// Each case calls FormValue first, exactly as the middleware does.
+func TestRoomHookPayload(t *testing.T) {
+	const payload = `{"repository":{"name":"repo1","owner":{"login":"user2"}}}`
+
+	newRequest := func(contentType, body string) *http.Request {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/robot/room/hook", strings.NewReader(body))
+		req.Header.Set("Content-Type", contentType)
+		// What sudo() does to every API request before the handler runs.
+		_ = req.FormValue("sudo")
+		return req
+	}
+
+	t.Run("json body survives the middleware", func(t *testing.T) {
+		body, tooLarge, err := roomHookPayload(newRequest("application/json", payload))
+		if err != nil || tooLarge {
+			t.Fatalf("roomHookPayload() = (_, %v, %v)", tooLarge, err)
+		}
+		if string(body) != payload {
+			t.Errorf("body = %q, want %q", body, payload)
+		}
+	})
+
+	t.Run("form delivery is read from the parsed payload field", func(t *testing.T) {
+		form := url.Values{"payload": []string{payload}}.Encode()
+		req := newRequest("application/x-www-form-urlencoded", form)
+		// The premise of the whole branch: ParseForm has drained the body, so
+		// reading it now yields nothing at all.
+		if left, _ := io.ReadAll(req.Body); len(left) != 0 {
+			t.Fatalf("urlencoded body was not drained by ParseForm: %q", left)
+		}
+		body, tooLarge, err := roomHookPayload(req)
+		if err != nil || tooLarge {
+			t.Fatalf("roomHookPayload() = (_, %v, %v)", tooLarge, err)
+		}
+		// The signature is computed over the JSON payload, not over the form
+		// encoding (services/webhook/deliver.go signs t.PayloadContent), so
+		// what comes back here has to be byte-identical to it.
+		if string(body) != payload {
+			t.Errorf("body = %q, want %q", body, payload)
+		}
+	})
+
+	t.Run("oversized json is reported, not truncated", func(t *testing.T) {
+		big := `{"padding":"` + strings.Repeat("a", roomHookMaxBodySize) + `"}`
+		_, tooLarge, err := roomHookPayload(newRequest("application/json", big))
+		if err != nil || !tooLarge {
+			t.Errorf("roomHookPayload() = (_, %v, %v), want tooLarge", tooLarge, err)
+		}
+	})
+
+	t.Run("oversized form delivery is reported too", func(t *testing.T) {
+		big := url.Values{"payload": []string{`{"padding":"` + strings.Repeat("a", roomHookMaxBodySize) + `"}`}}.Encode()
+		_, tooLarge, err := roomHookPayload(newRequest("application/x-www-form-urlencoded", big))
+		if err != nil || !tooLarge {
+			t.Errorf("roomHookPayload() = (_, %v, %v), want tooLarge", tooLarge, err)
+		}
+	})
 }
 
 // TestIsHexSHA covers the guard in front of the marker-head LIKE lookup.

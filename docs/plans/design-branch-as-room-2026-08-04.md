@@ -50,6 +50,14 @@ the branch merges or is deleted. Automation-side only (gitea-robot + one inbound
   `merged: true` and the head branch in `pull_request.head.ref` — the hook closes the room on this event.
 
 ## Deployment constraints
+- **Two switches, both 404.** The route is gated on `[issue_graph] ENABLED` — the feature's master switch, which
+  the three read-only robot routes already honour — before `ROOM_HOOK_SECRET`. The write path must not be the one
+  route that keeps running after an operator has switched the feature off in an incident.
+- **Webhook content type.** `json` is the documented choice; `form` works because the signature covers the JSON
+  payload either way (deliver.go signs `t.PayloadContent`), and the payload is read from the parsed `payload`
+  field — `sudo()` wraps the whole API router and its `ParseForm` has drained a urlencoded body before the handler
+  runs. For a form delivery the 4 MiB cap therefore bounds the parsed field, not the read; `net/http`'s own 10 MB
+  `ParseForm` limit is what bounded the request before that.
 - The hook delivery carries no credentials; auth is the HMAC signature only. On instances with strict sign-in
   (`REQUIRE_SIGNIN_VIEW`, `Service.RequireSignInViewStrict`; checked in `verifyAuthWithOptions`,
   routers/api/v1/api.go:1043-1045) tokenless requests are rejected with 403 before the HMAC check runs — the room
@@ -75,7 +83,9 @@ the branch merges or is deleted. Automation-side only (gitea-robot + one inbound
 - CI status change on the branch's head SHA posts one status comment on the room issue.
 - Branch merge (pull_request closed+merged) or delete (delete event / zero-after push) closes the room issue;
   hook with bad/missing signature is rejected (401, or 403 under strict sign-in).
-- `gitea-robot room open|status|close --owner X --repo Y --branch feat/foo` performs the same operations as the hook.
+- `gitea-robot room open|status|close --owner X --repo Y --branch feat/foo` performs the same operations as the hook,
+  including the reopen rule above: `room open` on a branch whose room is closed revives that issue, so the manual
+  path cannot leave a repository with two rooms for one branch.
 
 ## Non-goals
 No fork template backlink (YAGNI — only if the pilot proves value, per issue); no new tables or migrations; no

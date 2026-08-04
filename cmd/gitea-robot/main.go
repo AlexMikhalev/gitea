@@ -234,7 +234,8 @@ Examples:
   # Add dependency: issue 2 blocked by issue 1
   gitea-robot add-dep --owner terraphim --repo gitea --issue 2 --blocks 1
 
-  # Open the room for a feat branch (idempotent), post a CI status, close it
+  # Open the room for a feat branch (idempotent: it reopens a closed room
+  # rather than creating a second one), post a CI status, close it
   gitea-robot room open --owner terraphim --repo gitea --branch feat/foo
   gitea-robot room status --owner terraphim --repo gitea --branch feat/foo --state success
   gitea-robot room close --owner terraphim --repo gitea --branch feat/foo
@@ -723,7 +724,7 @@ func handleToolsList(req MCPRequest) any {
 						"properties": map[string]any{
 							"action": map[string]any{
 								"type":        "string",
-								"description": "Room action: open, status, or close",
+								"description": "Room action: open (creates the room, or reopens a closed one), status, or close",
 								"enum":        []string{"open", "status", "close"},
 							},
 							"owner": map[string]any{
@@ -1142,9 +1143,24 @@ const (
 // roomFindIssue locates the open room issue for branch, paging through the
 // repo's open issues. It returns the issue index and whether a room exists.
 func roomFindIssue(owner, repo, branch string) (int64, bool, error) {
+	return roomFindIssueInState(owner, repo, branch, "open")
+}
+
+// roomFindClosedIssue locates the closed room issue for branch. The issue list
+// is sorted newest-first by the API (SortByCreatedDesc, routers/api/v1/repo),
+// so the first match is the newest closed room - the one a re-open should
+// revive, same rule as the hook's findRoomIssueInState.
+func roomFindClosedIssue(owner, repo, branch string) (int64, bool, error) {
+	return roomFindIssueInState(owner, repo, branch, "closed")
+}
+
+// roomFindIssueInState locates the room issue for branch among the repo's
+// issues in the given state, paging through the list. It returns the issue
+// index and whether such a room exists.
+func roomFindIssueInState(owner, repo, branch, state string) (int64, bool, error) {
 	for page := 1; page <= roomIssuePageLimit; page++ {
-		url := fmt.Sprintf("%s/api/v1/repos/%s/%s/issues?state=open&type=issues&limit=%d&page=%d",
-			giteaURL, owner, repo, roomIssuePageSize, page)
+		url := fmt.Sprintf("%s/api/v1/repos/%s/%s/issues?state=%s&type=issues&limit=%d&page=%d",
+			giteaURL, owner, repo, state, roomIssuePageSize, page)
 		data, err := apiGetSafe(url)
 		if err != nil {
 			return 0, false, err
@@ -1168,36 +1184,78 @@ func roomFindIssue(owner, repo, branch string) (int64, bool, error) {
 			return 0, false, nil
 		}
 	}
-	return 0, false, fmt.Errorf("scanned %d pages of open issues in %s/%s without reaching the end of the list; refusing to report 'no room' for %s",
-		roomIssuePageLimit, owner, repo, branch)
+	return 0, false, fmt.Errorf("scanned %d pages of %s issues in %s/%s without reaching the end of the list; refusing to report 'no room' for %s",
+		roomIssuePageLimit, state, owner, repo, branch)
 }
 
-// roomOpen creates the room issue unless one already exists. It reports
-// whether a new issue was created and the room's issue index.
+// roomOpenOutcome reports what `room open` did to the branch's room. It
+// mirrors the hook's roomOpenResult (routers/api/v1/robot/room.go).
+type roomOpenOutcome int
+
+const (
+	// roomOpenExisting: the branch already had an open room.
+	roomOpenExisting roomOpenOutcome = iota
+	// roomOpenCreated: the branch had never had a room.
+	roomOpenCreated
+	// roomOpenReopened: the branch's closed room was revived.
+	roomOpenReopened
+)
+
+// roomOpen makes the branch's room current: it leaves an open room alone,
+// reopens a closed one, and creates an issue only when the branch has never
+// had a room. It reports which of the three happened and the room's index.
+//
+// Reopening rather than creating is what keeps "exactly one room issue per
+// branch" true across a branch's whole life, on this side exactly as on the
+// hook's (openRoom, routers/api/v1/robot/room.go). Without it, every branch
+// whose room the hook had closed - on merge, on delete - would get a second,
+// byte-identically titled room the next time an operator ran `room open`, and
+// the two sides would no longer agree on which issue is the branch's room.
+// The room body is left as it is, including its recorded marker head: the CLI
+// never rewrites a room it did not create, for a reopened room as for an
+// already-open one.
 //
 // Like the server side, idempotency is search-then-create with no unique
 // constraint behind it; two concurrent opens for the same branch can create
 // duplicates. The hook's deliveries are serialized per webhook, which keeps
 // the window theoretical in practice.
-func roomOpen(owner, repo, branch, head string) (bool, int64, error) {
+func roomOpen(owner, repo, branch, head string) (roomOpenOutcome, int64, error) {
 	if index, found, err := roomFindIssue(owner, repo, branch); err != nil || found {
-		return false, index, err
+		return roomOpenExisting, index, err
 	}
+	index, found, err := roomFindClosedIssue(owner, repo, branch)
+	if err != nil {
+		return roomOpenExisting, 0, err
+	}
+	if found {
+		if err := roomReopen(owner, repo, index); err != nil {
+			return roomOpenExisting, 0, err
+		}
+		return roomOpenReopened, index, nil
+	}
+
 	url := fmt.Sprintf("%s/api/v1/repos/%s/%s/issues", giteaURL, owner, repo)
 	body := fmt.Sprintf(`{"title": %s, "body": %s}`,
 		jsonString(robotroom.IssueTitle(branch)), jsonString(robotroom.IssueBody(branch, head)))
 	data, err := apiPostSafe(url, body)
 	if err != nil {
-		return false, 0, err
+		return roomOpenExisting, 0, err
 	}
 	var created roomIssueListEntry
 	if err := json.Unmarshal([]byte(data), &created); err != nil {
 		// The room was created server-side but its index is unknown; surface
 		// the failure instead of reporting a bogus "issue #0". A retry is
 		// safe: roomFindIssue finds the room just created.
-		return true, 0, fmt.Errorf("room issue created but its response could not be parsed: %v", err)
+		return roomOpenCreated, 0, fmt.Errorf("room issue created but its response could not be parsed: %v", err)
 	}
-	return true, created.Index, nil
+	return roomOpenCreated, created.Index, nil
+}
+
+// roomReopen reopens a closed room issue.
+func roomReopen(owner, repo string, index int64) error {
+	url := fmt.Sprintf("%s/api/v1/repos/%s/%s/issues/%d", giteaURL, owner, repo, index)
+	_, err := apiSendSafe("PATCH", url, `{"state": "open"}`)
+	return err
 }
 
 // roomStatus posts one CI status comment on the room issue.
@@ -1278,14 +1336,18 @@ func runRoomAction(a roomArgs) (string, error) {
 	}
 	switch a.Action {
 	case "open":
-		created, index, err := roomOpen(a.Owner, a.Repo, a.Branch, a.Head)
+		outcome, index, err := roomOpen(a.Owner, a.Repo, a.Branch, a.Head)
 		if err != nil {
 			return "", err
 		}
-		if created {
+		switch outcome {
+		case roomOpenCreated:
 			return fmt.Sprintf("✓ Room opened: issue #%d for %s", index, a.Branch), nil
+		case roomOpenReopened:
+			return fmt.Sprintf("✓ Room reopened: issue #%d for %s", index, a.Branch), nil
+		default:
+			return fmt.Sprintf("Room already exists: issue #%d for %s", index, a.Branch), nil
 		}
-		return fmt.Sprintf("Room already exists: issue #%d for %s", index, a.Branch), nil
 	case "status":
 		state := a.State
 		if state == "" {

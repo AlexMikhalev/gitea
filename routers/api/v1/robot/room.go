@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"strings"
 
@@ -43,18 +44,35 @@ const roomHookEndpoint = "/api/v1/robot/room/hook"
 // into a full scan of the repository's open issues.
 const roomLookupLimit = 20
 
-// roomHookMaxBodySize caps the delivery body this route will buffer.
+// roomHookMaxBodySize caps the delivery payload this route will buffer.
 //
 // The route is reachable with no credential at all - the signature is computed
-// over the body, so the body has to be read before anything about the caller
-// is known - and io.ReadAll on an unauthenticated request means an anonymous
-// caller decides how much server memory one request costs. The cap is what
-// bounds that, and it has to be applied at the read rather than after it.
+// over the payload, so the payload has to be read before anything about the
+// caller is known - and io.ReadAll on an unauthenticated request means an
+// anonymous caller decides how much server memory one request costs. The cap
+// is what bounds that, and for a JSON delivery it is applied at the read
+// rather than after it.
+//
+// A "form" delivery is the one case where it cannot be: sudo() wraps the whole
+// API router (routers/api/v1/api.go) and calls ctx.FormString("sudo"), so
+// net/http has already parsed - and buffered, under its own 10 MB ParseForm
+// limit - a urlencoded body before this handler is reached. There the cap is
+// applied to the payload field, which bounds what the handler goes on to hold
+// but not what the request had already cost. JSON is the content type to
+// configure (docs/ROBOT_SECURITY.md says so); form is accepted rather than
+// silently broken.
 //
 // 4 MiB is far above any real delivery: a push payload carries at most
 // [ui] FEED_MAX_COMMIT_NUM commits (default 5, services/repository/push.go),
 // and delete, pull_request and status payloads are a repository plus a user.
 const roomHookMaxBodySize = 4 << 20
+
+// roomStatusBranchLimit bounds how many feat/* branch heads one status
+// delivery may resolve to, and with it how many comments one tokenless request
+// can trigger: the branch loop in handleRoomStatus writes once per match. A
+// SHA is the head of a single branch in every ordinary repository, so the
+// walk stops as soon as this many have matched.
+const roomStatusBranchLimit = 10
 
 // featBranch reports whether branch is a non-empty feat/* branch name. All
 // three entry points (push refs, delete refs, merged PR head refs) agree on
@@ -477,6 +495,10 @@ func roomMutationError(ctx *context.APIContext, doer *user_model.User, claim roo
 	ctx.APIError(http.StatusInternalServerError, err)
 }
 
+// errRoomBranchLimit stops the reference walk in featBranchesAtHead once
+// roomStatusBranchLimit branches have matched. It never leaves that function.
+var errRoomBranchLimit = errors.New("room hook: branch match limit reached")
+
 // featBranchesAtHead returns the feat/* branches whose head is commit sha.
 // The CommitStatusPayload carries no branch ref (modules/structs/hook.go), so
 // the branch has to be recovered from the commit graph. Only branch heads
@@ -484,6 +506,13 @@ func roomMutationError(ctx *context.APIContext, doer *user_model.User, claim roo
 // branch's CI state, and containment-based resolution would fan one status
 // out to every room whose branch happens to contain the commit (e.g. a
 // branch cut off another feat/* branch).
+//
+// The heads come from the reference walk itself: for-each-ref already prints
+// the object id next to every ref name (modules/git/repo_branch_nogogit.go),
+// so one pass answers the question. Listing the branch names and re-reading
+// each head instead costs a cat-file batch round-trip per feat/* branch - on
+// status, the highest-frequency of the four events, and the one route that is
+// reachable without a token.
 func featBranchesAtHead(ctx *context.APIContext, repository *repo_model.Repository, sha string) []string {
 	gitRepo, err := gitrepo.OpenRepository(ctx, repository)
 	if err != nil {
@@ -492,30 +521,97 @@ func featBranchesAtHead(ctx *context.APIContext, repository *repo_model.Reposito
 	}
 	defer gitRepo.Close()
 
-	names, _, err := gitRepo.GetBranchNames(0, 0)
+	var out []string
+	_, err = gitRepo.WalkReferences(git.ObjectBranch, 0, 0, func(head, refName string) error {
+		branch, ok := featBranchRef(refName)
+		if !ok || !strings.EqualFold(head, sha) {
+			return nil
+		}
+		out = append(out, branch)
+		if len(out) >= roomStatusBranchLimit {
+			return errRoomBranchLimit
+		}
+		return nil
+	})
+	// A full walk of the limit's worth of matches is the limit case, whatever
+	// the walk reports: stopping it means the pipeline is torn down mid-stream,
+	// so gitcmd joins errRoomBranchLimit with whatever git made of having its
+	// stdout closed. The count is the reliable signal, so it is the one read.
+	if len(out) >= roomStatusBranchLimit {
+		log.Warn("room hook: %s/%s has at least %d feat/* branches at %s; commenting on those and stopping there",
+			repository.OwnerName, repository.Name, roomStatusBranchLimit, sha)
+		return out
+	}
 	if err != nil {
 		log.Warn("room hook: cannot list branches of %s/%s: %v", repository.OwnerName, repository.Name, err)
 		return nil
 	}
-	var out []string
-	for _, name := range names {
-		if !strings.HasPrefix(name, featBranchPrefix) {
-			continue
-		}
-		if head, err := gitRepo.GetBranchCommitID(name); err == nil && strings.EqualFold(head, sha) {
-			out = append(out, name)
-		}
-	}
 	return out
+}
+
+// roomHookFormContentType reports whether a delivery carries its payload as a
+// urlencoded "payload" field rather than as the body itself.
+func roomHookFormContentType(contentType string) bool {
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	return err == nil && mediaType == "application/x-www-form-urlencoded"
+}
+
+// roomHookPayload returns the JSON payload of a delivery - the bytes the
+// signature is computed over - and whether it exceeded roomHookMaxBodySize.
+//
+// Gitea offers two POST content types for a webhook (newDefaultRequest,
+// services/webhook/deliver.go): with "json" the body is the payload, with
+// "form" the payload is the value of a single urlencoded "payload" field. The
+// HMAC covers t.PayloadContent - the JSON - in both cases, so both are
+// verifiable; they differ only in where the bytes are.
+//
+// A form delivery cannot be read from ctx.Req.Body at all: sudo() wraps the
+// whole API router and calls ctx.FormString("sudo"), which runs ParseForm and
+// drains a urlencoded body long before this handler. Reading the parsed value
+// is what makes the form content type work instead of turning every delivery
+// into an empty body, an empty claim and a 400 that looks in the audit log
+// exactly like a caller probing for repository names.
+func roomHookPayload(req *http.Request) ([]byte, bool, error) {
+	if roomHookFormContentType(req.Header.Get("Content-Type")) {
+		// ParseForm has run; the declared length is the only pre-parse measure
+		// of the request left, and answering 413 on it keeps an oversized form
+		// delivery from being reported as a malformed one.
+		if req.ContentLength > roomHookMaxBodySize {
+			return nil, true, nil
+		}
+		payload := req.PostFormValue("payload")
+		if len(payload) > roomHookMaxBodySize {
+			return nil, true, nil
+		}
+		return []byte(payload), false, nil
+	}
+	// One byte over the cap is read on purpose: it is what distinguishes a
+	// delivery that exactly fills the budget from one that was truncated.
+	body, err := io.ReadAll(io.LimitReader(req.Body, roomHookMaxBodySize+1))
+	if err != nil {
+		return nil, false, err
+	}
+	if len(body) > roomHookMaxBodySize {
+		return nil, true, nil
+	}
+	return body, false, nil
 }
 
 // RoomHook handles POST /api/v1/robot/room/hook, the inbound webhook endpoint
 // of branch-as-room automation (issue #56). It accepts Gitea webhook
 // deliveries signed with the repository's secret, derived from the
 // instance-wide ROOM_HOOK_SECRET in app.ini (see roomHookSecretForRepo); with
-// no secret configured the route is disabled and answers 404, and an unsigned
-// or badly-signed delivery is always rejected with 401.
+// the feature disabled or no secret configured the route answers 404, and an
+// unsigned or badly-signed delivery is always rejected with 401.
 func RoomHook(ctx *context.APIContext) {
+	// [issue_graph] ENABLED is the master switch of the whole feature, and the
+	// three sibling robot routes gate on it first (robot.go, ready_graph.go).
+	// This is the only one of the four that *writes*, so it is the last one
+	// that may keep running after an operator has switched the feature off.
+	if !setting.IsIssueGraphEnabled() {
+		ctx.APIErrorNotFound()
+		return
+	}
 	master := setting.IssueGraphSettings.RoomHookSecret
 	if master == "" {
 		// Route disabled: indistinguishable from "no such route".
@@ -523,15 +619,14 @@ func RoomHook(ctx *context.APIContext) {
 		return
 	}
 
-	// One byte over the cap is read on purpose: it is what distinguishes a
-	// delivery that exactly fills the budget from one that was truncated.
-	body, err := io.ReadAll(io.LimitReader(ctx.Req.Body, roomHookMaxBodySize+1))
+	body, tooLarge, err := roomHookPayload(ctx.Req)
 	if err != nil {
 		ctx.APIError(http.StatusBadRequest, "cannot read payload")
 		return
 	}
-	if len(body) > roomHookMaxBodySize {
-		// The body was never parsed, so the audit record names no repository.
+	if tooLarge {
+		// The payload was never read for its claim, so the audit record names
+		// no repository.
 		roomAudit(ctx, nil, roomRepoClaim{}, false, "body_too_large")
 		ctx.APIError(http.StatusRequestEntityTooLarge, "payload too large")
 		return

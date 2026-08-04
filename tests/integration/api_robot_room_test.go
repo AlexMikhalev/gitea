@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -39,13 +40,15 @@ func createRawGitBranch(t *testing.T, repo *repo_model.Repository, name, sha str
 	require.NoError(t, err)
 }
 
-// deleteRawGitBranch removes a branch created by createRawGitBranch.
-func deleteRawGitBranch(t *testing.T, repo *repo_model.Repository, name string) func() {
-	return func() {
-		_, _, _ = gitcmd.NewCommand("branch", "-D").AddDynamicArguments(name).
-			WithDir(repo.RepoPath()).
-			RunStdString(t.Context())
-	}
+// deleteRawGitBranch removes a branch created by createRawGitBranch. It is a
+// plain call rather than a cleanup-closure factory so that `defer
+// deleteRawGitBranch(...)` deletes the branch instead of discarding a closure:
+// a leftover feat/* branch is not inert here, it is another head a later
+// subtest's status delivery resolves to.
+func deleteRawGitBranch(t *testing.T, repo *repo_model.Repository, name string) {
+	_, _, _ = gitcmd.NewCommand("branch", "-D").AddDynamicArguments(name).
+		WithDir(repo.RepoPath()).
+		RunStdString(t.Context())
 }
 
 // signRoomHookBody computes the X-Gitea-Signature value for a webhook delivery.
@@ -84,6 +87,22 @@ func makeRoomHookRequest(t *testing.T, event, body, sig string, expectedStatus i
 	return MakeRequest(t, req, expectedStatus)
 }
 
+// makeRoomHookFormRequest POSTs a webhook delivery the way a webhook whose
+// content type is "form" does: the JSON payload - the bytes the signature
+// covers - travels as a single urlencoded "payload" field
+// (newDefaultRequest, services/webhook/deliver.go).
+func makeRoomHookFormRequest(t *testing.T, event, payload, sig string, expectedStatus int) *httptest.ResponseRecorder {
+	t.Helper()
+	form := url.Values{"payload": []string{payload}}.Encode()
+	req := NewRequestWithBody(t, "POST", "/api/v1/robot/room/hook", strings.NewReader(form)).
+		SetHeader("X-Gitea-Event", event).
+		SetHeader("Content-Type", "application/x-www-form-urlencoded")
+	if sig != "" {
+		req.SetHeader("X-Gitea-Signature", sig)
+	}
+	return MakeRequest(t, req, expectedStatus)
+}
+
 // roomPushPayload builds a push payload for repo1 (owned by user2).
 func roomPushPayload(ref, after string) string {
 	return fmt.Sprintf(`{"ref":%q,"after":%q,`+
@@ -110,6 +129,10 @@ func TestAPIRobotRoom(t *testing.T) {
 	setting.IssueGraphSettings.RoomHookSecret = roomHookTestSecret
 	defer func() { setting.IssueGraphSettings.RoomHookSecret = oldSecret }()
 
+	oldEnabled := setting.IssueGraphSettings.Enabled
+	setting.IssueGraphSettings.Enabled = true
+	defer func() { setting.IssueGraphSettings.Enabled = oldEnabled }()
+
 	const (
 		branch = "feat/room-inttest"
 		ref    = "refs/heads/" + branch
@@ -122,6 +145,42 @@ func TestAPIRobotRoom(t *testing.T) {
 		defer func() { setting.IssueGraphSettings.RoomHookSecret = roomHookTestSecret }()
 		body := roomPushPayload(ref, head)
 		makeRoomHookRequest(t, "push", body, signRoomDelivery(body), http.StatusNotFound)
+	})
+
+	t.Run("RouteDisabledWithFeatureOff", func(t *testing.T) {
+		// [issue_graph] ENABLED is the feature's master switch: an operator who
+		// turns the issue graph off during an incident turns off the one robot
+		// route that writes, not just the three that read. A correctly signed
+		// delivery is refused, and nothing is written.
+		const offBranch = "feat/room-inttest-featureoff"
+		setting.IssueGraphSettings.Enabled = false
+		defer func() { setting.IssueGraphSettings.Enabled = true }()
+
+		body := roomPushPayload("refs/heads/"+offBranch, head)
+		makeRoomHookRequest(t, "push", body, signRoomDelivery(body), http.StatusNotFound)
+		assert.Equal(t, 0, unittest.GetCount(t, &issues_model.Issue{RepoID: 1, Title: "Room: " + offBranch}))
+	})
+
+	t.Run("FormContentTypeDeliveryAccepted", func(t *testing.T) {
+		// Gitea webhooks offer "form" as well as "json" (services/webhook/
+		// deliver.go), and the signature covers the JSON payload in both cases.
+		// sudo() has already run ParseForm and drained the body by the time the
+		// hook is reached, so the payload has to be read from the parsed field -
+		// otherwise every form delivery is an empty body, an empty repository
+		// claim and a 400 that reads in the audit log like a caller probing for
+		// repository names.
+		const formBranch = "feat/room-inttest-form"
+		formTitle := "Room: " + formBranch
+
+		payload := roomPushPayload("refs/heads/"+formBranch, head)
+		makeRoomHookFormRequest(t, "push", payload, signRoomDelivery(payload), http.StatusOK)
+		issue := unittest.AssertExistsAndLoadBean(t, &issues_model.Issue{RepoID: 1, Title: formTitle})
+		assert.False(t, issue.IsClosed)
+
+		// The signature is over the payload, not over the form encoding: a
+		// form delivery signed with the wrong secret is refused like any other.
+		makeRoomHookFormRequest(t, "push", payload, signRoomHookBody(roomHookTestSecret, payload), http.StatusUnauthorized)
+		assert.Equal(t, 1, unittest.GetCount(t, &issues_model.Issue{RepoID: 1, Title: formTitle}))
 	})
 
 	t.Run("UnsignedRejected", func(t *testing.T) {
@@ -418,6 +477,47 @@ func TestAPIRobotRoom(t *testing.T) {
 			`"repository":{"name":"repo1","owner":{"login":"user2"}},"sender":{"login":"user2"}}`, parentID.String())
 		makeRoomHookRequest(t, "status", parentBody, signRoomDelivery(parentBody), http.StatusAccepted)
 		assert.Equal(t, before+1, countComments())
+	})
+
+	t.Run("StatusFansOutToEveryFeatBranchAtTheSameHead", func(t *testing.T) {
+		// Two feat/* branches can point at one commit, and the status then
+		// belongs to both rooms. The heads come out of a single reference walk
+		// (featBranchesAtHead), so this is what pins that the walk reports
+		// every match rather than the first - and that it pairs each ref with
+		// its own object id.
+		repo1 := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 1})
+
+		gitRepo, err := gitrepo.OpenRepository(t.Context(), repo1)
+		require.NoError(t, err)
+		headSHA, err := gitRepo.GetBranchCommitID("branch2")
+		require.NoError(t, err)
+		gitRepo.Close()
+
+		branches := []string{"feat/room-inttest-fanout-a", "feat/room-inttest-fanout-b"}
+		issues := make([]*issues_model.Issue, 0, len(branches))
+		for _, name := range branches {
+			createRawGitBranch(t, repo1, name, headSHA)
+			defer deleteRawGitBranch(t, repo1, name)
+			// A marker head that matches nothing, so only git resolution finds
+			// these rooms.
+			openBody := roomPushPayload("refs/heads/"+name, "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+			makeRoomHookRequest(t, "push", openBody, signRoomDelivery(openBody), http.StatusOK)
+			issues = append(issues, unittest.AssertExistsAndLoadBean(t,
+				&issues_model.Issue{RepoID: 1, Title: "Room: " + name}))
+		}
+		countComments := func(issue *issues_model.Issue) int {
+			return unittest.GetCount(t, &issues_model.Comment{IssueID: issue.ID, Type: issues_model.CommentTypeComment})
+		}
+		before := []int{countComments(issues[0]), countComments(issues[1])}
+
+		statusBody := fmt.Sprintf(`{"sha":%q,"state":"success","context":"ci/fanout",`+
+			`"repository":{"name":"repo1","owner":{"login":"user2"}},"sender":{"login":"user2"}}`, headSHA)
+		resp := makeRoomHookRequest(t, "status", statusBody, signRoomDelivery(statusBody), http.StatusOK)
+		var payload map[string]any
+		DecodeJSON(t, resp, &payload)
+		assert.ElementsMatch(t, []any{branches[0], branches[1]}, payload["branches"])
+		assert.Equal(t, before[0]+1, countComments(issues[0]))
+		assert.Equal(t, before[1]+1, countComments(issues[1]))
 	})
 
 	t.Run("StatusWithoutOpenRoomReportsNoOpenRoom", func(t *testing.T) {
