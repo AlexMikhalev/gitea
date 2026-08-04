@@ -48,7 +48,22 @@ func validateOwnerRepoInput(owner, repo string) error {
 		return errors.New("invalid characters in owner or repo name")
 	}
 
+	// Control characters, newline first among them. Every value that reaches
+	// here is also written to the audit log as one [ROBOT_AUDIT] line
+	// (services/robot/audit.go), and the log formatter strips only a trailing
+	// newline (modules/log/event_format.go) - so an embedded one would let a
+	// caller append a second, forged record of their own choosing. A real
+	// owner or repository name never contains one.
+	if strings.ContainsFunc(owner, isControlRune) || strings.ContainsFunc(repo, isControlRune) {
+		return errors.New("invalid characters in owner or repo name")
+	}
+
 	return nil
+}
+
+// isControlRune reports whether r is a C0/C1 control character or DEL.
+func isControlRune(r rune) bool {
+	return r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f)
 }
 
 // checkRepoPermission checks if the current user has permission to read issues in the repository

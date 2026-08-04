@@ -70,7 +70,153 @@ ENABLED = true
 PAGERANK_CACHE_TTL = 300
 AUDIT_LOG = true
 STRICT_MODE = false
+ROOM_HOOK_SECRET =
 ```
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `ENABLED` | `true` | Master switch for the issue graph feature, **including the branch-as-room webhook** — `false` makes all four routes answer 404 |
+| `PAGERANK_CACHE_TTL` | `300` | PageRank cache expiration, seconds |
+| `AUDIT_LOG` | `true` | Write `[ROBOT_AUDIT]` records for Robot API access |
+| `STRICT_MODE` | `false` | Return 404 on any error, never 500 |
+| `ROOM_HOOK_SECRET` | *(empty)* | Master secret for the branch-as-room webhook. **Empty disables the route** — see below |
+
+---
+
+## Branch-as-room Webhook (`POST /api/v1/robot/room/hook`)
+
+The branch-as-room automation (issue #56) receives Gitea webhook deliveries and opens, comments on,
+and closes one "room" issue per `feat/*` branch. It is the only Robot API route that **writes**, and
+the only one authenticated by a signature rather than a token.
+
+### Enabling it
+
+```ini
+[issue_graph]
+ENABLED = true
+ROOM_HOOK_SECRET = <long random string, e.g. `openssl rand -hex 32`>
+```
+
+**An empty or missing `ROOM_HOOK_SECRET` disables the route: it answers 404, exactly as if it did not
+exist.** This is deliberate — a disabled route must not be distinguishable from an absent one — but it
+also means a typo in the key name silently turns the feature off rather than failing loudly. If
+deliveries return 404, check the spelling of the key and the `[issue_graph]` section header first.
+
+**`ENABLED = false` disables it as well**, and it is the switch to reach for to stop robot automation
+in an incident: the master switch turns off the route that *writes*, not just the three read-only
+ones. `ENABLED` is checked first, the secret second, and both answer 404 — so a 404 means either.
+
+### Per-repository secrets (do not hand out `ROOM_HOOK_SECRET`)
+
+`ROOM_HOOK_SECRET` is a **master secret and never goes into a webhook configuration**. Each
+repository's webhook secret is derived from it:
+
+```
+repo_secret = HMAC-SHA256(ROOM_HOOK_SECRET, "gitea-robot/room:v1:<owner>/<repo>")   # lower-case owner and repo, hex output
+```
+
+```bash
+# The webhook secret to configure on acme/project:
+printf 'gitea-robot/room:v1:acme/project' | openssl dgst -sha256 -mac HMAC -macopt "key:$ROOM_HOOK_SECRET" -r | cut -d' ' -f1
+```
+
+A delivery is verified with the secret of the repository **it names in its payload**, so:
+
+- A repo admin can be given their own repository's derived secret without being able to forge
+  deliveries for any other repository — computing another repository's secret needs the master.
+- The master secret itself never verifies a delivery, and stays inside `app.ini` and the site-admin
+  trust boundary.
+- Rotating the master secret invalidates every repository's derived secret at once; rotate one
+  repository by moving it to a new master only if you are prepared to reconfigure them all.
+
+Configure the derived value as the **Secret** of a repository webhook pointing at
+`https://<instance>/api/v1/robot/room/hook`, with the `Push`, `Delete`, `Pull Request` and
+`Repository status` events enabled.
+
+### Content type
+
+Use **`application/json`**. Gitea's `form` content type is accepted too — it sends the same signed
+JSON as a urlencoded `payload` field, and the hook reads it from there — but prefer JSON: the 4 MiB
+cap below is applied at the read for a JSON delivery, while a urlencoded body has already been
+buffered by `net/http`'s own 10 MB `ParseForm` limit before the handler sees it (`sudo()` wraps the
+whole API router and parses the form). Those are the only two content types a Gitea webhook sends;
+anything that is not urlencoded is read as a raw JSON body, and a body that is not the signed JSON
+payload is refused with 400 (`invalid_repo_claim` in the audit log).
+
+### Authorization of writes
+
+A valid signature authenticates the *repository*, never a user. The `sender` in the payload is
+therefore treated as an attribution preference, not a credential:
+
+| Step | Rule | On failure |
+|------|------|------------|
+| Enabled | `[issue_graph] ENABLED` and a non-empty `ROOM_HOOK_SECRET` — checked before the request is looked at | 404 |
+| Size | The payload is read under a 4 MiB cap, *before* anything else — the signature is over the payload, so the payload comes first (see **Content type**: for a `form` delivery the cap applies to the parsed field, not to the read) | 413 |
+| Claim | The payload's `repository` owner/name must be a plausible name: length-capped, no path traversal, no separator or control characters | 400 |
+| Signature | HMAC-SHA256 over the raw body, in `X-Gitea-Signature` (raw hex) or `X-Hub-Signature-256` (`sha256=` prefixed) | 401 |
+| Repository | The repository named in the payload (the same one whose secret verified the delivery) | 404 |
+| Archived | The repository must not be archived — the same rule every other API write path applies | 423 |
+| Actor | `sender`, else the repository owner; must be an active individual account | 403 |
+| Permission | The actor needs **write access to issues** on that repository | 403 |
+
+There is no site-admin fallback: an organization-owned repository whose delivery names no eligible
+actor is refused (403) rather than having its rooms authored by whichever site admin has the lowest
+user id.
+
+#### `sender` is authorship, and a secret-holder chooses it
+
+The permission check above bounds what the delivery can *do*; it does not bound whose name is on it.
+Whoever holds a repository's derived hook secret — which is every repo admin who configured the
+webhook — can put any user with issue-write access on that repository into `sender`, and the room
+issue, its CI comments and the `[ROBOT_AUDIT]` record will all name that user. **This is authorship
+attribution the holder could not otherwise perform**, and it is the price of running the automation
+under maintainers' own names rather than a service account.
+
+It stops at the repository boundary and at the permission check: no other repository can be written,
+and no account without issue-write on this one can be named. If that trade is not acceptable, give
+the repository's webhook a dedicated bot account as `sender` (any account with issue-write does), or
+do not hand out the derived secret.
+
+#### What is and is not idempotent
+
+| Operation | Repeat behaviour |
+|-----------|------------------|
+| Room open (push) | Idempotent — one room per branch, looked up by title and marker; a re-push refreshes the marker head, and a push to a branch whose room was closed reopens that room rather than opening a second one. `gitea-robot room open` applies the same rule, so the manual path cannot duplicate a room the hook closed |
+| Room close (delete, merged PR, zero-SHA push) | Idempotent — closing a closed room is a no-op |
+| Status comment | Idempotent **against the room's newest comment only**: a redelivery of the same status writes nothing (`"duplicate"` in the response), but a status that repeats after a *different* comment landed in between is treated as a new event and posts again |
+
+A status delivery is not transactional across branches: a SHA that is the head of two `feat/*`
+branches posts one comment per branch, and a failure on the second answers 500 after the first was
+written. Redelivering is the correct response — the comment that already landed is recognised.
+
+A merged pull request closes the room only when its head branch belongs to the same repository as
+its base. A merge from a fork leaves the base repository's own same-named room alone.
+
+### Anonymous API access is required
+
+The delivery carries no token. On instances with strict sign-in
+(`[service] REQUIRE_SIGNIN_VIEW = true`), tokenless API requests are rejected with **403 before the
+HMAC check runs** (`routers/api/v1/api.go`, `verifyAuthWithOptions`). The room hook only works where
+anonymous API access is allowed. If every delivery fails with 403 and no `[ROBOT_AUDIT]` record
+appears, this is the cause — the request never reached the handler.
+
+### Audit records
+
+Both outcomes are logged, so a caller probing for repository names is visible:
+
+```
+[ROBOT_AUDIT] status=DENIED  user=webhook(uid=0) repo=/           endpoint=/api/v1/robot/room/hook ... reason=body_too_large
+[ROBOT_AUDIT] status=DENIED  user=webhook(uid=0) repo=/           endpoint=/api/v1/robot/room/hook ... reason=invalid_repo_claim
+[ROBOT_AUDIT] status=DENIED  user=webhook(uid=0) repo=acme/project endpoint=/api/v1/robot/room/hook ... reason=bad_signature
+[ROBOT_AUDIT] status=DENIED  user=webhook(uid=0) repo=acme/project endpoint=/api/v1/robot/room/hook ... reason=repo_not_found
+[ROBOT_AUDIT] status=DENIED  user=webhook(uid=0) repo=acme/project endpoint=/api/v1/robot/room/hook ... reason=repo_archived
+[ROBOT_AUDIT] status=DENIED  user=webhook(uid=0) repo=acme/project endpoint=/api/v1/robot/room/hook ... reason=actor_denied
+[ROBOT_AUDIT] status=SUCCESS user=alice(uid=7)   repo=acme/project endpoint=/api/v1/robot/room/hook ...
+```
+
+The two records above the signature line name no repository on purpose: their delivery was refused
+*before* its claimed owner/repo had passed validation, and an unvalidated payload string never
+reaches a log line.
 
 ---
 
@@ -261,6 +407,10 @@ Before deploying to production:
 - [ ] Verify PageRank caching works (second request should be faster)
 - [ ] Check audit logs are being written
 - [ ] Configure log rotation for audit logs
+- [ ] If using branch-as-room: set `ROOM_HOOK_SECRET` (and leave `ENABLED = true`), verify the route no longer answers 404
+- [ ] If using branch-as-room: set each repository webhook's content type to `application/json`
+- [ ] If using branch-as-room: configure each repository's webhook with its **derived** secret, never the master
+- [ ] If using branch-as-room: confirm anonymous API access is allowed (`REQUIRE_SIGNIN_VIEW` not strict)
 
 ---
 
@@ -300,6 +450,7 @@ Before deploying to production:
 | Version | Date | Changes |
 |---------|------|---------|
 | 1.0.0 | 2026-04-08 | Initial secure implementation with auth, audit, caching |
+| 1.1.0 | 2026-08-04 | Branch-as-room webhook: per-repository derived secrets, actor permission check, failure-path audit records |
 
 ---
 
