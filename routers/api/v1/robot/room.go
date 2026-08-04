@@ -43,6 +43,19 @@ const roomHookEndpoint = "/api/v1/robot/room/hook"
 // into a full scan of the repository's open issues.
 const roomLookupLimit = 20
 
+// roomHookMaxBodySize caps the delivery body this route will buffer.
+//
+// The route is reachable with no credential at all - the signature is computed
+// over the body, so the body has to be read before anything about the caller
+// is known - and io.ReadAll on an unauthenticated request means an anonymous
+// caller decides how much server memory one request costs. The cap is what
+// bounds that, and it has to be applied at the read rather than after it.
+//
+// 4 MiB is far above any real delivery: a push payload carries at most
+// [ui] FEED_MAX_COMMIT_NUM commits (default 5, services/repository/push.go),
+// and delete, pull_request and status payloads are a repository plus a user.
+const roomHookMaxBodySize = 4 << 20
+
 // featBranch reports whether branch is a non-empty feat/* branch name. All
 // three entry points (push refs, delete refs, merged PR head refs) agree on
 // this definition, so a bare "feat/" is a branch to none of them.
@@ -279,19 +292,66 @@ func closeRoom(ctx *context.APIContext, repository *repo_model.Repository, doer 
 	return true, nil
 }
 
+// roomStatusResult reports what a status delivery did to one branch's room.
+type roomStatusResult int
+
+const (
+	// roomStatusNoRoom: the branch has no open room to comment on.
+	roomStatusNoRoom roomStatusResult = iota
+	// roomStatusPosted: a comment was created.
+	roomStatusPosted
+	// roomStatusDuplicate: the room's newest comment already said exactly
+	// this, so nothing was written.
+	roomStatusDuplicate
+)
+
+// lastRoomComment returns the content of the newest ordinary comment on the
+// issue, if it has one. Only the newest matters: it is the one a repeat of the
+// delivery that wrote it would duplicate.
+func lastRoomComment(ctx *context.APIContext, issueID int64) (string, bool, error) {
+	comment := new(issues_model.Comment)
+	has, err := db.GetEngine(ctx).
+		Where("`comment`.issue_id = ?", issueID).
+		And("`comment`.type = ?", issues_model.CommentTypeComment).
+		OrderBy("`comment`.id DESC").
+		Limit(1).
+		Get(comment)
+	if err != nil || !has {
+		return "", false, err
+	}
+	return comment.Content, true, nil
+}
+
 // statusComment appends one CI status comment to the room issue for branch.
 // The comment shape comes from modules/robotroom, shared with the gitea-robot
 // CLI, so hook-posted and CLI-posted comments are byte-identical.
-func statusComment(ctx *context.APIContext, repository *repo_model.Repository, doer *user_model.User, branch string, p *api.CommitStatusPayload) (bool, error) {
+//
+// That determinism is also what makes the write idempotent against a repeat:
+// a status delivery is not transactional across branches (a SHA that is the
+// head of two feat/* branches gets one comment each, and a failure on the
+// second answers 500 after the first was written), so "Redeliver" - and any
+// replay of a captured signed delivery - would otherwise duplicate every
+// comment that had already landed. A delivery whose comment is byte-identical
+// to the room's newest one is therefore a no-op rather than a second copy.
+// This does not deduplicate against an *older* comment: a status that repeats
+// after a different one was posted in between is a genuine new event.
+func statusComment(ctx *context.APIContext, repository *repo_model.Repository, doer *user_model.User, branch string, p *api.CommitStatusPayload) (roomStatusResult, error) {
 	existing, found, err := findRoomIssue(ctx, repository.ID, branch)
 	if err != nil || !found {
-		return false, err
+		return roomStatusNoRoom, err
 	}
 	body := robotroom.StatusComment(p.State, p.Context, p.SHA, p.TargetURL, p.Description)
-	if _, err := issue_service.CreateIssueComment(ctx, doer, repository, existing, body, nil); err != nil {
-		return false, err
+	last, has, err := lastRoomComment(ctx, existing.ID)
+	if err != nil {
+		return roomStatusNoRoom, err
 	}
-	return true, nil
+	if has && last == body {
+		return roomStatusDuplicate, nil
+	}
+	if _, err := issue_service.CreateIssueComment(ctx, doer, repository, existing, body, nil); err != nil {
+		return roomStatusNoRoom, err
+	}
+	return roomStatusPosted, nil
 }
 
 // errRoomActorUnknown means the delivery named no user who could act on the
@@ -385,6 +445,17 @@ func roomTarget(ctx *context.APIContext, claim roomRepoClaim, sender *api.User) 
 		ctx.APIErrorNotFound()
 		return nil, nil, false
 	}
+	// An archived repository is immutable to every other API write path
+	// (mustNotBeArchived, routers/api/v1/api.go, 423 Locked). IsArchived is not
+	// part of a repository permission, so the check below would not catch it:
+	// without this, a status delivery or a webhook redelivery would still open,
+	// comment on and close issues in a repository the API otherwise refuses to
+	// write to at all.
+	if repository.IsArchived {
+		roomAudit(ctx, nil, claim, false, "repo_archived")
+		ctx.APIError(http.StatusLocked, fmt.Errorf("%s is archived", repository.FullName()))
+		return nil, nil, false
+	}
 	doer, err := resolveRoomDoer(ctx, repository, sender)
 	if err != nil {
 		if errors.Is(err, errRoomActorUnknown) || errors.Is(err, errRoomActorDenied) {
@@ -452,9 +523,17 @@ func RoomHook(ctx *context.APIContext) {
 		return
 	}
 
-	body, err := io.ReadAll(ctx.Req.Body)
+	// One byte over the cap is read on purpose: it is what distinguishes a
+	// delivery that exactly fills the budget from one that was truncated.
+	body, err := io.ReadAll(io.LimitReader(ctx.Req.Body, roomHookMaxBodySize+1))
 	if err != nil {
 		ctx.APIError(http.StatusBadRequest, "cannot read payload")
+		return
+	}
+	if len(body) > roomHookMaxBodySize {
+		// The body was never parsed, so the audit record names no repository.
+		roomAudit(ctx, nil, roomRepoClaim{}, false, "body_too_large")
+		ctx.APIError(http.StatusRequestEntityTooLarge, "payload too large")
 		return
 	}
 
@@ -463,6 +542,17 @@ func RoomHook(ctx *context.APIContext) {
 	// only narrows what the delivery can be accepted as: naming another
 	// repository means having to sign with that repository's secret.
 	claim := roomPayloadRepoClaim(body)
+	if err := validateOwnerRepoInput(claim.Owner, claim.Name); err != nil {
+		// Same validator the token-authenticated robot routes run before they
+		// audit (robot.go, ready_graph.go). It matters more here: this is the
+		// one robot route an unauthenticated caller reaches, so without it the
+		// only thing between a payload string and the audit log is the log
+		// formatter. A claim that fails it can name no repository either, so
+		// there is nothing to distinguish by answering before the signature.
+		roomAudit(ctx, nil, roomRepoClaim{}, false, "invalid_repo_claim")
+		ctx.APIError(http.StatusBadRequest, "invalid repository in payload")
+		return
+	}
 	if !verifyRoomHookSignature(roomHookSecretForRepo(master, claim.Owner, claim.Name), body,
 		ctx.Req.Header.Get("X-Gitea-Signature"),
 		ctx.Req.Header.Get("X-Hub-Signature-256")) {
@@ -569,8 +659,26 @@ func handleRoomDelete(ctx *context.APIContext, body []byte, claim roomRepoClaim)
 // mergedFeatBranch returns the merged feat/* head branch of a pull_request
 // payload, if the payload represents a merge that should close a room. A PR
 // closed without merging leaves the branch (and its room) alone.
+//
+// The head has to live in the same repository as the base. A merge payload's
+// "repository" is the *base* repo (services/webhook/notifier.go), while the
+// head of a fork PR is a branch in someone else's repository - so closing on
+// the head's bare name would close the base repository's own, still-active
+// room whenever a fork contributed a branch of the same name. RepoID is the
+// comparison because it is what services/convert/pull.go sets on both sides,
+// and it is -1 rather than the base id when the head repository is gone.
 func mergedFeatBranch(p *api.PullRequestPayload) (string, bool) {
-	if p.Action != api.HookIssueClosed || p.PullRequest == nil || !p.PullRequest.HasMerged || p.PullRequest.Head == nil {
+	if p.Action != api.HookIssueClosed || p.PullRequest == nil || !p.PullRequest.HasMerged {
+		return "", false
+	}
+	if p.PullRequest.Head == nil || p.PullRequest.Base == nil {
+		return "", false
+	}
+	// A payload that carries no repository ids cannot answer the question, so
+	// it does not get to close anything: Gitea always sets the base id
+	// (services/convert/pull.go), and matching two absent ids would put the
+	// fork case straight back.
+	if p.PullRequest.Base.RepoID <= 0 || p.PullRequest.Head.RepoID != p.PullRequest.Base.RepoID {
 		return "", false
 	}
 	branch := p.PullRequest.Head.Ref
@@ -641,17 +749,23 @@ func handleRoomStatus(ctx *context.APIContext, body []byte, claim roomRepoClaim)
 	}
 
 	commented := make([]string, 0, len(branches))
+	duplicate := make([]string, 0, len(branches))
 	for _, branch := range branches {
-		posted, err := statusComment(ctx, repository, doer, branch, &p)
+		result, err := statusComment(ctx, repository, doer, branch, &p)
 		if err != nil {
 			roomMutationError(ctx, doer, claim, err)
 			return
 		}
-		if posted {
+		switch result {
+		case roomStatusPosted:
 			commented = append(commented, branch)
+		case roomStatusDuplicate:
+			// Already said, so nothing was written - reported separately so a
+			// redelivery is visibly a no-op rather than silently a success.
+			duplicate = append(duplicate, branch)
 		}
 	}
-	if len(commented) == 0 {
+	if len(commented) == 0 && len(duplicate) == 0 {
 		// The SHA is a feat/* branch head, but no open room exists for it
 		// (the room was closed manually, or the branch was pushed while the
 		// hook secret was unset): report that distinctly instead of claiming
@@ -660,7 +774,7 @@ func handleRoomStatus(ctx *context.APIContext, body []byte, claim roomRepoClaim)
 		return
 	}
 	roomAudit(ctx, doer, claim, true, "")
-	ctx.JSON(http.StatusOK, map[string]any{"status": "commented", "branches": commented})
+	ctx.JSON(http.StatusOK, map[string]any{"status": "commented", "branches": commented, "duplicate": duplicate})
 }
 
 // isHexSHA reports whether s is a non-empty hex string. It gates the marker

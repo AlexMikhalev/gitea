@@ -135,14 +135,46 @@ therefore treated as an attribution preference, not a credential:
 
 | Step | Rule | On failure |
 |------|------|------------|
+| Size | The body is read under a 4 MiB cap, *before* anything else — the signature is over the body, so the body comes first | 413 |
+| Claim | The payload's `repository` owner/name must be a plausible name: length-capped, no path traversal, no separator or control characters | 400 |
 | Signature | HMAC-SHA256 over the raw body, in `X-Gitea-Signature` (raw hex) or `X-Hub-Signature-256` (`sha256=` prefixed) | 401 |
 | Repository | The repository named in the payload (the same one whose secret verified the delivery) | 404 |
+| Archived | The repository must not be archived — the same rule every other API write path applies | 423 |
 | Actor | `sender`, else the repository owner; must be an active individual account | 403 |
 | Permission | The actor needs **write access to issues** on that repository | 403 |
 
 There is no site-admin fallback: an organization-owned repository whose delivery names no eligible
 actor is refused (403) rather than having its rooms authored by whichever site admin has the lowest
 user id.
+
+#### `sender` is authorship, and a secret-holder chooses it
+
+The permission check above bounds what the delivery can *do*; it does not bound whose name is on it.
+Whoever holds a repository's derived hook secret — which is every repo admin who configured the
+webhook — can put any user with issue-write access on that repository into `sender`, and the room
+issue, its CI comments and the `[ROBOT_AUDIT]` record will all name that user. **This is authorship
+attribution the holder could not otherwise perform**, and it is the price of running the automation
+under maintainers' own names rather than a service account.
+
+It stops at the repository boundary and at the permission check: no other repository can be written,
+and no account without issue-write on this one can be named. If that trade is not acceptable, give
+the repository's webhook a dedicated bot account as `sender` (any account with issue-write does), or
+do not hand out the derived secret.
+
+#### What is and is not idempotent
+
+| Operation | Repeat behaviour |
+|-----------|------------------|
+| Room open (push) | Idempotent — one room per branch, looked up by title and marker; a re-push refreshes the marker head |
+| Room close (delete, merged PR, zero-SHA push) | Idempotent — closing a closed room is a no-op |
+| Status comment | Idempotent **against the room's newest comment only**: a redelivery of the same status writes nothing (`"duplicate"` in the response), but a status that repeats after a *different* comment landed in between is treated as a new event and posts again |
+
+A status delivery is not transactional across branches: a SHA that is the head of two `feat/*`
+branches posts one comment per branch, and a failure on the second answers 500 after the first was
+written. Redelivering is the correct response — the comment that already landed is recognised.
+
+A merged pull request closes the room only when its head branch belongs to the same repository as
+its base. A merge from a fork leaves the base repository's own same-named room alone.
 
 ### Anonymous API access is required
 
@@ -157,11 +189,18 @@ appears, this is the cause — the request never reached the handler.
 Both outcomes are logged, so a caller probing for repository names is visible:
 
 ```
+[ROBOT_AUDIT] status=DENIED  user=webhook(uid=0) repo=/           endpoint=/api/v1/robot/room/hook ... reason=body_too_large
+[ROBOT_AUDIT] status=DENIED  user=webhook(uid=0) repo=/           endpoint=/api/v1/robot/room/hook ... reason=invalid_repo_claim
 [ROBOT_AUDIT] status=DENIED  user=webhook(uid=0) repo=acme/project endpoint=/api/v1/robot/room/hook ... reason=bad_signature
 [ROBOT_AUDIT] status=DENIED  user=webhook(uid=0) repo=acme/project endpoint=/api/v1/robot/room/hook ... reason=repo_not_found
+[ROBOT_AUDIT] status=DENIED  user=webhook(uid=0) repo=acme/project endpoint=/api/v1/robot/room/hook ... reason=repo_archived
 [ROBOT_AUDIT] status=DENIED  user=webhook(uid=0) repo=acme/project endpoint=/api/v1/robot/room/hook ... reason=actor_denied
 [ROBOT_AUDIT] status=SUCCESS user=alice(uid=7)   repo=acme/project endpoint=/api/v1/robot/room/hook ...
 ```
+
+The two records above the signature line name no repository on purpose: their delivery was refused
+*before* its claimed owner/repo had passed validation, and an unvalidated payload string never
+reaches a log line.
 
 ---
 

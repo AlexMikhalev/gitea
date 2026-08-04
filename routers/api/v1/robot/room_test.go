@@ -178,14 +178,20 @@ func TestRoomEventPayloadParsing(t *testing.T) {
 // TestMergedFeatBranch covers the pull_request filter: only a closed+merged
 // PR from a feat/* branch closes a room; anything else is ignored.
 func TestMergedFeatBranch(t *testing.T) {
-	prPayload := func(action string, merged bool, headRef string) *api.PullRequestPayload {
+	// headRepoID is the repository the head branch lives in; base is always 1,
+	// the repository the merge payload is about.
+	prPayloadFrom := func(action string, merged bool, headRef string, headRepoID int64) *api.PullRequestPayload {
 		return &api.PullRequestPayload{
 			Action: api.HookIssueAction(action),
 			PullRequest: &api.PullRequest{
 				HasMerged: merged,
-				Head:      &api.PRBranchInfo{Ref: headRef},
+				Head:      &api.PRBranchInfo{Ref: headRef, RepoID: headRepoID},
+				Base:      &api.PRBranchInfo{Ref: "main", RepoID: 1},
 			},
 		}
+	}
+	prPayload := func(action string, merged bool, headRef string) *api.PullRequestPayload {
+		return prPayloadFrom(action, merged, headRef, 1)
 	}
 	tests := []struct {
 		name       string
@@ -200,6 +206,36 @@ func TestMergedFeatBranch(t *testing.T) {
 		{"opened feat PR", prPayload("opened", false, "feat/foo"), "", false},
 		{"no pull request", &api.PullRequestPayload{Action: api.HookIssueClosed}, "", false},
 		{"no head", &api.PullRequestPayload{Action: api.HookIssueClosed, PullRequest: &api.PullRequest{HasMerged: true}}, "", false},
+		{
+			// The payload's repository is the *base* repo, so a fork's
+			// feat/foo must not close the base repository's own feat/foo room.
+			"merged from a fork", prPayloadFrom("closed", true, "feat/foo", 2), "", false,
+		},
+		{
+			// convert.ToAPIPullRequest leaves the head id at -1 when the head
+			// repository is gone; that is not the base repository either.
+			"merged with the head repository deleted", prPayloadFrom("closed", true, "feat/foo", -1), "", false,
+		},
+		{
+			// Two absent ids must not compare equal, or the fork case is back.
+			"merged with no repository ids", &api.PullRequestPayload{
+				Action: api.HookIssueClosed,
+				PullRequest: &api.PullRequest{
+					HasMerged: true,
+					Head:      &api.PRBranchInfo{Ref: "feat/foo"},
+					Base:      &api.PRBranchInfo{Ref: "main"},
+				},
+			}, "", false,
+		},
+		{
+			"merged with no base", &api.PullRequestPayload{
+				Action: api.HookIssueClosed,
+				PullRequest: &api.PullRequest{
+					HasMerged: true,
+					Head:      &api.PRBranchInfo{Ref: "feat/foo", RepoID: 1},
+				},
+			}, "", false,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -211,8 +247,10 @@ func TestMergedFeatBranch(t *testing.T) {
 		})
 	}
 
-	// The wire shape: PRBranchInfo carries the branch name in "ref".
-	prJSON := `{"action":"closed","pull_request":{"merged":true,"head":{"ref":"feat/foo","label":"o:feat/foo"}},` +
+	// The wire shape: PRBranchInfo carries the branch name in "ref" and the
+	// repository it lives in in "repo_id".
+	prJSON := `{"action":"closed","pull_request":{"merged":true,` +
+		`"head":{"ref":"feat/foo","label":"o:feat/foo","repo_id":1},"base":{"ref":"main","repo_id":1}},` +
 		`"repository":{"name":"repo","owner":{"login":"owner"}},"sender":{"login":"user2"}}`
 	var pr api.PullRequestPayload
 	if err := json.Unmarshal([]byte(prJSON), &pr); err != nil {
@@ -220,6 +258,17 @@ func TestMergedFeatBranch(t *testing.T) {
 	}
 	if branch, ok := mergedFeatBranch(&pr); !ok || branch != "feat/foo" {
 		t.Errorf("wire payload resolved to (%q, %v), want (feat/foo, true)", branch, ok)
+	}
+
+	forkJSON := `{"action":"closed","pull_request":{"merged":true,` +
+		`"head":{"ref":"feat/foo","label":"forker:feat/foo","repo_id":42},"base":{"ref":"main","repo_id":1}},` +
+		`"repository":{"name":"repo","owner":{"login":"owner"}},"sender":{"login":"user2"}}`
+	var forkPR api.PullRequestPayload
+	if err := json.Unmarshal([]byte(forkJSON), &forkPR); err != nil {
+		t.Fatalf("fork pull_request payload did not parse: %v", err)
+	}
+	if branch, ok := mergedFeatBranch(&forkPR); ok {
+		t.Errorf("fork payload resolved to (%q, %v), want ignored", branch, ok)
 	}
 }
 

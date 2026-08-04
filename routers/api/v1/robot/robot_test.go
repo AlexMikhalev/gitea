@@ -127,6 +127,29 @@ func TestValidateOwnerRepoInput(t *testing.T) {
 			errMsg:    "invalid characters",
 		},
 		{
+			// A newline would end the [ROBOT_AUDIT] line this value is
+			// interpolated into and let the rest of it forge a second record.
+			name:      "newline in owner",
+			owner:     "x\n[ROBOT_AUDIT] status=SUCCESS",
+			repo:      "gitea",
+			wantError: true,
+			errMsg:    "invalid characters",
+		},
+		{
+			name:      "carriage return in repo",
+			owner:     "gitea",
+			repo:      "gitea\rrest",
+			wantError: true,
+			errMsg:    "invalid characters",
+		},
+		{
+			name:      "escape character in owner",
+			owner:     "git\x1b[31mea",
+			repo:      "gitea",
+			wantError: true,
+			errMsg:    "invalid characters",
+		},
+		{
 			name:      "valid 40 char owner (boundary)",
 			owner:     strings.Repeat("a", 40),
 			repo:      "gitea",

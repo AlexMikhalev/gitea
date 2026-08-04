@@ -89,6 +89,17 @@ const (
 		"satisfy - so it is out of reach for the same reason, one layer earlier"
 	exemptFederationInbox = "the ActivityPub inbox, which authenticates the *sending instance* by HTTP " +
 		"signature rather than acting for the caller"
+	exemptSignedWebhookDelivery = "the branch-as-room webhook, which authenticates the *repository* by an " +
+		"HMAC over the delivery body - a secret derived from ROOM_HOOK_SECRET - and carries no " +
+		"caller credential at all, NIP-98 or otherwise. reqHumanAuth() would therefore change " +
+		"nothing about it: the guard refuses requests made with an agent signature, and a request " +
+		"here is never made with one. What the delivery may do is bounded twice over instead - to " +
+		"the repository whose secret signed it, and to the issue-write permission of the actor it " +
+		"names, checked against that repository (routers/api/v1/robot/room.go). It plants no " +
+		"credential and grants no principal standing access; what it writes is issues and comments " +
+		"in one repository, which is exemptRepoWork's class of write reached by a different door. " +
+		"An operator who does not want that door open leaves ROOM_HOOK_SECRET empty, which makes " +
+		"the route answer 404. See docs/ROBOT_SECURITY.md"
 	exemptPathGroupCatchAll = "an artifact of web.Router.PathGroup, which registers the pattern for every " +
 		"HTTP method at the chi level and then dispatches inside RouterPathGroup.ServeHTTP against " +
 		"the matchers declared in it. Every matcher under this pattern is a GET or a HEAD, so a " +
@@ -392,6 +403,9 @@ var agentAuthExemptRoutes = map[string]string{
 	// FederationInbox
 	"POST /activitypub/user-id/{user-id}/inbox": exemptFederationInbox,
 	"POST /activitypub/user/{username}/inbox":   exemptFederationInbox,
+
+	// SignedWebhookDelivery
+	"POST /robot/room/hook": exemptSignedWebhookDelivery,
 
 	// exemptPathGroupCatchAll
 	"CONNECT /repos/{username}/{reponame}/commits/*": exemptPathGroupCatchAll,

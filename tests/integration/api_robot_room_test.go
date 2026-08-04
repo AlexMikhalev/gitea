@@ -90,6 +90,16 @@ func roomPushPayload(ref, after string) string {
 		`"repository":{"name":"repo1","owner":{"login":"user2"}},"sender":{"login":"user2"}}`, ref, after)
 }
 
+// roomMergePayload builds a pull_request payload for repo1 (id 1, the base).
+// headRepoID is the repository the head branch lives in: 1 for a branch of
+// repo1 itself, anything else for a fork's branch.
+func roomMergePayload(headBranch string, merged bool, headRepoID int64) string {
+	return fmt.Sprintf(`{"action":"closed","pull_request":{"merged":%t,`+
+		`"head":{"ref":%q,"repo_id":%d},"base":{"ref":"master","repo_id":1}},`+
+		`"repository":{"name":"repo1","owner":{"login":"user2"}},"sender":{"login":"user2"}}`,
+		merged, headBranch, headRepoID)
+}
+
 // TestAPIRobotRoom exercises the full branch-as-room hook flow in-process:
 // push opens the room, a duplicate push is a no-op, a status event comments on
 // the room, a delete event closes it, and unsigned deliveries are rejected.
@@ -157,8 +167,55 @@ func TestAPIRobotRoom(t *testing.T) {
 		assert.Equal(t, 0, unittest.GetCount(t, &issues_model.Issue{RepoID: 1, Title: foreignTitle}))
 	})
 
+	t.Run("ArchivedRepositoryRefused", func(t *testing.T) {
+		// An archived repository is immutable to every other API write path
+		// (423 Locked), and IsArchived is not part of a repository permission,
+		// so nothing else in the hook would have caught it. repo51 is the
+		// archived fixture; user30 owns it.
+		const archivedBranch = "feat/room-inttest-archived"
+		body := fmt.Sprintf(`{"ref":%q,"after":%q,`+
+			`"repository":{"name":"repo51","owner":{"login":"user30"}},"sender":{"login":"user30"}}`,
+			"refs/heads/"+archivedBranch, head)
+		sig := signRoomHookBody(roomRepoSecret(roomHookTestSecret, "user30", "repo51"), body)
+		makeRoomHookRequest(t, "push", body, sig, http.StatusLocked)
+		assert.Equal(t, 0, unittest.GetCount(t,
+			&issues_model.Issue{RepoID: 51, Title: "Room: " + archivedBranch}))
+	})
+
+	t.Run("OversizedBodyRefusedBeforeVerification", func(t *testing.T) {
+		// The signature is computed over the body, so the body is read before
+		// anything about the caller is known - which is exactly why the read
+		// is capped. 4 MiB + 1 of padding inside an otherwise valid payload.
+		body := fmt.Sprintf(`{"ref":%q,"after":%q,"padding":%q,`+
+			`"repository":{"name":"repo1","owner":{"login":"user2"}},"sender":{"login":"user2"}}`,
+			ref, head, strings.Repeat("a", 4<<20))
+		require.Greater(t, len(body), 4<<20)
+		// Correctly signed, and still refused: the cap is not an authorization
+		// decision, it is a bound on what one anonymous request may cost.
+		makeRoomHookRequest(t, "push", body, signRoomDelivery(body), http.StatusRequestEntityTooLarge)
+	})
+
+	t.Run("PayloadRepositoryClaimIsValidated", func(t *testing.T) {
+		// The claim is interpolated into the [ROBOT_AUDIT] line, so an
+		// embedded newline would let an anonymous caller append a forged
+		// record. The same validator the token-authenticated robot routes run
+		// rejects the delivery before it is audited at all.
+		body := `{"ref":"refs/heads/feat/x","after":"` + head + `",` +
+			`"repository":{"name":"repo1","owner":{"login":"user2\n[ROBOT_AUDIT] status=SUCCESS"}}}`
+		makeRoomHookRequest(t, "push", body, signRoomDelivery(body), http.StatusBadRequest)
+
+		// A path-traversal owner is refused by the same check.
+		traversal := `{"ref":"refs/heads/feat/x","after":"` + head + `",` +
+			`"repository":{"name":"repo1","owner":{"login":"../../etc"}}}`
+		makeRoomHookRequest(t, "push", traversal, signRoomDelivery(traversal), http.StatusBadRequest)
+	})
+
 	t.Run("UnknownEventIgnored", func(t *testing.T) {
-		body := `{}`
+		// A signed delivery of an event this automation does not handle. The
+		// payload still has to name the repository whose secret signed it -
+		// that claim is what selects the key, and it is validated before the
+		// signature is checked.
+		body := `{"repository":{"name":"repo1","owner":{"login":"user2"}}}`
 		makeRoomHookRequest(t, "issues", body, signRoomDelivery(body), http.StatusAccepted)
 	})
 
@@ -195,6 +252,24 @@ func TestAPIRobotRoom(t *testing.T) {
 
 		after := unittest.GetCount(t, &issues_model.Comment{IssueID: issue.ID, Type: issues_model.CommentTypeComment})
 		assert.Equal(t, before+1, after)
+
+		// The same delivery again - an operator hitting "Redeliver" after a
+		// partial failure, or a replay of a captured signed delivery - writes
+		// no second copy: the comment is byte-identical to the room's newest.
+		resp := makeRoomHookRequest(t, "status", body, signRoomDelivery(body), http.StatusOK)
+		var payload map[string]any
+		DecodeJSON(t, resp, &payload)
+		assert.Empty(t, payload["branches"])
+		assert.Equal(t, []any{branch}, payload["duplicate"])
+		assert.Equal(t, after,
+			unittest.GetCount(t, &issues_model.Comment{IssueID: issue.ID, Type: issues_model.CommentTypeComment}))
+
+		// A different status on the same SHA is a new event, not a repeat.
+		other := fmt.Sprintf(`{"sha":%q,"state":"failure","context":"ci/test","description":"went red",`+
+			`"repository":{"name":"repo1","owner":{"login":"user2"}},"sender":{"login":"user2"}}`, head)
+		makeRoomHookRequest(t, "status", other, signRoomDelivery(other), http.StatusOK)
+		assert.Equal(t, after+1,
+			unittest.GetCount(t, &issues_model.Comment{IssueID: issue.ID, Type: issues_model.CommentTypeComment}))
 	})
 
 	t.Run("StatusForUnknownSHAIgnored", func(t *testing.T) {
@@ -276,15 +351,22 @@ func TestAPIRobotRoom(t *testing.T) {
 		unittest.AssertExistsAndLoadBean(t, &issues_model.Issue{RepoID: 1, Title: mergeTitle})
 
 		// A PR closed without a merge leaves the branch (and room) alone.
-		unmerged := fmt.Sprintf(`{"action":"closed","pull_request":{"merged":false,"head":{"ref":%q}},`+
-			`"repository":{"name":"repo1","owner":{"login":"user2"}},"sender":{"login":"user2"}}`, mergeBranch)
+		unmerged := roomMergePayload(mergeBranch, false, 1)
 		makeRoomHookRequest(t, "pull_request", unmerged, signRoomDelivery(unmerged), http.StatusAccepted)
 		issue := unittest.AssertExistsAndLoadBean(t, &issues_model.Issue{RepoID: 1, Title: mergeTitle})
 		assert.False(t, issue.IsClosed)
 
+		// A merged PR whose head is a branch of *another* repository (a fork)
+		// says nothing about this repository's branch of the same name: the
+		// payload's repository is the base repo, so closing on the bare head
+		// name would close repo1's own, still-active room.
+		fromFork := roomMergePayload(mergeBranch, true, 2)
+		makeRoomHookRequest(t, "pull_request", fromFork, signRoomDelivery(fromFork), http.StatusAccepted)
+		issue = unittest.AssertExistsAndLoadBean(t, &issues_model.Issue{RepoID: 1, Title: mergeTitle})
+		assert.False(t, issue.IsClosed)
+
 		// A merged PR closes the room even though the branch still exists.
-		merged := fmt.Sprintf(`{"action":"closed","pull_request":{"merged":true,"head":{"ref":%q}},`+
-			`"repository":{"name":"repo1","owner":{"login":"user2"}},"sender":{"login":"user2"}}`, mergeBranch)
+		merged := roomMergePayload(mergeBranch, true, 1)
 		makeRoomHookRequest(t, "pull_request", merged, signRoomDelivery(merged), http.StatusOK)
 		issue = unittest.AssertExistsAndLoadBean(t, &issues_model.Issue{RepoID: 1, Title: mergeTitle})
 		assert.True(t, issue.IsClosed)
