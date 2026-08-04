@@ -98,6 +98,41 @@ const SUPPRESSION_CAP: usize = 10_000;
 /// [`BridgeState::remember_unlisted`].
 const UNLISTED_CAP: usize = 10_000;
 
+/// Consecutive failed `kanban show` calls after which a by-id task is given up on.
+///
+/// Nothing else would ever drop such an id. The set is fed by *successful* shows and drained by
+/// them too — [`BridgeState::forget_unlisted`] needs a `show` that reported some other status —
+/// so a task archived, deleted, or moved to a renamed board leaves an id whose `show` fails
+/// forever: one failed subprocess per sweep, each one an `error!` line about a task that no
+/// longer exists. That is the noise that trains an operator to ignore the message when a real
+/// one appears.
+///
+/// It has to be a count rather than a discrimination on the error, because
+/// [`crate::hermes::KanbanError`] has no `NotFound` variant: "no such task" and "could not spawn
+/// hermes" arrive as the same `Exit`/`Spawn` pair, and dropping a genuinely blocked task because
+/// kanban was briefly unreachable would strand work a human is waiting on. Twenty is the trade:
+/// the release sweep runs every 60s, so a transient outage has to last on the order of twenty
+/// minutes before any id is given up — far past a failed spawn, far short of forever. Both
+/// sweeps count into the same tally, so a shared outage reaches it sooner; that is deliberate,
+/// since a failure both legs see is the one least likely to be about a single task.
+///
+/// Giving up is a liveness cost, never a safety one — nothing is released and nothing is
+/// posted — and it is loud: the drop names the id and the manual recovery, exactly like the
+/// restart case in [`BridgeState::remember_unlisted`].
+pub const UNLISTED_ATTEMPTS: u32 = 20;
+
+/// What [`BridgeState::fail_unlisted`] did with the id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnlistedFailure {
+    /// Still reachable by id; this many consecutive failures so far.
+    Retained(u32),
+    /// Dropped from the by-id set after this many consecutive failures.
+    Dropped(u32),
+    /// Nothing to count — another leg had already dropped the id. Not a decision, so not
+    /// something to report as one.
+    Gone,
+}
+
 /// Per-process guards shared by the approval, outbound and reconcile legs.
 #[derive(Debug, Default)]
 pub struct BridgeState {
@@ -120,6 +155,9 @@ struct Inner {
     failures: HashMap<String, u32>,
     /// Task ids last seen holding [`crate::hermes::UNLISTABLE_STATUS`].
     unlisted: HashSet<String>,
+    /// Consecutive failed `kanban show` calls per by-id task. Keyed only by ids in `unlisted`,
+    /// and cleared by any successful `show`, so it is bounded by that set rather than by time.
+    unlisted_failures: HashMap<String, u32>,
 }
 
 impl BridgeState {
@@ -271,8 +309,27 @@ impl BridgeState {
     /// That is a liveness cost, not a safety one — nothing is released without a 🐝, and no
     /// duplicate lands on a Gitea issue — and it is the strictly better half of the trade the
     /// alternative offered: releasing *every* blocked task on a timer, with no human at all.
+    ///
+    /// The same cost, and the same recovery, is what [`Self::fail_unlisted`] hands an id whose
+    /// `show` has stopped answering: a task that no longer exists must not stay in this set
+    /// forever, so it is given up on and said out loud.
     pub fn remember_unlisted(&self, task_id: &str) {
-        insert_capped(&mut self.lock().unlisted, task_id, UNLISTED_CAP);
+        let mut inner = self.lock();
+        let Inner {
+            unlisted,
+            unlisted_failures,
+            ..
+        } = &mut *inner;
+        insert_capped(unlisted, task_id, UNLISTED_CAP);
+        // Kept paired with the set, because `insert_capped` may have dropped it whole and a
+        // counter for an id no longer in the set is one nothing would ever clear. Normally a
+        // walk of an empty map: a counter only exists for a task whose `show` has failed.
+        unlisted_failures.retain(|id, _| unlisted.contains(id));
+        // The `show` that reported the status is proof the task resolves, so the failure tally
+        // starts again from here. That is what makes [`UNLISTED_ATTEMPTS`] *consecutive*: a
+        // task that fails nineteen times across a kanban outage and then answers is not one
+        // failure away from being given up on for the rest of the process's life.
+        unlisted_failures.remove(task_id);
     }
 
     /// Forgets a task that is listable again — any status but the unlistable one.
@@ -282,7 +339,38 @@ impl BridgeState {
     /// `list` of that status will return the task, and reaching it by id as well would cost a
     /// second `show` per sweep forever.
     pub fn forget_unlisted(&self, task_id: &str) {
-        self.lock().unlisted.remove(task_id);
+        let mut inner = self.lock();
+        inner.unlisted.remove(task_id);
+        inner.unlisted_failures.remove(task_id);
+    }
+
+    /// Counts one failed `kanban show` for a by-id task, giving up on it at
+    /// [`UNLISTED_ATTEMPTS`].
+    ///
+    /// The one path that removes an id without a successful `show` behind it, and it exists
+    /// because otherwise there is none: an id whose task was archived, deleted, or moved to a
+    /// renamed board fails forever, and both by-id passes `continue` past it — one wasted
+    /// subprocess and one `error!` per sweep, for the lifetime of the process.
+    ///
+    /// The caller reports; this only decides. See [`UnlistedFailure`].
+    pub fn fail_unlisted(&self, task_id: &str) -> UnlistedFailure {
+        let mut inner = self.lock();
+        // Not `entry().or_insert()`: an id that is no longer in the set — dropped whole at the
+        // cap, or forgotten by a concurrent leg between the read and this call — must not
+        // resurrect a counter nothing will ever clear.
+        if !inner.unlisted.contains(task_id) {
+            inner.unlisted_failures.remove(task_id);
+            return UnlistedFailure::Gone;
+        }
+        let counter = inner.unlisted_failures.entry(task_id.to_string()).or_insert(0);
+        *counter = counter.saturating_add(1);
+        let failures = *counter;
+        if failures < UNLISTED_ATTEMPTS {
+            return UnlistedFailure::Retained(failures);
+        }
+        inner.unlisted.remove(task_id);
+        inner.unlisted_failures.remove(task_id);
+        UnlistedFailure::Dropped(failures)
     }
 
     /// The tasks the sweeps must reach by id, in id order.
@@ -672,6 +760,55 @@ mod tests {
         // `show` in the daemon, which is most of them.
         state.forget_unlisted("t_9");
         assert_eq!(state.unlisted(), vec!["t_2"]);
+    }
+
+    /// **The R8 P2.** An id whose `show` fails forever is the one entry nothing else removes:
+    /// the set is drained only by a *successful* `show`, so an archived or deleted task costs a
+    /// failed subprocess and an `error!` line every sweep for the lifetime of the process.
+    #[test]
+    fn an_id_whose_show_never_answers_again_is_eventually_given_up_on() {
+        let state = BridgeState::new();
+        state.remember_unlisted("t_1");
+
+        // A transient outage must not cost the task: nineteen consecutive failures leave it
+        // exactly where it was, which is the whole reason this is a count and not a guess at
+        // whether the error meant "no such task".
+        for i in 1..UNLISTED_ATTEMPTS {
+            assert_eq!(state.fail_unlisted("t_1"), UnlistedFailure::Retained(i));
+            assert_eq!(state.unlisted(), vec!["t_1"]);
+        }
+        assert_eq!(
+            state.fail_unlisted("t_1"),
+            UnlistedFailure::Dropped(UNLISTED_ATTEMPTS),
+            "a task that has not answered in {UNLISTED_ATTEMPTS} consecutive sweeps is gone"
+        );
+        assert!(
+            state.unlisted().is_empty(),
+            "…and it must actually leave the set, or the log line was the only thing that changed"
+        );
+        // Dropped once, not once per sweep: the id is no longer in the set to count against.
+        assert_eq!(state.fail_unlisted("t_1"), UnlistedFailure::Gone);
+    }
+
+    /// Consecutive, not cumulative. A `show` that answers is proof the task resolves, so a
+    /// board that was briefly unreachable must not leave every blocked task one failure away
+    /// from being abandoned for the rest of the process's life.
+    #[test]
+    fn a_show_that_answers_again_resets_the_tally() {
+        let state = BridgeState::new();
+        state.remember_unlisted("t_1");
+        for _ in 1..UNLISTED_ATTEMPTS {
+            state.fail_unlisted("t_1");
+        }
+        // What `note_status` calls when the task is still blocked.
+        state.remember_unlisted("t_1");
+        assert_eq!(state.fail_unlisted("t_1"), UnlistedFailure::Retained(1));
+
+        // And the other branch of `note_status` — it moved — clears the tally too, so an id
+        // that comes back to `blocked` later starts from zero rather than from a dead count.
+        state.forget_unlisted("t_1");
+        state.remember_unlisted("t_1");
+        assert_eq!(state.fail_unlisted("t_1"), UnlistedFailure::Retained(1));
     }
 
     #[test]

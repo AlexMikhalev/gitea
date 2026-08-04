@@ -35,7 +35,7 @@ use bridge::outbound::{
 };
 use bridge::robot::{LabelCheck, Robot, check_blocked_label};
 use bridge::rules::{Action, RuleSet};
-use bridge::state::{BridgeState, ESCALATE_AFTER, MARKER_ATTEMPTS, PendingApprovals};
+use bridge::state::{BridgeState, ESCALATE_AFTER, MARKER_ATTEMPTS, PendingApprovals, UnlistedFailure};
 
 /// Bridge between the Gitea shared board and the Hermes kanban execution fabric.
 #[derive(Debug, Parser)]
@@ -72,6 +72,21 @@ enum Command {
         path: PathBuf,
     },
 }
+
+/// What a one-shot sweep cannot do, said before it runs.
+///
+/// The by-id passes read [`BridgeState::unlisted`], which a one-shot builds empty and which is
+/// only ever filled by a `kanban show` this process made. Combined with no sweep listing
+/// [`UNLISTABLE_STATUS`], that makes `approval-once` and `reconcile-once` unable to reach a
+/// blocked task at all — and they say `unlisted=0` and exit 0, which reads exactly like a board
+/// with nothing blocked on it.
+const ONE_SHOT_BLOCKED_NOTE: &str = "note: a one-shot sweep cannot reach a `blocked` task, and \
+    reports nothing to say so. No sweep lists that status (on hermes v0.19.0 listing it promotes \
+    what it lists), so blocked tasks are reached by id — and the ids are learned from `kanban \
+    show` calls this process made, of which a one-shot has made none. A clean exit here therefore \
+    means \"this process knew of no blocked task\", not \"there are none\". Releasing or \
+    reconciling one is the running daemon's job; failing that, `hermes kanban unblock <id>` by \
+    hand returns it to a status the sweeps do list.";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -209,11 +224,20 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        // Both one-shots build a fresh `BridgeState`, so their by-id passes enumerate nothing,
+        // and no sweep lists `blocked` — a one-shot is therefore structurally incapable of
+        // touching a blocked task. That is not a bug to route around here (the set is learned
+        // from `kanban show`, and the only way to learn it cold is a `list` of the one status a
+        // `list` releases), but it *was* being told to operators the other way round: the R8
+        // P2. It is said before the sweep runs, because the failure mode is reading a clean
+        // `unlisted=0` summary afterwards as "there was nothing to do".
         Command::ApprovalOnce => {
+            println!("{ONE_SHOT_BLOCKED_NOTE}");
             approval_sweep(&gitea, &kanban, &cfg, &BridgeState::new(), &pending).await;
             Ok(())
         }
         Command::ReconcileOnce => {
+            println!("{ONE_SHOT_BLOCKED_NOTE}");
             reconcile_sweep(&cfg, &kanban, &robot, &BridgeState::new()).await;
             Ok(())
         }
@@ -452,6 +476,11 @@ async fn approval_sweep(
 /// consumed markers are matched line-exactly so they are written at most once, and releasing an
 /// issue that is no longer held is a no-op.
 ///
+/// That idempotence is also why this leg reads the status back before it spends anything. A
+/// `create` that resolved to a task kanban has already stopped for a human is not a release,
+/// and acting on one burns the approval that was meant to lift the block — the R8 P1, at the
+/// `awaits_release` check below.
+///
 /// Every entry is revalidated against the issue itself before it is evaluated, because nothing
 /// else would ever drop one. A held entry is refreshed by being re-held on each inbound sweep,
 /// for as long as `/robot/ready` keeps offering the issue — and an issue that is closed, or
@@ -467,7 +496,7 @@ async fn gate_sweep(
     pending: &PendingApprovals,
 ) {
     let held = pending.held();
-    let (mut released, mut waiting, mut dropped) = (0u64, 0u64, 0u64);
+    let (mut released, mut waiting, mut dropped, mut stopped) = (0u64, 0u64, 0u64, 0u64);
     for entry in &held {
         // The gate outlives a config change, so an issue held for a repository this bridge no
         // longer owns stays held rather than being created by whoever inherits the file.
@@ -530,14 +559,11 @@ async fn gate_sweep(
                         continue;
                     }
                 };
-                let approver = approvals.first().map(|a| a.by.as_str()).unwrap_or("-");
-                tracing::info!(
-                    task = %task_id, issue = entry.index, by = %approver,
-                    "approval released a held issue into a kanban task"
-                );
-                // Read back rather than assumed empty: `create` returns the *existing* task
-                // when this entry is a re-hold of an issue already released, and writing its
-                // markers a second time would be comment spam on that task.
+                // Read back rather than assumed fresh. `create` dedups on the idempotency key,
+                // and a re-hold is the *steady state* rather than a corner: the inbound leg
+                // holds every ready issue unconditionally and never asks kanban whether a task
+                // exists, and an issue whose task has produced no branch and no pull request is
+                // still ready — so an entry whose task already exists comes back every sweep.
                 let detail = match kanban.show(&task_id).await {
                     Ok(detail) => detail,
                     Err(err) => {
@@ -550,6 +576,45 @@ async fn gate_sweep(
                     }
                 };
                 note_status(state, &detail);
+                // **The R8 P1.** What the status says is which of the two happened, and it is
+                // the only thing that can: probed twice on 2026-08-04 against hermes v0.19.0, a
+                // duplicate-key `create` against a **blocked** task returns that task's id,
+                // does not error, and does not promote it — see
+                // `the_idempotency_key_dedups_against_real_kanban` in `tests/live_kanban.rs`.
+                //
+                // So a task kanban has already stopped for a human is indistinguishable here
+                // from one this call just made, and treating it as a release burns the 🐝 that
+                // was meant to lift the block: `consume_approvals` writes the marker, no
+                // `unblock` is issued, and `release_sweep` — running seconds later on the same
+                // task — then finds every approval consumed and returns. The human's answer to
+                // the worker's question is spent with nothing to show for it, and re-reacting
+                // reproduces it exactly, so the task becomes unreleasable by reaction.
+                //
+                // This leg cannot do the release itself: it knows nothing about `Promote`
+                // versus `Unblock`, which is [`release_sweep`]'s whole subject. It hands the
+                // task over instead — `note_status` above has just put the id where that sweep
+                // looks — and leaves the approvals untouched for it to spend.
+                if let Some(release) = awaits_release(&detail.task.status) {
+                    // The entry stays held on purpose. Releasing it would claim a job this
+                    // sweep did not do, and holding it buys something: each sweep re-resolves
+                    // the id by idempotency key, which is the one path that re-learns a blocked
+                    // task after a restart has emptied `BridgeState::unlisted`.
+                    tracing::debug!(
+                        task = %task_id, issue = entry.index, status = %detail.task.status,
+                        action = release.name(),
+                        "approved, but the idempotency key resolved to a task kanban has already \
+                         stopped for a human; leaving the approvals unspent for the release sweep"
+                    );
+                    stopped += 1;
+                    continue;
+                }
+                let approver = approvals.first().map(|a| a.by.as_str()).unwrap_or("-");
+                tracing::info!(
+                    task = %task_id, issue = entry.index, by = %approver,
+                    "approval released a held issue into a kanban task"
+                );
+                // Markers written only now, and matched line-exactly, so the re-hold of an
+                // issue whose task is merely claimable is not comment spam on that task.
                 consume_approvals(kanban, state, &task_id, &approvals, Some(&detail)).await;
                 if let Err(err) = pending.release(&entry.idempotency_key) {
                     // The task exists, so the gate has already done its job; the cost of this
@@ -581,11 +646,16 @@ async fn gate_sweep(
     // is the number an operator actually wants, and it is the only place the gate is visible
     // without reading the state file. It is also why `dropped` is reported: without the
     // revalidation above, `held` counted issues nobody was waiting on and nobody could act on.
+    // `stopped` is here for the same reason, and is not an error state: those entries are
+    // approved issues whose task already exists and is waiting on `release_sweep`. It being
+    // large is what says a gate entry is being re-created every tick for a task nothing is
+    // going to release — the only visible cost of leaving those entries held.
     tracing::info!(
         held = held.len(),
         released,
         waiting,
         dropped,
+        stopped,
         state_file = %pending.path().display(),
         "approval gate sweep complete"
     );
@@ -699,6 +769,21 @@ impl Release {
     }
 }
 
+/// Whether a task in this status is one [`release_sweep`] owns — i.e. one stopped for a human.
+///
+/// Derived from the two arrays rather than spelled again, so [`gate_sweep`]'s hand-off and the
+/// sweep it hands off *to* cannot drift apart. A status added to [`RELEASE_STATUSES`] becomes a
+/// status the gate stops spending approvals on, in the same edit.
+fn awaits_release(status: &str) -> Option<Release> {
+    if status == UNLISTABLE_STATUS {
+        Some(Release::Unblock)
+    } else if RELEASE_STATUSES.contains(&status) {
+        Some(Release::Promote)
+    } else {
+        None
+    }
+}
+
 /// Sweeps 🐝 reactions for every bridge task kanban itself stopped for a human.
 ///
 /// This is **not** the approval gate — see [`gate_sweep`] — because a kanban status cannot
@@ -740,7 +825,7 @@ async fn release_sweep(gitea: &GiteaClient, kanban: &Kanban, cfg: &Config, state
         let detail = match kanban.show(&task_id).await {
             Ok(detail) => detail,
             Err(err) => {
-                tracing::error!(task = %task_id, error = %err, "cannot resolve a blocked task by id");
+                report_unlisted_failure(state, &task_id, &err);
                 continue;
             }
         };
@@ -879,6 +964,42 @@ fn note_status(state: &BridgeState, detail: &TaskDetail) {
         state.remember_unlisted(&detail.task.id);
     } else {
         state.forget_unlisted(&detail.task.id);
+    }
+}
+
+/// Reports the other outcome of a by-id `show`, and eventually gives up on the id.
+///
+/// **The R8 P2.** Both by-id passes used to `error!` and `continue` here, and nothing else in
+/// the daemon removes an id: [`note_status`] needs a *successful* `show`. So a task archived,
+/// deleted, or moved to a renamed board left an id whose `show` fails forever — one wasted
+/// subprocess and one red line every 60s in the release sweep and every 300s in the reconcile
+/// sweep, about a task that no longer exists. That is precisely the noise that teaches an
+/// operator to skip past the message when a real one appears.
+///
+/// [`BridgeState::fail_unlisted`] carries the counting and says why it is a count rather than a
+/// discrimination on the error. This carries the reporting, which is the half that matters to
+/// whoever has to act: giving up is a liveness decision about somebody's blocked work, so it is
+/// a `warn!` that names the task and what to do if it *was* real — the same recovery a restart
+/// already needs.
+fn report_unlisted_failure(state: &BridgeState, task_id: &str, err: &bridge::hermes::KanbanError) {
+    match state.fail_unlisted(task_id) {
+        UnlistedFailure::Retained(failures) => tracing::error!(
+            task = %task_id, failures, error = %err,
+            "cannot resolve a blocked task by id"
+        ),
+        UnlistedFailure::Dropped(failures) => tracing::warn!(
+            task = %task_id, failures, error = %err,
+            "giving up on a blocked task that has not resolved in {failures} consecutive \
+             attempts; no sweep can reach it again in this process. If it does still exist and \
+             is still blocked, it needs `hermes kanban unblock` by hand — the same recovery a \
+             restart needs"
+        ),
+        // Another leg saw it move, or the set was dropped whole at its cap. Neither is a
+        // decision this sweep made, and neither is worth a line above debug.
+        UnlistedFailure::Gone => tracing::debug!(
+            task = %task_id, error = %err,
+            "a by-id task failed to resolve after another leg had already dropped it"
+        ),
     }
 }
 
@@ -1062,7 +1183,7 @@ async fn reconcile_sweep(cfg: &Config, kanban: &Kanban, robot: &Robot, state: &B
         let detail = match kanban.show(&task_id).await {
             Ok(detail) => detail,
             Err(err) => {
-                tracing::error!(task = %task_id, error = %err, "cannot resolve a blocked task by id");
+                report_unlisted_failure(state, &task_id, &err);
                 continue;
             }
         };
@@ -1361,6 +1482,10 @@ async fn apply_plan(
     // Re-read under the claim: see this function's own note. The check is the marker rather
     // than a re-plan because the marker is exactly what `plan()` would refuse on, and it is
     // the one line of the comment that must not be posted twice.
+    //
+    // The status of that re-read is kept, because it is what decides the recovery
+    // `record_marker` names below and the one in hand may predate a `kanban show` subprocess.
+    let mut status = detail.task.status.clone();
     if let Some(marker) = plan_marker(plan) {
         match kanban.show(task_id).await {
             Ok(fresh) if fresh.has_marker(marker) => {
@@ -1373,7 +1498,10 @@ async fn apply_plan(
                 );
                 return;
             }
-            Ok(fresh) => note_status(state, &fresh),
+            Ok(fresh) => {
+                note_status(state, &fresh);
+                status = fresh.task.status;
+            }
             Err(err) => {
                 // Deliberately a skip rather than a best-effort apply. The plan in hand may
                 // already have landed, and the action that is not idempotent is the
@@ -1395,7 +1523,7 @@ async fn apply_plan(
         Ok(marker) => {
             state.clear_plan_failures(task_id);
             if let Some(marker) = marker {
-                record_marker(kanban, state, task_id, &marker).await;
+                record_marker(kanban, state, task_id, &marker, &status).await;
             }
         }
         Err((action, err)) => {
@@ -1481,13 +1609,25 @@ async fn apply_actions(
 /// a plan and `reconcile_sweep` keeps applying it — posting the same comment on a
 /// user-visible Gitea issue every 300 seconds. Suppressing the task bounds that to one
 /// duplicate per process lifetime instead of one per sweep, forever.
-async fn record_marker(kanban: &Kanban, state: &BridgeState, task_id: &str, marker: &str) {
+/// `status` is the task's, because the recovery differs by it and naming the wrong one is worse
+/// than naming none: `reconcile-once` builds a fresh [`BridgeState`], so its by-id pass
+/// enumerates nothing, and no `list` returns [`UNLISTABLE_STATUS`]. For a blocked task — the
+/// resting status of the terminal kind this path fires for most often — that advice would be a
+/// clean-exiting no-op an operator would read as "done".
+async fn record_marker(kanban: &Kanban, state: &BridgeState, task_id: &str, marker: &str, status: &str) {
     if let Err(err) = kanban.comment_with_retry(task_id, marker, MARKER_ATTEMPTS).await {
+        let recovery = if status == UNLISTABLE_STATUS {
+            "`reconcile-once` will NOT finish this one: no sweep lists `blocked`, and a one-shot \
+             starts with no memory of blocked task ids, so it would exit clean having reached \
+             nothing. `hermes kanban unblock` returns the task to a status the sweeps do list — \
+             and makes it claimable again — after which `reconcile-once` replays the report"
+        } else {
+            "Run `reconcile-once` once kanban accepts comments again to finish recording it"
+        };
         tracing::error!(
-            task = task_id, marker, attempts = MARKER_ATTEMPTS, error = %err,
+            task = task_id, marker, status, attempts = MARKER_ATTEMPTS, error = %err,
             "cannot record the kanban dedup marker after retries; suppressing this task for the \
-             lifetime of this process so its gitea comment is not reposted every sweep. Run \
-             `reconcile-once` once kanban accepts comments again to finish recording it"
+             lifetime of this process so its gitea comment is not reposted every sweep. {recovery}"
         );
         state.suppress_task(task_id);
     }
@@ -2037,6 +2177,12 @@ printf 'ok\n'
             std::fs::write(self.dir.path().join("create-fails"), "").expect("write sentinel");
         }
 
+        /// The id `kanban create` resolves the idempotency key to — i.e. the *existing* task,
+        /// which is what a real create returns for a re-hold.
+        fn create_id(&self, id: &str) {
+            std::fs::write(self.dir.path().join("create-id"), id).expect("write create-id");
+        }
+
         fn lines(&self, name: &str) -> Vec<String> {
             std::fs::read_to_string(self.dir.path().join(name))
                 .unwrap_or_default()
@@ -2161,6 +2307,16 @@ printf 'ok\n'
 
     const A_BEE: &str = r#"[{"user":{"login":"alex"},"content":"honeybee",
                              "created_at":"2026-08-04T16:23:00Z"}]"#;
+
+    /// alex's 🐝 from before the run, plus bo's answer to the question the worker blocked on.
+    const TWO_BEES: &str = r#"[{"user":{"login":"alex"},"content":"honeybee",
+                                "created_at":"2026-08-04T16:23:00Z"},
+                               {"user":{"login":"bo"},"content":"honeybee",
+                                "created_at":"2026-08-04T17:00:00Z"}]"#;
+
+    /// The marker recording that alex's 🐝 was already spent — on the release that created the
+    /// task in the first place.
+    const ALEX_CONSUMED: &str = "gitea-bridge: approval-consumed alex@2026-08-04T16:23:00Z";
 
     fn held_issue() -> PendingTask {
         PendingTask {
@@ -2287,6 +2443,54 @@ printf 'ok\n'
         );
     }
 
+    /// **The R8 P2.** An id the by-id passes can never resolve again has to leave the set.
+    ///
+    /// Nothing else removes one: the set is drained only by a `show` that *succeeded*. So a
+    /// task archived, deleted, or moved to a renamed board left a `show` that fails forever —
+    /// one wasted subprocess and one `error!` line every 60s in this sweep and every 300s in
+    /// the reconcile one, about a task that no longer exists. That is the noise that teaches an
+    /// operator to skip the message when a real one appears.
+    ///
+    /// The assertion is on the *set*, not on the log: what has to stop is the work.
+    #[tokio::test]
+    async fn an_id_that_never_resolves_again_stops_costing_a_subprocess_every_sweep() {
+        let server = MockServer::start().await;
+        let stub = Stub::new();
+        // No `tasks/t_gone.json`, so the stub's `show` exits non-zero — as hermes does for a
+        // task that is not there.
+        let state = BridgeState::new();
+        state.remember_unlisted("t_gone");
+
+        let cfg = config(&server, stub.dir.path().join("gate.json"));
+        let gitea = gitea_client(&server);
+        // One sweep short of the give-up point: a kanban that is merely unreachable for a
+        // while must not cost a human their blocked task.
+        for _ in 1..bridge::state::UNLISTED_ATTEMPTS {
+            release_sweep(&gitea, &stub.kanban(), &cfg, &state).await;
+        }
+        assert_eq!(
+            state.unlisted(),
+            vec!["t_gone"],
+            "a transient failure must not abandon a task somebody is waiting on"
+        );
+
+        release_sweep(&gitea, &stub.kanban(), &cfg, &state).await;
+        assert!(
+            state.unlisted().is_empty(),
+            "an id that has not resolved in {} consecutive sweeps is given up on",
+            bridge::state::UNLISTED_ATTEMPTS
+        );
+
+        // …and the proof it is not merely absent from the log: the sweep stops asking.
+        let before = stub.lines("calls.log").len();
+        release_sweep(&gitea, &stub.kanban(), &cfg, &state).await;
+        assert_eq!(
+            stub.lines("calls.log").len(),
+            before + RELEASE_STATUSES.len(),
+            "only the status listing is left; the dead id costs nothing"
+        );
+    }
+
     /// A blocked task whose Gitea report never landed still gets replayed.
     ///
     /// `watch` fires each terminal event exactly once, so without this the whole `blocked`
@@ -2381,6 +2585,75 @@ printf 'ok\n'
             stub.moves()
         );
         assert!(gate.is_empty(), "…and only then does the issue leave the gate");
+    }
+
+    /// **The R8 P1.** A 🐝 answering a *worker's* question must not be spent by the gate.
+    ///
+    /// The gate meets this every 60s, because a re-hold is the steady state: inbound holds
+    /// every ready issue unconditionally and never asks kanban whether a task exists, and an
+    /// issue whose task has produced no branch and no pull request is still ready. So
+    /// `gate_sweep` calls `create`, gets back the *existing* task — which a worker has since
+    /// blocked with `needs_input` — and used to treat that as a release: it wrote bo's
+    /// consumed-marker and issued no `unblock`. `release_sweep`, running seconds later on the
+    /// same task, then found every approval already consumed and returned. Bo's answer was
+    /// spent with nothing to show for it, on both sides silently, and re-reacting reproduced
+    /// the race exactly — leaving `hermes kanban unblock` by hand as the only way out.
+    ///
+    /// The live half of the premise — that a duplicate-key `create` against a blocked task
+    /// returns that task, does not error, and does not promote it — is pinned against a real
+    /// hermes by `the_idempotency_key_dedups_against_real_kanban`.
+    #[tokio::test]
+    async fn an_approval_for_a_task_kanban_has_blocked_is_left_for_the_release_sweep() {
+        let server = MockServer::start().await;
+        mount_issue(&server, 57, 200, r#"{"state":"open"}"#).await;
+        mount_reactions(&server, 57, TWO_BEES).await;
+
+        let stub = Stub::new();
+        // What a real `create` does with a re-held issue: resolves the key to the task that
+        // already exists, rather than making a second one.
+        stub.create_id("t_1");
+        stub.task(
+            "t_1",
+            &task_json(
+                "blocked",
+                &[("created", 1), ("claimed", 2), ("blocked", 3)],
+                &[ALEX_CONSUMED],
+            ),
+        );
+        let gate = stub.gate();
+        gate.hold(held_issue()).expect("holds");
+
+        let cfg = config(&server, stub.dir.path().join("gate.json"));
+        let state = BridgeState::new();
+        gate_sweep(&gitea_client(&server), &stub.kanban(), &cfg, &state, &gate).await;
+
+        assert!(
+            stub.moves().is_empty(),
+            "the gate must touch nothing on a task it did not create: writing bo's marker here \
+             is what burned the approval: {:?}",
+            stub.moves()
+        );
+        assert!(
+            !gate.is_empty(),
+            "…and must not record a release it did not perform"
+        );
+        assert!(
+            state.unlisted().contains(&"t_1".to_string()),
+            "the id it resolved is handed to the leg that can act on it, so that leg reaches \
+             the task in this same tick"
+        );
+
+        // Which is exactly what `approval_sweep` runs next.
+        release_sweep(&gitea_client(&server), &stub.kanban(), &cfg, &state).await;
+        let moves = stub.moves();
+        assert!(
+            moves.iter().any(|m| m == "unblock t_1"),
+            "bo's 🐝 must lift the block it was given for: {moves:?}"
+        );
+        assert!(
+            moves.iter().any(|m| m == "comment t_1"),
+            "…and only then be spent: {moves:?}"
+        );
     }
 
     /// The same path, failing closed, three ways. None of them may create a task.

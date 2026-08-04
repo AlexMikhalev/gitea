@@ -97,6 +97,26 @@ fn create_request(index: i64, title: &str) -> CreateTask {
     }
 }
 
+/// The dedup the whole inbound leg rests on — and, in its second half, the fact the **approval
+/// gate** rests on.
+///
+/// `gate_sweep` calls `create` for every approved held issue, and a re-hold is the steady state
+/// rather than a corner: inbound holds every ready issue unconditionally and never asks kanban
+/// whether a task exists, and an issue whose task has produced no branch and no pull request is
+/// still ready. So the `create` in the gate routinely lands on a task that already exists — and
+/// that task may be one a worker has since **blocked**, waiting on the very human whose 🐝 is
+/// being processed.
+///
+/// Three things had to be true of that call for `gate_sweep`'s hand-off to `release_sweep` to
+/// be the right shape, and only a live probe can say so — `hermes.rs` documents the
+/// return-existing contract but only for a non-archived task in the abstract. **Observed on
+/// hermes v0.19.0, probed twice on 2026-08-04**: a duplicate-key `create` against a blocked
+/// task (1) returns the *same* task id, (2) does not error, and (3) does not promote it — the
+/// task is still `blocked` afterwards.
+///
+/// `hermes kanban block` is what puts it there, deliberately: `create --initial-status blocked`
+/// does **not** hold on v0.19.0 — the task auto-promotes — which is the whole reason the
+/// approval gate is bridge-side rather than a kanban status.
 #[tokio::test]
 #[ignore = "runs a real hermes kanban on a throwaway board"]
 async fn the_idempotency_key_dedups_against_real_kanban() {
@@ -113,12 +133,37 @@ async fn the_idempotency_key_dedups_against_real_kanban() {
         "kanban must return the existing task id, not a duplicate"
     );
 
+    // Before the block, because `list` promotes a blocked task by reading it.
     let listed = board.run(&["list", "--json"]);
     let tasks: serde_json::Value = serde_json::from_str(&listed).expect("list --json");
     assert_eq!(
         tasks.as_array().map(Vec::len),
         Some(1),
         "exactly one task exists: {listed}"
+    );
+
+    // …and now the case `gate_sweep` actually meets. Nothing below may run a `list`.
+    board.run(&["block", "--kind", "needs_input", &first, "waiting for spec"]);
+    assert_eq!(
+        kanban.show(&first).await.expect("show").task.status,
+        "blocked",
+        "`kanban block` is what sticks; `create --initial-status blocked` does not on v0.19.0"
+    );
+
+    let third = kanban
+        .create(&req)
+        .await
+        .expect("a duplicate-key create against a blocked task must not error");
+    assert_eq!(
+        third, first,
+        "the same key must resolve to the same task even when kanban has blocked it, or \
+         `gate_sweep` would create a second task for one issue behind a human's back"
+    );
+    assert_eq!(
+        kanban.show(&first).await.expect("show").task.status,
+        "blocked",
+        "and `create` must not promote it: a 🐝 arriving while a worker waits on an answer \
+         would otherwise dispatch the agent back onto the unanswered question"
     );
 }
 

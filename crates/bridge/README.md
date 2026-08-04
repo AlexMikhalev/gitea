@@ -115,12 +115,20 @@ gitea-automations --config bridge.yaml check-rules rules.yaml
 gitea-automations --config bridge.yaml poll-once      # one inbound sweep; safe to repeat
 gitea-automations --config bridge.yaml approval-once  # one 🐝 sweep: creates the tasks the
                                                       # gate is holding for approved issues,
-                                                      # and releases the ones kanban blocked
+                                                      # and promotes the `todo` ones
 gitea-automations --config bridge.yaml reconcile-once # replay unreported terminal tasks
 gitea-automations --config bridge.yaml run            # all four legs
 ```
 
 See `bridge.example.yaml` and `rules.example.yaml`.
+
+**Neither one-shot can reach a `blocked` task**, and both say so before they run. No sweep
+lists that status — on hermes v0.19.0 a `list` of it *promotes* what it returns — so blocked
+tasks are reached by id, and the ids come from `kanban show` calls the process itself made.
+A one-shot starts with none, so its `unlisted=0` means "this process knows of none", not
+"there are none". Releasing or reconciling a blocked task is the running daemon's job (it
+learned the id when it watched the task block); failing that, `hermes kanban unblock <id>` by
+hand returns it to a status the sweeps do list — which is also what a restart costs.
 
 ## Seven things that bite
 
