@@ -277,7 +277,7 @@ pub fn escalation_comment(
 /// as a pull request against a head branch the bridge does not push, so `create-pull` fails
 /// until someone pushes it; and every other terminal kind leads with a label, which
 /// `gitea-robot edit-issue` refuses outright when the repository does not have it
-/// (`cmd/gitea-robot/write.go`). Either way [`crate::main`]'s `apply_actions` stops at the
+/// (`cmd/gitea-robot/write.go`). Either way the daemon's `apply_actions` (`main.rs`) stops at the
 /// failing action, the task is left unmarked, and the reconcile sweep replays the same plan
 /// every 300s indefinitely — with the only signal a recurring `error!` line in the daemon's
 /// log, while the Gitea issue stays completely silent about work that ran and stopped. A human

@@ -48,7 +48,7 @@ const REPORTED_CAP: usize = 50_000;
 
 /// Upper bound on the plan-failure counters.
 ///
-/// Same argument as [`SETTLED_CAP`], and it bites sooner: an entry is removed only by
+/// Same argument as [`REPORTED_CAP`], and it bites sooner: an entry is removed only by
 /// [`BridgeState::clear_plan_failures`], on full success, so a task that can *never* succeed —
 /// a head branch nobody ever pushes, a label nobody ever creates — keeps its counter for the
 /// lifetime of a process meant to run for months. At the cap the counters are dropped whole:

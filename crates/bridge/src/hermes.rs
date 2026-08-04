@@ -11,12 +11,13 @@
 //! `sh -c` anywhere in this crate, so no argument can turn into shell syntax; the argv
 //! builders are pure functions and [`tests`](self) asserts the property directly.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Deserializer, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader, Lines};
-use tokio::process::{ChildStdout, Command};
+use tokio::process::{Child, ChildStdout, Command};
 
 use crate::config::KanbanConfig;
 
@@ -285,6 +286,74 @@ pub enum KanbanError {
     /// A created task came back without an id.
     #[error("kanban create returned no task id")]
     NoTaskId,
+}
+
+/// Stderr lines retained from a running `kanban watch`.
+///
+/// Enough to carry a usage error and its context out of a watcher that died on startup;
+/// bounded so a watcher that logs forever cannot grow this without limit.
+const WATCH_STDERR_TAIL: usize = 20;
+
+/// How long [`Watcher::finish`] waits for an exit before killing the child.
+///
+/// Stdout is already at EOF by then, so the process has almost always exited; the wait is
+/// only so the exit *status* can be reported instead of guessed.
+const WATCH_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A running `hermes kanban watch`.
+///
+/// Dropping it kills the watcher. [`Watcher::finish`] is the ordered path: it reports why the
+/// watcher stopped, which is the difference between a restart loop an operator can act on and
+/// one that only says it is looping.
+#[derive(Debug)]
+pub struct Watcher {
+    child: Child,
+    /// The watcher's stdout, line by line. Terminal events arrive here.
+    pub lines: Lines<BufReader<ChildStdout>>,
+    stderr: Arc<Mutex<VecDeque<String>>>,
+    drain: tokio::task::JoinHandle<()>,
+}
+
+/// Why a [`Watcher`] stopped.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WatchExit {
+    /// Exit code, when the child exited on its own within `WATCH_EXIT_GRACE`.
+    pub code: Option<i32>,
+    /// The last `WATCH_STDERR_TAIL` stderr lines, newest last, joined by ` | `.
+    ///
+    /// Empty when the watcher said nothing — which is itself the diagnosis for a binary that
+    /// is not there or a subcommand that produced no complaint.
+    pub stderr: String,
+}
+
+impl Watcher {
+    /// Waits for the watcher to exit, killing it if it outlives the grace period, and reports
+    /// its exit code alongside whatever it wrote to stderr.
+    pub async fn finish(mut self) -> WatchExit {
+        let code = match tokio::time::timeout(WATCH_EXIT_GRACE, self.child.wait()).await {
+            Ok(Ok(status)) => status.code(),
+            // Waiting itself failed: there is no code to report.
+            Ok(Err(_)) => None,
+            // The child outlived the grace period, so it is killed — and a status read after
+            // that reports only the signal we just sent, which says nothing about the exit.
+            Err(_) => {
+                let _ = self.child.kill().await;
+                let _ = self.child.wait().await;
+                None
+            }
+        };
+        // The child is gone, so its stderr pipe is at EOF and the drain finishes promptly.
+        // Joining it first is what stops the exit line from racing the very lines that explain
+        // the exit. The tail is read either way if the drain somehow outlives the grace
+        // period — a partial diagnosis still beats none.
+        let _ = tokio::time::timeout(WATCH_EXIT_GRACE, &mut self.drain).await;
+        let stderr = self
+            .stderr
+            .lock()
+            .map(|tail| tail.iter().cloned().collect::<Vec<_>>().join(" | "))
+            .unwrap_or_default();
+        WatchExit { code, stderr }
+    }
 }
 
 /// Handle on one kanban board.
@@ -564,17 +633,22 @@ impl Kanban {
         self.run(&self.unblock_args(task_id)).await.map(|_| ())
     }
 
-    /// Spawns `kanban watch` and returns its stdout, line by line.
+    /// Spawns `kanban watch` and returns a handle to it.
     ///
-    /// The child is returned alongside the reader so the caller owns its lifetime; dropping
-    /// the child kills the watcher.
-    pub async fn watch(&self) -> Result<(tokio::process::Child, Lines<BufReader<ChildStdout>>), KanbanError> {
+    /// The child is owned by the returned [`Watcher`]; dropping it kills the watcher.
+    pub async fn watch(&self) -> Result<Watcher, KanbanError> {
         let args = self.watch_args();
         let mut child = Command::new(&self.binary)
             .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            // Piped, not null. This is the daemon's only long-lived subprocess, and the only
+            // one whose failure is *silent*: a `watch` that exits immediately — an unsupported
+            // `--kinds`, a missing board, version skew — writes nothing to stdout, so the
+            // "output but nothing parsed" diagnostic cannot fire and the outbound leg is dead
+            // behind a bare `watch exited; restarting` every five seconds. `run_argv` reports
+            // stderr for every other call (`:637`); this one used to discard it.
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .map_err(|source| KanbanError::Spawn {
@@ -582,7 +656,27 @@ impl Kanban {
                 source,
             })?;
         let stdout = child.stdout.take().expect("stdout is piped");
-        Ok((child, BufReader::new(stdout).lines()))
+        let stderr = child.stderr.take().expect("stderr is piped");
+        // Drained concurrently rather than read at exit: a watcher that logs steadily to
+        // stderr would otherwise fill the pipe buffer and block on its own diagnostics.
+        let tail = Arc::new(Mutex::new(VecDeque::with_capacity(WATCH_STDERR_TAIL)));
+        let sink = Arc::clone(&tail);
+        let drain = tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let mut tail = sink.lock().expect("stderr tail mutex");
+                if tail.len() == WATCH_STDERR_TAIL {
+                    tail.pop_front();
+                }
+                tail.push_back(line);
+            }
+        });
+        Ok(Watcher {
+            child,
+            lines: BufReader::new(stdout).lines(),
+            stderr: tail,
+            drain,
+        })
     }
 
     async fn run(&self, args: &[String]) -> Result<String, KanbanError> {
@@ -933,6 +1027,62 @@ mod tests {
         .await
         .expect("a prompt command still succeeds");
         assert_eq!(out, "ok");
+    }
+
+    /// A watcher that dies on startup must say why.
+    ///
+    /// This is the only long-lived subprocess in the daemon and the only failure the outbound
+    /// leg cannot infer: with no stdout there is nothing to count as unparsed, so before this
+    /// the whole diagnosis was `watch exited; restarting`, every five seconds, forever, while
+    /// the leg was dead.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_watcher_that_exits_immediately_reports_its_code_and_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("hermes");
+        std::fs::write(&script, "#!/bin/sh\necho 'unknown flag: --kinds' >&2\nexit 3\n").expect("write stub");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let k = Kanban::new(&KanbanConfig {
+            binary: script.to_string_lossy().into_owned(),
+            ..KanbanConfig::default()
+        });
+        let mut watcher = k.watch().await.expect("spawns");
+        assert!(
+            watcher.lines.next_line().await.expect("reads").is_none(),
+            "the failure case emits nothing on stdout — which is exactly why stderr matters"
+        );
+        let exit = watcher.finish().await;
+        assert_eq!(exit.code, Some(3));
+        assert!(exit.stderr.contains("unknown flag: --kinds"), "{exit:?}");
+    }
+
+    /// …and the ordinary path is unaffected: stdout still streams, and a clean exit says so.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_watcher_streams_stdout_and_reports_a_clean_exit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("hermes");
+        std::fs::write(&script, "#!/bin/sh\necho 'completed t_1'\n").expect("write stub");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let k = Kanban::new(&KanbanConfig {
+            binary: script.to_string_lossy().into_owned(),
+            ..KanbanConfig::default()
+        });
+        let mut watcher = k.watch().await.expect("spawns");
+        assert_eq!(
+            watcher.lines.next_line().await.expect("reads").as_deref(),
+            Some("completed t_1")
+        );
+        assert!(watcher.lines.next_line().await.expect("reads").is_none());
+        let exit = watcher.finish().await;
+        assert_eq!(exit.code, Some(0));
+        assert_eq!(exit.stderr, "");
     }
 
     #[test]

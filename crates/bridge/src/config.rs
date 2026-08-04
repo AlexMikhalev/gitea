@@ -26,7 +26,10 @@ pub const DEFAULT_APPROVAL_REACTION: &str = "honeybee";
 pub const DEFAULT_BLOCKED_LABEL: &str = "status/blocked";
 
 /// A single `<owner>/<repo>` the bridge is responsible for.
+///
+/// Unknown keys are rejected here and in every other config struct — see [`Config`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RepoRef {
     /// Repository owner. Config-supplied: the ready endpoint never returns it.
     pub owner: String,
@@ -54,6 +57,7 @@ impl RepoRef {
 /// Writes never go through here — they shell out to `gitea-robot`, which holds the NIP-98
 /// agent identity (F1). See [`crate::robot`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GiteaConfig {
     /// Base URL, e.g. `https://git.example.org`.
     pub base_url: String,
@@ -78,6 +82,7 @@ pub struct GiteaConfig {
 
 /// Kanban side: which binary, which board, and the task-shaping defaults.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KanbanConfig {
     /// `hermes` executable, resolved on `PATH` when not absolute.
     #[serde(default = "default_hermes_binary")]
@@ -122,6 +127,7 @@ pub struct KanbanConfig {
 
 /// Write side: the `gitea-robot` CLI that carries the NIP-98 agent identity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RobotConfig {
     /// `gitea-robot` executable, resolved on `PATH` when not absolute.
     #[serde(default = "default_robot_binary")]
@@ -139,6 +145,7 @@ pub struct RobotConfig {
 
 /// Poll cadences. The bridge is a poller by construction on both approval and ready.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PollConfig {
     /// Seconds between `/api/v1/robot/ready` sweeps.
     #[serde(default = "default_ready_interval_secs")]
@@ -163,10 +170,25 @@ pub struct PollConfig {
     /// replay" reachable rather than merely true.
     #[serde(default = "default_reconcile_interval_secs")]
     pub reconcile_interval_secs: u64,
+    /// Most kanban tasks one inbound sweep may create, per repository.
+    ///
+    /// `GET /api/v1/robot/ready` returns *every* unblocked open issue — no limit, no paging
+    /// (`ready_graph.go:192-276`) — so this is the only bound on the daemon's steady-state
+    /// cost. Uncapped, a board with 300 open issues means 300 `hermes kanban create`
+    /// subprocesses per sweep, 300 tasks swept for a 🐝 every
+    /// [`approval_interval_secs`](Self::approval_interval_secs), and 300 `kanban show`
+    /// subprocesses per reconcile sweep — permanently, because a task the bridge blocked
+    /// leaves its issue "ready" as far as `getInProgressIssues` is concerned.
+    ///
+    /// Selection is PageRank-descending and deterministic, so the cap bounds the *board* and
+    /// not merely one sweep: see [`crate::inbound::select_ready`].
+    #[serde(default = "default_max_tasks_per_sweep")]
+    pub max_tasks_per_sweep: usize,
 }
 
 /// Human-approval configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApprovalConfig {
     /// Reaction alias that means "a human approved this".
     #[serde(default = "default_approval_reaction")]
@@ -179,7 +201,14 @@ pub struct ApprovalConfig {
 }
 
 /// Complete daemon configuration.
+///
+/// Every struct here rejects unknown keys, for the same reason the rules file does
+/// (`rules.rs:242`): a typo cannot silently become a default. `kanban:\n  boad: f4` would
+/// otherwise parse clean, leave `board` at `None`, drop `--board` from every argv
+/// (`hermes.rs:331`) and drive kanban's *default* board — creating, promoting and commenting
+/// on the wrong one — while `check` printed `board None`, which reads as absence by choice.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Gitea read endpoint.
     pub gitea: GiteaConfig,
@@ -310,6 +339,17 @@ impl Config {
                 self.robot.blocked_label
             )));
         }
+        // 0 is not "unlimited" here, deliberately: the ready endpoint has no limit and no
+        // paging, so an unlimited sweep's cost is whatever the board happens to hold, forever.
+        // An operator who wants more work in flight raises the number.
+        if self.poll.max_tasks_per_sweep == 0 {
+            return Err(ConfigError::Invalid(
+                "poll.max_tasks_per_sweep must be at least 1: it is the only bound on how many \
+                 tasks one sweep creates, and /api/v1/robot/ready returns every unblocked open \
+                 issue with no limit and no paging"
+                    .into(),
+            ));
+        }
         if self.approval.reaction.trim().is_empty() {
             return Err(ConfigError::Invalid("approval.reaction is required".into()));
         }
@@ -374,6 +414,9 @@ fn default_ready_interval_secs() -> u64 {
 fn default_reconcile_interval_secs() -> u64 {
     300
 }
+fn default_max_tasks_per_sweep() -> usize {
+    25
+}
 fn default_approval_interval_secs() -> u64 {
     60
 }
@@ -430,6 +473,7 @@ impl Default for PollConfig {
             approval_interval_secs: default_approval_interval_secs(),
             skip_in_progress: true,
             reconcile_interval_secs: default_reconcile_interval_secs(),
+            max_tasks_per_sweep: default_max_tasks_per_sweep(),
         }
     }
 }
@@ -466,6 +510,55 @@ mod tests {
         // creates `ready` by default, which would dispatch an agent with no human in it.
         assert!(cfg.kanban.require_approval);
         assert_eq!(cfg.reconcile_interval().as_secs(), 300);
+        // The ready endpoint is unpaged, so an absent cap must not mean "no cap".
+        assert_eq!(cfg.poll.max_tasks_per_sweep, 25);
+    }
+
+    #[test]
+    fn an_uncapped_sweep_is_rejected() {
+        let cfg: Config = serde_norway::from_str(&format!("{}poll:\n  max_tasks_per_sweep: 0\n", minimal()))
+            .expect("parses");
+        let err = cfg.validate().expect_err("must reject");
+        assert!(err.to_string().contains("max_tasks_per_sweep"), "{err}");
+    }
+
+    /// A mistyped key must not become a default.
+    ///
+    /// `boad: f4` is the sharp case: `board` stays `None`, `--board` is dropped from every
+    /// argv, and the bridge drives kanban's default board instead of the configured one —
+    /// creating, promoting and commenting on the wrong board, with `check` reporting only
+    /// `board None`.
+    #[test]
+    fn an_unknown_key_is_rejected_rather_than_ignored() {
+        let appended = [
+            "kanban:\n  boad: f4\n",
+            "poll:\n  ready_interval_sec: 30\n",
+            "approval:\n  reactions: honeybee\n",
+            "robot:\n  blocked_labels: status/blocked\n",
+            "rules_fil: rules.yaml\n",
+        ];
+        let whole = [
+            // Sections that `minimal()` already spells, so they cannot simply be appended.
+            "gitea:\n  base_url: https://git.example.org\n  tokens: abc\nrepos:\n  - owner: a\n    repo: b\n",
+            "gitea:\n  base_url: https://git.example.org\nrepos:\n  - owner: a\n    repo: b\n    branch: main\n",
+        ];
+        for yaml in appended
+            .iter()
+            .map(|y| format!("{}{y}", minimal()))
+            .chain(whole.iter().map(|y| (*y).to_string()))
+        {
+            let err = serde_norway::from_str::<Config>(&yaml).expect_err("an unknown key must not parse");
+            assert!(err.to_string().contains("unknown field"), "{yaml}: {err}");
+        }
+    }
+
+    /// The shipped example must stay loadable — `deny_unknown_fields` makes a stale key in it
+    /// a hard failure for anyone who copies it, and nothing else would catch that.
+    #[test]
+    fn the_example_config_parses_and_validates() {
+        let cfg: Config =
+            serde_norway::from_str(include_str!("../bridge.example.yaml")).expect("example parses");
+        cfg.validate().expect("example is valid");
     }
 
     #[test]

@@ -356,10 +356,18 @@ lint-go-gitea-vet: ## lint go files with gitea-vet
 # --locked everywhere: crates/Cargo.lock is committed, and without this flag cargo is free to
 # update it in place, so CI would test a dependency set no developer ever ran and the pin
 # would be decorative. With it, a lockfile that does not match Cargo.toml is an error.
+#
+# `cargo doc` is the third leg and it is not decoration: neither fmt nor clippy evaluates a
+# rustdoc lint, so a `[`Name`]` link left dangling by a rename — the doc comments in this
+# crate are the design record for its invariants — resolves to nothing and no target notices.
+# `--document-private-items` is what reaches them: most of those constants and their arguments
+# are private, and without it rustdoc never reads their doc comments at all.
 .PHONY: lint-rust
 lint-rust: ## lint rust files (crates/, the gitea-automations bridge)
 	cargo fmt --manifest-path crates/Cargo.toml --all -- --check
 	cargo clippy --locked --manifest-path crates/Cargo.toml --all-targets -- -D warnings
+	RUSTDOCFLAGS="-D warnings" cargo doc --locked --manifest-path crates/Cargo.toml \
+		--no-deps --document-private-items
 
 .PHONY: lint-rust-fix
 lint-rust-fix: ## lint rust files and fix issues

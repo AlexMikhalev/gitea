@@ -100,10 +100,14 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::CheckRules { .. } => unreachable!("handled above"),
         Command::Check => {
+            // The cap is stated because it is the only bound on how much work the daemon puts
+            // in flight: the ready endpoint is unpaged, so everything downstream of inbound
+            // costs whatever this number is, per repository, per sweep, indefinitely.
             println!(
-                "config OK: {} repo(s), board {:?}",
+                "config OK: {} repo(s), board {:?}, at most {} task(s) per inbound sweep per repo",
                 cfg.repos.len(),
-                cfg.kanban.board
+                cfg.kanban.board,
+                cfg.poll.max_tasks_per_sweep
             );
             // The daemon cannot read app.ini, and an unconfigured reaction is invisible
             // rather than rejected, so this is the only place it can be said out loud.
@@ -303,7 +307,7 @@ async fn run(cfg: Arc<Config>, gitea: GiteaClient, kanban: Kanban, robot: Robot)
 
 /// A ticker that does **not** burst.
 ///
-/// [`tokio::time::interval`] defaults to [`MissedTickBehavior::Burst`], which replays every
+/// [`tokio::time::interval`] defaults to [`tokio::time::MissedTickBehavior::Burst`], which replays every
 /// tick a slow sweep overran back to back with no delay. An unwarmed reconcile sweep is nine
 /// `kanban list` calls plus a `kanban show` subprocess per unsettled task, so overrunning is
 /// most likely exactly when the board is already slow — and bursting answers that by stacking
@@ -322,6 +326,7 @@ async fn inbound_sweep(gitea: &GiteaClient, kanban: &Kanban, cfg: &Config, repo:
         repo,
         &cfg.gitea.base_url,
         cfg.poll.skip_in_progress,
+        cfg.poll.max_tasks_per_sweep,
     )
     .await
     {
@@ -329,6 +334,7 @@ async fn inbound_sweep(gitea: &GiteaClient, kanban: &Kanban, cfg: &Config, repo:
             repo = %repo.slug(),
             resolved = report.resolved.len(),
             failed = report.failed.len(),
+            deferred = report.deferred,
             "inbound sweep complete"
         ),
         Err(err) => tracing::error!(repo = %repo.slug(), error = %err, "inbound sweep failed"),
@@ -448,14 +454,14 @@ async fn approval_sweep(gitea: &GiteaClient, kanban: &Kanban, cfg: &Config, stat
 async fn outbound_loop(cfg: Arc<Config>, kanban: Kanban, robot: Robot, state: Arc<BridgeState>) {
     loop {
         match kanban.watch().await {
-            Ok((mut child, mut lines)) => {
+            Ok(mut watcher) => {
                 tracing::info!("watching kanban terminal events");
                 // The `watch` line format is a terminal display, not a documented interface.
                 // Counting what parsed is what turns a change to it into a log line instead
                 // of a daemon that reports "watching" and then never acts again.
                 let (mut parsed, mut unparsed) = (0u64, 0u64);
                 loop {
-                    match lines.next_line().await {
+                    match watcher.lines.next_line().await {
                         Ok(Some(line)) => match classify_watch_line(&line) {
                             WatchLine::Event(event) => {
                                 parsed += 1;
@@ -483,7 +489,7 @@ async fn outbound_loop(cfg: Arc<Config>, kanban: Kanban, robot: Robot, state: Ar
                         }
                     }
                 }
-                let _ = child.kill().await;
+                let exit = watcher.finish().await;
                 if parsed == 0 && unparsed > 0 {
                     tracing::warn!(
                         unparsed,
@@ -491,7 +497,25 @@ async fn outbound_loop(cfg: Arc<Config>, kanban: Kanban, robot: Robot, state: Ar
                          format; the outbound leg acted on nothing"
                     );
                 }
-                tracing::warn!("kanban watch exited; restarting");
+                // The silent case: no stdout at all. Nothing above can fire, so without the
+                // exit code and stderr this is a `watch exited; restarting` line every five
+                // seconds and a permanently dead outbound leg — an unsupported `--kinds`, a
+                // missing board or version skew all look identical to an idle board.
+                if parsed == 0 && unparsed == 0 {
+                    tracing::error!(
+                        code = ?exit.code,
+                        stderr = %exit.stderr,
+                        "kanban watch exited without emitting a single line; the outbound leg is \
+                         dead until this is fixed (reconcile still covers correctness)"
+                    );
+                }
+                tracing::warn!(
+                    code = ?exit.code,
+                    stderr = %exit.stderr,
+                    parsed,
+                    unparsed,
+                    "kanban watch exited; restarting"
+                );
             }
             Err(err) => tracing::error!(error = %err, "cannot start kanban watch"),
         }

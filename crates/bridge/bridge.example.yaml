@@ -79,6 +79,18 @@ poll:
   # that issue's feedback for good. This sweep re-drives terminal tasks that carry no report
   # marker, which is what makes a half-applied plan actually replayable.
   reconcile_interval_secs: 300
+  # The only bound on this daemon's steady-state cost. /api/v1/robot/ready returns EVERY
+  # unblocked open issue - no limit, no paging (routers/api/v1/robot/ready_graph.go:192-276) -
+  # so uncapped, a board with 300 open issues means 300 `hermes kanban create` subprocesses
+  # per sweep, 300 tasks polled for a 🐝 every approval_interval_secs and 300 `kanban show`
+  # subprocesses per reconcile sweep, permanently: a task the bridge blocked still leaves its
+  # issue "ready" as far as getInProgressIssues is concerned.
+  #
+  # Selection is PageRank descending, ties broken by issue index, so consecutive sweeps pick
+  # the SAME issues and re-creating them is deduplicated by idempotency key - the cap bounds
+  # the board, not just one sweep. Whatever it defers is logged, never dropped silently.
+  # Must be at least 1; raise it to put more work in flight.
+  max_tasks_per_sweep: 25
 
 approval:
   # The emoji *alias* for U+1F41D (modules/emoji/emoji_data.go:191), which is also the

@@ -48,6 +48,23 @@ task idle in `ready` that is claimed, crashes, and is returned to `ready` by cra
 cost of not caching it is one `kanban show` per idle bridge task per sweep, bounded by work in
 flight rather than by history.
 
+**The inbound leg is capped, and that cap bounds the whole daemon.**
+`GET /api/v1/robot/ready` returns *every* unblocked open issue — no limit, no paging
+(`routers/api/v1/robot/ready_graph.go:192-276`). Uncapped, a repository with 300 open issues
+means 300 `hermes kanban create` subprocesses per sweep, and then a *permanent* cost behind
+it: 300 tasks polled for a 🐝 every `approval_interval_secs` and one `kanban show` per idle
+task every `reconcile_interval_secs`, forever — because a task the bridge created and blocked
+still leaves its issue "ready" as far as `getInProgressIssues` (`ready_graph.go:279-301`) is
+concerned, so nothing drains the set. With `require_approval` off it is worse: it is unbounded
+*agent dispatch*.
+
+`poll.max_tasks_per_sweep` (default 25) takes the top N by PageRank, ties broken by issue
+index. The ordering is what makes it a bound on the *board* rather than on one sweep: the same
+ready set selects the same issues every cycle, and re-creating them is deduplicated by
+idempotency key, so steady state is at most N bridge-created tasks per repository. Work is not
+lost — as those tasks finish, their issues stop being ready and the next best ones are admitted
+— and what a sweep defers is counted and logged rather than silently truncated.
+
 **`completed` assumes the head branch was pushed.** The bridge derives or reads
 `branch_name` and hands it to `create-pull`; nothing in `src/` pushes anything. kanban
 worktrees are local, so if the agent did not push its branch to the Gitea remote,
@@ -229,6 +246,14 @@ output. Treat the file as a validated declaration of intent for a future release
   forever. The suppression is in-process only: kanban stays the durable side, and a restart
   costs at most one extra release or one duplicate comment — the bound the marker already
   gives — rather than one per sweep.
+* **Every sweep is bounded.** The inbound leg admits at most `poll.max_tasks_per_sweep`
+  issues per repository, deterministically ordered, which is the only bound on an endpoint
+  that returns every open unblocked issue with no paging — and therefore on the per-task cost
+  every other leg pays afterwards.
+* **A mistyped config key is an error, not a default.** Every section rejects unknown fields,
+  as the rules file already did. `kanban: {boad: f4}` would otherwise parse clean, leave
+  `board` unset, drop `--board` from every argv and drive kanban's *default* board — creating,
+  promoting and commenting on the wrong one, while `check` reported only `board None`.
 * **Crashes orphan nothing.** Claims, heartbeats, reclaim and the circuit breaker are
   kanban's. Killing the bridge stops the bridge.
 * **Nothing waits forever, and nothing dies quietly.** Every subprocess is run with a deadline
@@ -239,7 +264,11 @@ output. Treat the file as a validated declaration of intent for a future release
   whose silence reads as an idle board, so the daemon exits non-zero and lets its supervisor
   rebuild it. The three tickers use `MissedTickBehavior::Delay`, so a sweep that overruns its
   interval does not come back to a burst of missed ticks stacking subprocesses onto a board
-  that is already slow.
+  that is already slow. `kanban watch` — the one long-lived subprocess — has its stderr piped
+  and drained, and its exit code is read rather than discarded: a watcher that dies on startup
+  (unsupported `--kinds`, missing board, version skew) writes nothing to stdout, so without
+  those two the entire diagnosis was `watch exited; restarting` every five seconds while the
+  outbound leg was dead.
 
 ## Multi-box
 
@@ -250,7 +279,7 @@ sharing an assignee would both act on the same terminal events. Cross-host kanba
 ## Tests
 
 ```sh
-make lint-rust                        # cargo fmt --check + cargo clippy -D warnings
+make lint-rust                        # cargo fmt --check + clippy -D warnings + rustdoc -D warnings
 make test-rust                        # cargo test --all
 make test-rust-robot-contract         # builds cmd/gitea-robot, runs the bridge's argv at it
 go test ./cmd/gitea-robot/            # the other side of the write-leg contract
@@ -262,8 +291,10 @@ cargo test --manifest-path crates/Cargo.toml --test live_kanban -- --ignored --t
 `tests/wiremock_gitea.rs` covers the read leg (ready shape, empty board, 404 flag-off,
 5xx-then-retry, reaction paging, the approved / unapproved / non-collaborator / unknown-user
 / 403 / no-token reaction cases, and the token preflight). `tests/inbound_dedup.rs` drives
-two full poll cycles against wiremock plus a stub kanban and asserts one task results.
-`tests/live_kanban.rs` is the opt-in live half.
+two full poll cycles against wiremock plus a stub kanban and asserts one task results — and,
+for the cap, that a five-issue board produces exactly two `create` calls for the two highest
+PageRanks and reports the other three as deferred. `tests/live_kanban.rs` is the opt-in live
+half.
 
 All three Rust gates run in CI: `.github/workflows/pull-compliance.yml` has a `rust` job, fired
 by the `crates/**` and `cmd/gitea-robot/**` filters in `files-changed.yml` — or by the

@@ -99,10 +99,10 @@ async fn two_poll_cycles_over_one_ready_issue_create_exactly_one_task() {
     });
     let repo = RepoRef::new("terraphim", "gitea");
 
-    let first = poll_once(&gitea, &kanban, &repo, &server.uri(), true)
+    let first = poll_once(&gitea, &kanban, &repo, &server.uri(), true, 25)
         .await
         .expect("first sweep");
-    let second = poll_once(&gitea, &kanban, &repo, &server.uri(), true)
+    let second = poll_once(&gitea, &kanban, &repo, &server.uri(), true, 25)
         .await
         .expect("second sweep");
 
@@ -166,12 +166,86 @@ async fn a_kanban_failure_is_collected_not_fatal() {
         &RepoRef::new("terraphim", "gitea"),
         &server.uri(),
         true,
+        25,
     )
     .await
     .expect("the sweep itself survives");
     assert!(report.resolved.is_empty());
     assert_eq!(report.failed.len(), 1);
     assert_eq!(report.failed[0].0, 57);
+}
+
+/// The sweep must cost `max_tasks_per_sweep` subprocesses, not "however many issues are open".
+///
+/// `/api/v1/robot/ready` has no limit and no paging (`ready_graph.go:192-276`), so this is the
+/// only thing standing between a busy board and one `hermes kanban create` per open issue
+/// every cycle — plus a permanent per-task cost in the approval and reconcile sweeps behind it.
+#[tokio::test]
+async fn a_sweep_creates_at_most_max_tasks_and_takes_the_highest_page_rank_first() {
+    let issues: Vec<String> = [(11, 0.10), (12, 0.90), (13, 0.30), (14, 0.70), (15, 0.50)]
+        .iter()
+        .map(|(index, rank)| {
+            format!(
+                r#"{{"id": {}, "index": {index}, "title": "issue {index}", "page_rank": {rank},
+                     "priority": 1, "is_blocked": false, "blocker_count": 0}}"#,
+                900 + index
+            )
+        })
+        .collect();
+    let body = format!(
+        r#"{{"repo_id":7,"repo_name":"gitea","total_count":5,"ready_issues":[{}]}}"#,
+        issues.join(",")
+    );
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/robot/ready"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let stub = write_stub_hermes(dir.path());
+    let gitea = GiteaClient::new(&GiteaConfig {
+        base_url: server.uri(),
+        request_timeout_secs: 5,
+        max_retries: 0,
+        retry_backoff_ms: 1,
+        ..GiteaConfig::default()
+    })
+    .expect("client");
+    let kanban = Kanban::new(&KanbanConfig {
+        binary: stub.to_string_lossy().into_owned(),
+        ..KanbanConfig::default()
+    });
+    let repo = RepoRef::new("terraphim", "gitea");
+
+    let first = poll_once(&gitea, &kanban, &repo, &server.uri(), true, 2)
+        .await
+        .expect("sweep");
+    assert_eq!(first.resolved.len(), 2, "the cap bounds what one sweep creates");
+    assert_eq!(first.deferred, 3, "and what it deferred is reported, not dropped");
+    let mut picked: Vec<i64> = first.resolved.iter().map(|(i, _)| *i).collect();
+    picked.sort_unstable();
+    assert_eq!(picked, vec![12, 14], "PageRank descending, best first");
+
+    let calls = std::fs::read_to_string(dir.path().join("calls.log")).expect("calls.log");
+    assert_eq!(
+        calls.lines().filter(|l| l.contains(" create ")).count(),
+        2,
+        "one subprocess per admitted issue, and no more"
+    );
+
+    // The selection is deterministic, so a second sweep over an unchanged board re-picks the
+    // same two and kanban dedups them: the cap bounds the *board*, not merely one sweep.
+    let second = poll_once(&gitea, &kanban, &repo, &server.uri(), true, 2)
+        .await
+        .expect("second sweep");
+    assert_eq!(first.resolved, second.resolved);
+    let keys = std::fs::read_dir(dir.path().join("keys"))
+        .expect("keys dir")
+        .count();
+    assert_eq!(keys, 2, "two sweeps, still two tasks");
 }
 
 #[tokio::test]
@@ -208,6 +282,7 @@ async fn a_blocked_ready_issue_is_skipped() {
         &RepoRef::new("terraphim", "gitea"),
         &server.uri(),
         true,
+        25,
     )
     .await
     .expect("sweep");
