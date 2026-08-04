@@ -250,9 +250,9 @@ jobs:
   # of the write-leg contract (TestBridgeWriteVerbsExist) would actually be enforced.
   rust:
     # ORed with `actions`, like every other job in this file: the `rust` filter is
-    # `crates/**` + `Makefile` (files-changed.yml), so a PR that bumps the pinned toolchain
-    # below or edits these steps touches neither path and would ship without this job ever
-    # having run on it.
+    # `crates/**` + `cmd/gitea-robot/**` + `Makefile` (files-changed.yml), so a PR that bumps
+    # the pinned toolchain below or edits these steps touches none of those paths and would
+    # ship without this job ever having run on it.
     if: needs.files-changed.outputs.rust == 'true' || needs.files-changed.outputs.actions == 'true'
     needs: files-changed
     runs-on: ubuntu-latest
@@ -270,5 +270,16 @@ jobs:
       # targets below) is what makes a red `rust` job mean the diff, not the calendar.
       - run: rustup toolchain install 1.93.1 --profile minimal --component rustfmt,clippy
       - run: rustup default 1.93.1
+      # Go, for the write-leg contract below: it builds cmd/gitea-robot and runs the bridge's
+      # argv against it.
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
       - run: make lint-rust
       - run: make test-rust
+      # `make test-rust` cannot reach robot_cli_contract — its tests are `#[ignore]`d because
+      # they need a built binary — so without this step the only check that runs a real
+      # gitea-robot never runs anywhere, and a flag added on the Rust side is caught by
+      # neither half of the contract.
+      - run: make test-rust-robot-contract

@@ -113,4 +113,9 @@ jobs:
 
             rust:
               - "crates/**"
+              # The write-leg contract test builds and runs this binary, so a PR touching only
+              # the Go side of that contract has to run the Rust job too — otherwise the one
+              # check that a real gitea-robot accepts the bridge's argv is skipped exactly
+              # when the CLI is what changed.
+              - "cmd/gitea-robot/**"
               - "Makefile"

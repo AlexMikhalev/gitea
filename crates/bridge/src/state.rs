@@ -22,10 +22,11 @@
 //! marker already bounds. It exists so that a marker write which failed *after its retries*
 //! becomes a dead letter rather than a loop.
 //!
-//! The `settled` cache is the same idea pointed at cost rather than correctness: a task whose
-//! Gitea feedback is confirmed done — or which has nothing to report at all — cannot become
-//! unsettled while it stands still, so the reconcile sweep need not pay a `kanban show`
-//! subprocess for it on every sweep for the lifetime of the board.
+//! The `reported` cache is the same idea pointed at cost rather than correctness: a task whose
+//! Gitea feedback is *confirmed landed in kanban* cannot become unreported, so the reconcile
+//! sweep need not pay a `kanban show` subprocess for it on every sweep for the lifetime of the
+//! board. It deliberately does **not** cover the other cheap outcome — a task with nothing to
+//! report yet — because that one is not stable: see [`BridgeState::mark_reported`].
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -37,13 +38,13 @@ pub const MARKER_ATTEMPTS: u32 = 3;
 /// Gitea issue itself.
 pub const ESCALATE_AFTER: u32 = 3;
 
-/// Upper bound on the settled-task cache.
+/// Upper bound on the reported-task cache.
 ///
-/// One short string per settled task is nothing beside the subprocess it saves, but the board
+/// One short string per reported task is nothing beside the subprocess it saves, but the board
 /// grows for its whole lifetime and this daemon is meant to run for months. At the cap the
 /// cache is dropped whole: the next sweep is as expensive as an unwarmed one and then warms
 /// again, which is a bounded cost, whereas retaining the map is not.
-const SETTLED_CAP: usize = 50_000;
+const REPORTED_CAP: usize = 50_000;
 
 /// Upper bound on the plan-failure counters.
 ///
@@ -67,8 +68,12 @@ struct Inner {
     fingerprints: HashSet<String>,
     /// Task ids whose report marker could not be recorded.
     tasks: HashSet<String>,
-    /// `<task id>\0<status>` pairs the reconcile sweep has nothing left to do for.
-    settled: HashSet<String>,
+    /// Task ids whose *escalation* marker could not be recorded.
+    escalations: HashSet<String>,
+    /// Task ids whose plan is being applied right now, by one leg or the other.
+    applying: HashSet<String>,
+    /// `<task id>\0<status>` pairs whose Gitea report is confirmed landed.
+    reported: HashSet<String>,
     /// Consecutive failed applications of a task's plan.
     failures: HashMap<String, u32>,
 }
@@ -112,30 +117,78 @@ impl BridgeState {
         self.lock().tasks.contains(task_id)
     }
 
-    /// Records that this task, in this status, needs nothing further from the sweep.
+    /// Stops this process re-posting an escalation comment whose marker could not be recorded.
     ///
-    /// Either its terminal event is confirmed reported to Gitea, or it has no terminal event
-    /// to report at all.
-    pub fn mark_settled(&self, task_id: &str, status: &str) {
-        let mut inner = self.lock();
-        if inner.settled.len() >= SETTLED_CAP {
-            inner.settled.clear();
-        }
-        inner.settled.insert(settled_key(task_id, status));
+    /// Deliberately *not* [`Self::suppress_task`]: that one retires the task from both the
+    /// watch leg and the reconcile sweep, and the escalation comment this marker belongs to
+    /// has just told the reader on the Gitea issue that "the bridge will keep retrying".
+    /// Retiring the task there would make that a lie — push the missing branch, create the
+    /// missing label, and nothing would pick it up until a restart. The escalation comment's
+    /// own failure mode is far cheaper: without its marker it would be re-posted on every
+    /// sweep, so this bounds it to the one that was already posted.
+    pub fn suppress_escalation(&self, task_id: &str) {
+        self.lock().escalations.insert(task_id.to_string());
     }
 
-    /// Whether this task was settled *while holding this status*.
+    /// Whether this task's escalation comment has been suppressed for this process.
+    pub fn is_escalation_suppressed(&self, task_id: &str) -> bool {
+        self.lock().escalations.contains(task_id)
+    }
+
+    /// Claims a task for one application of its plan, or returns `None` if a leg holds it.
     ///
-    /// The status is part of the key on purpose. A durable marker cannot un-write itself and
-    /// an event trail cannot un-happen, so a task that has not moved cannot have become
-    /// unsettled — but a task that *has* moved can have new work to report: a `done` task
-    /// that later blocks still needs its block reported, and only
-    /// [`crate::outbound::BLOCK_MARKER`] suppresses that. So the cache must miss when the
-    /// status changes, and every path from one terminal event to the next passes through a
-    /// different status (kanban refuses to block an already-blocked task, so a second block
-    /// is reached only via `unblock`).
-    pub fn is_settled(&self, task_id: &str, status: &str) -> bool {
-        self.lock().settled.contains(&settled_key(task_id, status))
+    /// The watch leg and the reconcile sweep run as independent tasks over the same
+    /// `Arc<BridgeState>`, and the window between reading a task's detail and recording its
+    /// marker spans a `create-pull` subprocess plus the comment plus the marker's retries — up
+    /// to a couple of minutes. A sweep landing inside that window sees an unmarked task, plans
+    /// the same actions and applies them: `create-pull` and the label are idempotent, but the
+    /// reason comment is *not*, so the user's issue gets it twice.
+    ///
+    /// The guard releases on drop, so an early return or a panic cannot strand the claim.
+    pub fn try_claim_apply(&self, task_id: &str) -> Option<ApplyGuard<'_>> {
+        if !self.lock().applying.insert(task_id.to_string()) {
+            return None;
+        }
+        Some(ApplyGuard {
+            state: self,
+            task_id: task_id.to_string(),
+        })
+    }
+
+    /// Records that this task's Gitea report, in this status, is confirmed landed.
+    ///
+    /// Only that. The reconcile sweep's other cheap outcome — a task with *no* terminal event
+    /// to report — must not come here, and the distinction is the whole point of the cache:
+    ///
+    /// * a durable kanban marker cannot un-write itself, so a task whose report is confirmed
+    ///   cannot become unreported while it stands still;
+    /// * a task with nothing to report can *acquire* something to report and come back to the
+    ///   same status. A task created `blocked` to await a 🐝 is idle in `blocked`; the 🐝
+    ///   releases it, a worker runs it, the worker blocks it, and it is `blocked` again — now
+    ///   with a `blocked` event and nothing on the issue. Same shape for `ready`: idle,
+    ///   claimed, crashed, and returned to `ready` by kanban's crash-reclaim.
+    ///
+    /// Caching that second case keyed on `(id, status)` blinded the sweep to those tasks for
+    /// the lifetime of the process, and nothing invalidates this cache. So the sweep pays a
+    /// `kanban show` per idle task per sweep instead. That cost is bounded by work in flight,
+    /// whereas the history this cache exists for — `done` and `archived`, which accumulate for
+    /// the lifetime of the board — always carries a terminal event and a durable marker, and
+    /// so still lands here.
+    ///
+    /// The status stays part of the key: a task that *has* moved can have new work to report —
+    /// a `done` task that later blocks still needs its block reported, and only
+    /// [`crate::outbound::BLOCK_MARKER`] suppresses that.
+    pub fn mark_reported(&self, task_id: &str, status: &str) {
+        let mut inner = self.lock();
+        if inner.reported.len() >= REPORTED_CAP {
+            inner.reported.clear();
+        }
+        inner.reported.insert(reported_key(task_id, status));
+    }
+
+    /// Whether this task's report was confirmed landed *while holding this status*.
+    pub fn is_reported(&self, task_id: &str, status: &str) -> bool {
+        self.lock().reported.contains(&reported_key(task_id, status))
     }
 
     /// Counts one failed application of a task's plan and returns the running total.
@@ -156,8 +209,24 @@ impl BridgeState {
 }
 
 /// Cache key. `\0` cannot occur in a kanban id or status, so it cannot be spelled by data.
-fn settled_key(task_id: &str, status: &str) -> String {
+fn reported_key(task_id: &str, status: &str) -> String {
     format!("{task_id}\0{status}")
+}
+
+/// Holds one task's apply-claim for as long as its plan is being applied.
+///
+/// See [`BridgeState::try_claim_apply`]. Released on drop so no path out of the apply — an
+/// early return, an error, a panic — can leak the claim and wedge the task for the process.
+#[derive(Debug)]
+pub struct ApplyGuard<'a> {
+    state: &'a BridgeState,
+    task_id: String,
+}
+
+impl Drop for ApplyGuard<'_> {
+    fn drop(&mut self) {
+        self.state.lock().applying.remove(&self.task_id);
+    }
 }
 
 #[cfg(test)]
@@ -191,24 +260,59 @@ mod tests {
         assert!(!state.is_task_suppressed("t_2"));
     }
 
+    /// The escalation comment says on the user's issue that the bridge will keep retrying, so
+    /// a failed escalation *marker* must not retire the task from both legs the way a failed
+    /// *plan* marker does. The two suppressions are separate sets for exactly that reason.
     #[test]
-    fn a_settled_task_is_cached_per_status_not_per_id() {
+    fn a_suppressed_escalation_does_not_retire_the_task_itself() {
         let state = BridgeState::new();
-        state.mark_settled("t_1", "done");
-        assert!(state.is_settled("t_1", "done"));
-        // A task that moved may have a new terminal event to report — a completed task that
-        // later blocks needs its block reported, and the PR marker does not suppress that.
-        assert!(!state.is_settled("t_1", "blocked"));
-        assert!(!state.is_settled("t_2", "done"));
+        state.suppress_escalation("t_1");
+        assert!(state.is_escalation_suppressed("t_1"));
+        // …and the task stays in both legs: push the missing branch or create the missing
+        // label and the original plan still applies on the next sweep.
+        assert!(!state.is_task_suppressed("t_1"));
+        // The converse too — dead-lettering a task says nothing about its escalation.
+        state.suppress_task("t_2");
+        assert!(!state.is_escalation_suppressed("t_2"));
+    }
+
+    /// The watch leg and the reconcile sweep share this state and can reach the same task's
+    /// plan at once; `create-pull` and the label are idempotent but the reason comment is not.
+    #[test]
+    fn only_one_leg_at_a_time_can_apply_a_task_s_plan() {
+        let state = BridgeState::new();
+        let held = state.try_claim_apply("t_1").expect("the first claim wins");
+        assert!(
+            state.try_claim_apply("t_1").is_none(),
+            "the second leg must not apply the same plan concurrently"
+        );
+        // A different task is unaffected — the guard is per task, not a global lock.
+        assert!(state.try_claim_apply("t_2").is_some());
+        drop(held);
+        assert!(
+            state.try_claim_apply("t_1").is_some(),
+            "the claim must be released on drop, or one apply wedges the task for the process"
+        );
     }
 
     #[test]
-    fn the_settled_cache_is_bounded() {
+    fn a_reported_task_is_cached_per_status_not_per_id() {
         let state = BridgeState::new();
-        for i in 0..SETTLED_CAP + 10 {
-            state.mark_settled(&format!("t_{i}"), "done");
+        state.mark_reported("t_1", "done");
+        assert!(state.is_reported("t_1", "done"));
+        // A task that moved may have a new terminal event to report — a completed task that
+        // later blocks needs its block reported, and the PR marker does not suppress that.
+        assert!(!state.is_reported("t_1", "blocked"));
+        assert!(!state.is_reported("t_2", "done"));
+    }
+
+    #[test]
+    fn the_reported_cache_is_bounded() {
+        let state = BridgeState::new();
+        for i in 0..REPORTED_CAP + 10 {
+            state.mark_reported(&format!("t_{i}"), "done");
         }
-        assert!(state.lock().settled.len() <= SETTLED_CAP);
+        assert!(state.lock().reported.len() <= REPORTED_CAP);
     }
 
     #[test]

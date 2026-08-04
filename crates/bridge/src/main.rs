@@ -519,11 +519,15 @@ async fn outbound_loop(cfg: Arc<Config>, kanban: Kanban, robot: Robot, state: Ar
 /// with the infrastructure trouble that made this sweep necessary in the first place.
 ///
 /// Enumerating widely costs nothing extra per task, because the expensive step — one
-/// `kanban show` subprocess each — is skipped for tasks already settled in the status they
-/// were listed in. Without that cache the sweep's cost would grow without bound with board
-/// history: `done` accumulates for the lifetime of the board and nothing here archives it.
+/// `kanban show` subprocess each — is skipped for tasks whose report is already *confirmed*
+/// in the status they were listed in. Without that cache the sweep's cost would grow without
+/// bound with board history: `done` accumulates for the lifetime of the board and nothing here
+/// archives it, and every one of those tasks carries a durable marker that cannot un-write
+/// itself. A task with nothing to report is not cached — see [`BridgeState::mark_reported`] —
+/// so the residual per-sweep cost is one `show` per idle bridge task, bounded by work in
+/// flight rather than by history.
 async fn reconcile_sweep(cfg: &Config, kanban: &Kanban, robot: &Robot, state: &BridgeState) {
-    let (mut checked, mut replayed, mut settled, mut suppressed) = (0u64, 0u64, 0u64, 0u64);
+    let (mut checked, mut replayed, mut reported, mut idle, mut suppressed) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let mut seen = std::collections::HashSet::new();
     let (mut failed_statuses, mut first_error): (Vec<&str>, Option<String>) = (Vec::new(), None);
     for status in RECONCILE_STATUSES {
@@ -558,16 +562,16 @@ async fn reconcile_sweep(cfg: &Config, kanban: &Kanban, robot: &Robot, state: &B
             {
                 continue;
             }
-            if state.is_settled(&task.id, &task.status) {
-                settled += 1;
-                continue;
-            }
-            // A task whose marker could not be written is deliberately left unmarked, which
-            // is exactly what this sweep looks for — so without this guard it would repost
-            // the same user-visible Gitea comment every sweep, forever.
-            if state.is_task_suppressed(&task.id) {
-                suppressed += 1;
-                continue;
+            match triage(state, &task.id, &task.status) {
+                Triage::Reported => {
+                    reported += 1;
+                    continue;
+                }
+                Triage::Suppressed => {
+                    suppressed += 1;
+                    continue;
+                }
+                Triage::Resolve => {}
             }
             let detail = match kanban.show(&task.id).await {
                 Ok(detail) => detail,
@@ -576,28 +580,24 @@ async fn reconcile_sweep(cfg: &Config, kanban: &Kanban, robot: &Robot, state: &B
                     continue;
                 }
             };
-            let Some(kind) = latest_terminal_kind(&detail) else {
-                // Nothing to report while it stands still: a task created blocked to await a
-                // 🐝, or one still running. Every route to a terminal event changes its
-                // status, so this is safe to remember.
-                state.mark_settled(&task.id, &task.status);
-                continue;
-            };
-            checked += 1;
-            match plan(&detail, kind, robot.blocked_label(), true) {
-                Ok(plan) => {
+            match resolve(state, &detail, robot.blocked_label()) {
+                Resolution::Idle => idle += 1,
+                Resolution::Reported => {
+                    checked += 1;
+                    reported += 1;
+                }
+                Resolution::Replay(kind, plan) => {
+                    checked += 1;
+                    replayed += 1;
                     tracing::info!(
                         task = %task.id, kind = kind.event_kind(),
                         "terminal task has no report marker; replaying its plan"
                     );
-                    replayed += 1;
                     apply_plan(cfg, kanban, robot, state, &task.id, &plan, &detail).await;
                 }
-                // The overwhelmingly common case: the watcher already handled it. The marker
-                // is durable, so a confirmed report can never become unreported.
-                Err(PlanError::AlreadyReported { .. }) => state.mark_settled(&task.id, &task.status),
-                Err(err) => {
-                    tracing::error!(task = %task.id, error = %err, "cannot plan outbound actions")
+                Resolution::Unplannable(err) => {
+                    checked += 1;
+                    tracing::error!(task = %task.id, error = %err, "cannot plan outbound actions");
                 }
             }
         }
@@ -611,11 +611,77 @@ async fn reconcile_sweep(cfg: &Config, kanban: &Kanban, robot: &Robot, state: &B
     tracing::info!(
         checked,
         replayed,
-        settled,
+        reported,
+        idle,
         suppressed,
         candidates = seen.len(),
         "reconciliation sweep complete"
     );
+}
+
+/// What the sweep does with one listed task *before* paying for its `kanban show`.
+///
+/// Extracted so the one decision that can silently drop a task's Gitea feedback forever is
+/// testable without a board behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Triage {
+    /// Its report is confirmed landed in kanban, in this status. A durable marker cannot
+    /// un-write itself, so there is nothing left to find.
+    Reported,
+    /// Its marker could not be written after retries. The task is deliberately unmarked —
+    /// exactly what this sweep looks for — so acting again reposts the same Gitea comment.
+    Suppressed,
+    /// Pay for the `show` and decide on the event trail.
+    Resolve,
+}
+
+fn triage(state: &BridgeState, task_id: &str, status: &str) -> Triage {
+    if state.is_reported(task_id, status) {
+        Triage::Reported
+    } else if state.is_task_suppressed(task_id) {
+        Triage::Suppressed
+    } else {
+        Triage::Resolve
+    }
+}
+
+/// What the sweep does with a task once `kanban show` has resolved its *event trail*.
+///
+/// The trail, not the status: a task created `--initial-status blocked` to await a 🐝 is
+/// `blocked` and has no terminal event, and labelling its issue `status/blocked` would be a
+/// lie about work that never ran.
+#[derive(Debug)]
+enum Resolution {
+    /// No terminal event yet — awaiting a 🐝, or still running.
+    Idle,
+    /// Its terminal event is confirmed already reported to Gitea.
+    Reported,
+    /// A terminal event with no report marker behind it. Apply this.
+    Replay(TerminalKind, OutboundPlan),
+    /// A terminal event the sweep cannot turn into actions.
+    Unplannable(PlanError),
+}
+
+/// Classifies a resolved task, and records the one outcome that is safe to remember.
+///
+/// Which outcome that is, is the whole point, and getting it wrong is silent: see
+/// [`BridgeState::mark_reported`]. `Reported` is stable — a durable kanban marker cannot
+/// un-write itself. `Idle` is **not**: a task with nothing to report can acquire something to
+/// report and come back to the same status, so caching it blinds the sweep to that task for
+/// the lifetime of the process, and nothing invalidates the cache.
+fn resolve(state: &BridgeState, detail: &TaskDetail, blocked_label: &str) -> Resolution {
+    let Some(kind) = latest_terminal_kind(detail) else {
+        return Resolution::Idle;
+    };
+    match plan(detail, kind, blocked_label, true) {
+        Ok(plan) => Resolution::Replay(kind, plan),
+        // The overwhelmingly common case: the watcher already handled it.
+        Err(PlanError::AlreadyReported { .. }) => {
+            state.mark_reported(&detail.task.id, &detail.task.status);
+            Resolution::Reported
+        }
+        Err(err) => Resolution::Unplannable(err),
+    }
 }
 
 async fn apply_event(
@@ -673,6 +739,13 @@ async fn apply_event(
 }
 
 /// Applies one planned response to Gitea, then marks the task once all of it landed.
+///
+/// Serialised per task. `outbound_loop` and the reconcile ticker are independent tokio tasks
+/// over one `Arc<BridgeState>`, and the window between planning and the marker landing spans a
+/// `create-pull` subprocess (up to `RUN_TIMEOUT`), the comment, and the marker's retries. A
+/// sweep arriving inside that window sees an unmarked task and plans the same actions:
+/// `create-pull` probes for an existing pull request and adding a label twice is a no-op, but
+/// the reason comment is not idempotent, so the user's issue would carry it twice.
 async fn apply_plan(
     cfg: &Config,
     kanban: &Kanban,
@@ -682,6 +755,14 @@ async fn apply_plan(
     plan: &OutboundPlan,
     detail: &TaskDetail,
 ) {
+    let Some(_claim) = state.try_claim_apply(task_id) else {
+        tracing::info!(
+            task = task_id,
+            "another leg is already applying this task's plan; skipping this one rather than \
+             posting its reason comment a second time"
+        );
+        return;
+    };
     if !cfg
         .repos
         .iter()
@@ -812,6 +893,13 @@ struct PlanFailure<'a> {
 /// exactly once per failing action, guarded by its own durable marker so it survives a restart
 /// and does not collide with a genuine later report.
 ///
+/// That "the retry is not abandoned" is load-bearing, because the comment this posts says so
+/// out loud to whoever is reading the issue. So the escalation marker is *not* routed through
+/// [`record_marker`]: dead-lettering the task there would drop it from both the watch leg and
+/// the sweep for the process lifetime, which is precisely the promise the comment just made
+/// being broken silently. The escalation's own failure mode is one duplicate comment, and
+/// [`BridgeState::suppress_escalation`] bounds it to that.
+///
 /// The escalation is a comment and nothing else. That is what makes it reachable for the case
 /// it most needs to cover: when the *label* is what cannot be applied, an escalation leading
 /// with a label would be retrying the one call that is broken.
@@ -829,6 +917,11 @@ async fn escalate_plan_failure(
         error,
     } = failure;
     let task_id = detail.task.id.as_str();
+    // Its marker never landed, so `escalation_actions` would plan the comment again on every
+    // sweep. The comment is already on the issue and says what it needs to say.
+    if state.is_escalation_suppressed(task_id) {
+        return;
+    }
     // The one fact that tells a human which failure this is — the head branch, or the label —
     // read off the action that actually failed rather than assumed.
     let context = plan.actions.iter().find_map(|a| match (action, a) {
@@ -847,8 +940,17 @@ async fn escalate_plan_failure(
         action = action.name(), context = context.as_deref().unwrap_or("-"),
         "a terminal task's report to gitea has failed repeatedly; reporting that on the issue"
     );
-    if let Ok(Some(marker)) = apply_actions(robot, task_id, owner, repo, index, &actions).await {
-        record_marker(kanban, state, task_id, &marker).await;
+    if let Ok(Some(marker)) = apply_actions(robot, task_id, owner, repo, index, &actions).await
+        && let Err(err) = kanban.comment_with_retry(task_id, &marker, MARKER_ATTEMPTS).await
+    {
+        tracing::error!(
+            task = task_id, marker, attempts = MARKER_ATTEMPTS, error = %err,
+            "cannot record the escalation marker after retries; not re-posting this escalation \
+             for the lifetime of this process. The task itself stays in both legs, because the \
+             comment just posted on the issue promises the bridge will keep retrying — fixing \
+             the branch or the label still resolves it on a later sweep"
+        );
+        state.suppress_escalation(task_id);
     }
 }
 
@@ -941,6 +1043,67 @@ mod tests {
         let kind = latest_terminal_kind(&reclaimed).expect("a terminal event");
         assert_eq!(kind, TerminalKind::Crashed);
         assert!(plan(&reclaimed, kind, "status/blocked", true).is_ok());
+    }
+
+    /// The R3 P1 this closes: the sweep's cache used to remember "nothing to report", which
+    /// is not a stable fact.
+    ///
+    /// On the default config (`require_approval: true`) every bridge task passes through an
+    /// idle `blocked` on its way in, so this is the *normal* path, not a corner:
+    ///
+    /// 1. inbound creates the task `--initial-status blocked`; the sweep lists it under
+    ///    `blocked`, finds only a `created` event, and used to cache `(t_1, "blocked")`;
+    /// 2. a 🐝 releases it → `ready` → `running`; the worker blocks it → `blocked` again,
+    ///    now with a `blocked` event on the trail;
+    /// 3. the watch leg's apply fails (the R2 case: `status/blocked` missing, `edit-issue`
+    ///    refuses at action 0), leaving the task deliberately unmarked;
+    /// 4. the next sweep hit the cache and skipped it — for the process lifetime, while its
+    ///    own "healthy" log line counted it as settled, and with the failure counter frozen
+    ///    below `ESCALATE_AFTER` so the escalation could never fire either.
+    ///
+    /// The same shape covers the reclaim case `RECONCILE_STATUSES` was widened for: idle in
+    /// `ready`, claimed, crashed, and returned to `ready` by kanban's crash-reclaim.
+    #[test]
+    fn a_task_that_returns_to_a_status_it_was_idle_in_is_still_reconciled() {
+        let state = BridgeState::new();
+        let label = "status/blocked";
+
+        // Sweep 1 — created blocked to await a 🐝. Nothing to report, and — the fix —
+        // nothing the sweep is allowed to remember.
+        assert_eq!(triage(&state, "t_1", "blocked"), Triage::Resolve);
+        let gated = task_detail(&[("created", 1)], &[]);
+        assert!(matches!(resolve(&state, &gated, label), Resolution::Idle));
+
+        // Sweep 2 — released, run, and blocked by the worker. Same status, new trail. This
+        // is the assertion the old status-keyed cache failed: it returned `Reported` here
+        // and the block was never reported to the issue at all.
+        assert_eq!(
+            triage(&state, "t_1", "blocked"),
+            Triage::Resolve,
+            "an idle task must not be cached: it can acquire a terminal event and come back \
+             to the status it was idle in"
+        );
+        let blocked = task_detail(
+            &[("created", 1), ("unblocked", 2), ("claimed", 3), ("blocked", 4)],
+            &[],
+        );
+        assert!(matches!(
+            resolve(&state, &blocked, label),
+            Resolution::Replay(TerminalKind::Blocked, _)
+        ));
+
+        // What the cache *is* for still works: once the report is confirmed by a durable
+        // marker it cannot become unreported, so the next sweep skips the `show`.
+        let reported = task_detail(
+            &[("created", 1), ("blocked", 2)],
+            &[&blocked_comment("t_1", TerminalKind::Blocked, None, None)],
+        );
+        assert!(matches!(resolve(&state, &reported, label), Resolution::Reported));
+        assert_eq!(triage(&state, "t_1", "blocked"), Triage::Reported);
+
+        // …and a dead-lettered task is skipped for its own reason, not this one.
+        state.suppress_task("t_2");
+        assert_eq!(triage(&state, "t_2", "blocked"), Triage::Suppressed);
     }
 
     /// The P1 this closes, stated as the shape that caused it.

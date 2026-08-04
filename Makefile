@@ -370,6 +370,23 @@ lint-rust-fix: ## lint rust files and fix issues
 test-rust: ## test rust files (crates/, the gitea-automations bridge)
 	cargo test --locked --manifest-path crates/Cargo.toml --all
 
+# The one cross-language check on the write leg's argv, and the only one that runs a real
+# binary: `robot_cli_contract` covers the case where cmd/gitea-robot builds but rejects the
+# argv the bridge hands it — the exact failure that had the outbound leg calling subcommands
+# the CLI did not have. Its tests are `#[ignore]`d because they need that binary, so
+# `test-rust` above cannot run them and this target exists to build it and opt in. Without
+# this being wired into CI the file's own claim — "runs a real binary" — is never true there,
+# and only the Go half (TestBridgeWriteVerbsExist) is actually enforced.
+#
+# Built fresh into ./bin (gitignored) rather than resolved from PATH: an installed
+# `gitea-robot` may be older than the tree, and a stale pass here is worse than no test.
+.PHONY: test-rust-robot-contract
+test-rust-robot-contract: ## test the bridge write leg against a built cmd/gitea-robot
+	@mkdir -p bin
+	$(GO) build -o bin/gitea-robot ./cmd/gitea-robot
+	GITEA_ROBOT_BIN="$(CURDIR)/bin/gitea-robot" cargo test --locked \
+		--manifest-path crates/Cargo.toml --test robot_cli_contract -- --ignored
+
 .PHONY: lint-editorconfig
 lint-editorconfig:
 	@echo "Running editorconfig check..."

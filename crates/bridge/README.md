@@ -34,8 +34,19 @@ dead worker's task to a claimable status — so a `done`/`blocked` scan covered 
 terminal kinds and silently dropped the other three, which are precisely the kinds that
 coincide with the infrastructure trouble this leg exists for. Enumerating widely is safe
 because the discrimination is `latest_terminal_kind`, not the status, and it is cheap because
-a task already settled in the status it was listed under is skipped without paying for a
-`kanban show` subprocess.
+a task whose report is *confirmed landed* in the status it was listed under is skipped without
+paying for a `kanban show` subprocess — which is what keeps the sweep's cost off the board's
+history, since `done` accumulates forever and every one of those tasks carries a durable
+marker that cannot un-write itself.
+
+A task with *nothing yet to report* is deliberately **not** remembered, and the asymmetry is
+the point: it can acquire something to report and come back to the same status. On the default
+config every task is created `blocked` to await a 🐝, so the ordinary path — idle in `blocked`,
+released, run, blocked again by the worker — lands back where it started, and a status-keyed
+"nothing to do" would blind the sweep to it for the lifetime of the process. Same shape for a
+task idle in `ready` that is claimed, crashes, and is returned to `ready` by crash-reclaim. The
+cost of not caching it is one `kanban show` per idle bridge task per sweep, bounded by work in
+flight rather than by history.
 
 **`completed` assumes the head branch was pushed.** The bridge derives or reads
 `branch_name` and hands it to `create-pull`; nothing in `src/` pushes anything. kanban
@@ -54,7 +65,17 @@ with a label, so gating escalation on `open_pr` left four of the five terminal k
 escalation at all — and an escalation that itself led with a label would, in the case that
 needs it most, be retrying the very call that is broken. A comment is the one verb with no
 repository-side precondition. Each failing action escalates under its own marker, so a label
-escalation cannot silence a later pull-request one.
+escalation cannot silence a later pull-request one. "The retry continues" is enforced, not just
+promised: an escalation marker that will not write suppresses the *escalation* for this
+process, never the task, because retiring the task would break the promise the comment it just
+posted makes to whoever reads the issue.
+
+**The watch leg and the sweep can reach the same task at once.** They are independent tokio
+tasks over one shared state, and the window between planning a response and its marker landing
+spans a `create-pull` subprocess, the comment, and the marker's retries. `create-pull` probes
+for an existing pull request and adding a label twice is a no-op, but the reason comment is not
+idempotent, so a plan is claimed per task for the length of its application and the second leg
+steps aside rather than posting it again.
 
 `src/rules.rs` parses the declarative rules file; `src/config.rs` is the daemon config;
 `src/gitea.rs` is the read client and `src/robot.rs` the write side. The three write verbs
@@ -231,15 +252,11 @@ sharing an assignee would both act on the same terminal events. Cross-host kanba
 ```sh
 make lint-rust                        # cargo fmt --check + cargo clippy -D warnings
 make test-rust                        # cargo test --all
+make test-rust-robot-contract         # builds cmd/gitea-robot, runs the bridge's argv at it
 go test ./cmd/gitea-robot/            # the other side of the write-leg contract
 
 # opt-in: runs a real hermes kanban on a throwaway board it creates and deletes
 cargo test --manifest-path crates/Cargo.toml --test live_kanban -- --ignored --test-threads=1
-
-# opt-in: runs a real gitea-robot binary and checks it accepts the argv the bridge emits
-go build -o /tmp/gitea-robot ./cmd/gitea-robot
-GITEA_ROBOT_BIN=/tmp/gitea-robot cargo test --manifest-path crates/Cargo.toml \
-    --test robot_cli_contract -- --ignored
 ```
 
 `tests/wiremock_gitea.rs` covers the read leg (ready shape, empty board, 404 flag-off,
@@ -248,14 +265,19 @@ GITEA_ROBOT_BIN=/tmp/gitea-robot cargo test --manifest-path crates/Cargo.toml \
 two full poll cycles against wiremock plus a stub kanban and asserts one task results.
 `tests/live_kanban.rs` is the opt-in live half.
 
-Both Rust gates run in CI: `.github/workflows/pull-compliance.yml` has a `rust` job, fired by
-the `crates/**` filter in `files-changed.yml` — or by the `actions` filter, so that a PR which
-changes only the job's own wiring (the pinned toolchain, the steps) still runs it.
+All three Rust gates run in CI: `.github/workflows/pull-compliance.yml` has a `rust` job, fired
+by the `crates/**` and `cmd/gitea-robot/**` filters in `files-changed.yml` — or by the
+`actions` filter, so that a PR which changes only the job's own wiring (the pinned toolchain,
+the steps) still runs it.
 
 The Gitea *write* leg is checked in two places, because the argv tests in `src/robot.rs` can
-only assert the bridge agrees with itself. The two halves are **not** symmetric:
-`TestBridgeWriteVerbsExist` in `cmd/gitea-robot/write_test.go` asserts every verb and flag
-the bridge emits exists in the CLI, and runs on every Go CI build; `tests/robot_cli_contract.rs`
-runs a real `gitea-robot` binary but is `--ignored`, so it runs only when someone asks for it.
-What is still **not** covered anywhere is the HTTP call itself — 🐝 on a real issue driving a
-real pull request end to end needs a reachable instance and a NIP-98 agent key.
+only assert the bridge agrees with itself. `TestBridgeWriteVerbsExist` in
+`cmd/gitea-robot/write_test.go` asserts every verb and flag the bridge emits exists in the
+CLI's dispatch table; `tests/robot_cli_contract.rs` runs a real `gitea-robot` binary, so it
+also covers the case where the CLI builds but rejects the argv it is handed. Its tests are
+`#[ignore]`d — they need that binary — which is why `make test-rust-robot-contract` builds it
+and opts in, and why the `rust` job runs that target as well: unwired, the file's own claim to
+run a real binary was never true in CI, and the `cmd/gitea-robot/**` filter is what makes a PR
+touching only the Go side run it at all. What is still **not** covered anywhere is the HTTP
+call itself — 🐝 on a real issue driving a real pull request end to end needs a reachable
+instance and a NIP-98 agent key.
