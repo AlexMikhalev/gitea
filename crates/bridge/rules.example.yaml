@@ -1,0 +1,44 @@
+# Example rules for the gitea-automations bridge.
+#
+# THIS FILE IS VALIDATED, NOT EXECUTED. Nothing in the daemon consults a rule at runtime:
+# RuleSet::load is called by `check-rules` and by config validation, and both parse and
+# discard. Editing anything here changes nothing about a running bridge. It is scaffolding
+# for a future release, kept parseable so the shape is agreed before it is wired.
+#
+# In particular, the `every_secs` below does NOT drive the ready poll - poll.ready_interval_secs
+# in bridge.yaml does - and the outbound actions come from src/outbound.rs, not from here.
+#
+# Validate with:
+#   gitea-automations check-rules rules.yaml
+#
+# `action` is an allowlist, not a command. The only accepted values are:
+#
+#   create_task, comment, label, open_pr, unblock
+#
+# There is no shell action and no way to spell one: an unrecognised name is a named parse
+# error, and the daemon never invokes a shell — every external call is an argv vector.
+#
+# `trigger.type` is one of schedule, webhook, reaction.
+
+rules:
+  - name: poll-ready-issues
+    trigger:
+      type: schedule
+      # Inert: the live cadence is poll.ready_interval_secs in bridge.yaml.
+      every_secs: 60
+    action: create_task
+
+  - name: honeybee-approves
+    # The emoji alias, never the codepoint — and it must be present in [ui] REACTIONS.
+    trigger:
+      type: reaction
+      content: honeybee
+    action: unblock
+
+  - name: mark-blocked
+    trigger:
+      type: webhook
+      event: issues
+    action: label
+    with:
+      labels: status/blocked

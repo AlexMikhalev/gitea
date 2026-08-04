@@ -348,6 +348,53 @@ lint-go-gitea-vet: ## lint go files with gitea-vet
 	@echo "Running gitea-vet..."
 	@$(GO) vet -vettool="$(shell GOOS= GOARCH= go tool -n gitea-vet)" ./...
 
+# The gitea-automations bridge daemon under crates/ is a Rust workspace, so it is not
+# reached by lint-backend or test-backend. It is kept out of `lint`/`test` because it needs a
+# cargo toolchain the rest of the build does not; CI runs these two targets directly when
+# anything under crates/ changes (.github/workflows/pull-compliance.yml).
+#
+# --locked everywhere: crates/Cargo.lock is committed, and without this flag cargo is free to
+# update it in place, so CI would test a dependency set no developer ever ran and the pin
+# would be decorative. With it, a lockfile that does not match Cargo.toml is an error.
+#
+# `cargo doc` is the third leg and it is not decoration: neither fmt nor clippy evaluates a
+# rustdoc lint, so a `[`Name`]` link left dangling by a rename — the doc comments in this
+# crate are the design record for its invariants — resolves to nothing and no target notices.
+# `--document-private-items` is what reaches them: most of those constants and their arguments
+# are private, and without it rustdoc never reads their doc comments at all.
+.PHONY: lint-rust
+lint-rust: ## lint rust files (crates/, the gitea-automations bridge)
+	cargo fmt --manifest-path crates/Cargo.toml --all -- --check
+	cargo clippy --locked --manifest-path crates/Cargo.toml --all-targets -- -D warnings
+	RUSTDOCFLAGS="-D warnings" cargo doc --locked --manifest-path crates/Cargo.toml \
+		--no-deps --document-private-items
+
+.PHONY: lint-rust-fix
+lint-rust-fix: ## lint rust files and fix issues
+	cargo fmt --manifest-path crates/Cargo.toml --all
+	cargo clippy --locked --manifest-path crates/Cargo.toml --all-targets --fix --allow-dirty -- -D warnings
+
+.PHONY: test-rust
+test-rust: ## test rust files (crates/, the gitea-automations bridge)
+	cargo test --locked --manifest-path crates/Cargo.toml --all
+
+# The one cross-language check on the write leg's argv, and the only one that runs a real
+# binary: `robot_cli_contract` covers the case where cmd/gitea-robot builds but rejects the
+# argv the bridge hands it — the exact failure that had the outbound leg calling subcommands
+# the CLI did not have. Its tests are `#[ignore]`d because they need that binary, so
+# `test-rust` above cannot run them and this target exists to build it and opt in. Without
+# this being wired into CI the file's own claim — "runs a real binary" — is never true there,
+# and only the Go half (TestBridgeWriteVerbsExist) is actually enforced.
+#
+# Built fresh into ./bin (gitignored) rather than resolved from PATH: an installed
+# `gitea-robot` may be older than the tree, and a stale pass here is worse than no test.
+.PHONY: test-rust-robot-contract
+test-rust-robot-contract: ## test the bridge write leg against a built cmd/gitea-robot
+	@mkdir -p bin
+	$(GO) build -o bin/gitea-robot ./cmd/gitea-robot
+	GITEA_ROBOT_BIN="$(CURDIR)/bin/gitea-robot" cargo test --locked \
+		--manifest-path crates/Cargo.toml --test robot_cli_contract -- --ignored
+
 .PHONY: lint-editorconfig
 lint-editorconfig:
 	@echo "Running editorconfig check..."

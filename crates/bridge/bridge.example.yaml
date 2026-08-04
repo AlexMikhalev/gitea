@@ -1,0 +1,167 @@
+# Example configuration for the gitea-automations bridge daemon (issue #57, phase F4).
+#
+# Copy to bridge.yaml and edit. Validate with:
+#   gitea-automations --config bridge.yaml check
+
+gitea:
+  base_url: https://git.example.org
+
+  # Reads only. The ready and reactions endpoints allow anonymous reads on public
+  # repositories, but GET /repos/{o}/{r}/collaborators/{u}/permission sits behind
+  # reqToken() (routers/api/v1/api.go:1464,1466). Without a token the bridge cannot tell a
+  # maintainer's 🐝 from a passer-by's, and every approval fails closed.
+  #
+  # A token is necessary but NOT sufficient: that endpoint answers for a user other than
+  # the caller only for a site admin or an admin of the repository
+  # (routers/api/v1/repo/collaborators.go:279) - anyone else gets 403. The bridge always
+  # asks about somebody else, namely whoever reacted, so this token must belong to a site
+  # admin or to an admin of every repo listed below. `check` probes exactly that and says
+  # so; without it the only symptom is every 🐝 resolving to Undetermined, forever.
+  # token: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+  request_timeout_secs: 30
+  max_retries: 3
+  retry_backoff_ms: 250
+
+# The ready endpoint returns repo_id and repo_name but no owner
+# (routers/api/v1/robot/ready_graph.go:25-42), so the owner is config, never inferred.
+repos:
+  - owner: terraphim
+    repo: gitea
+
+kanban:
+  binary: hermes
+  # Boards are the isolation unit: each has its own DB, workspaces directory and
+  # dispatcher loop.
+  board: f4
+  # Multi-box deployment is one bridge per host with *disjoint* assignees. Two bridges
+  # sharing an assignee would both act on the same terminal events.
+  assignee: codex
+  workspace: worktree
+  max_runtime: 2h
+  max_retries: 2
+  created_by: gitea-automations
+  # Hold each ready issue until a 🐝, and create NO kanban task before it arrives.
+  #
+  # The hold is bridge-side (see state_file at the bottom of this file), not a kanban status,
+  # and that is not a stylistic choice: on hermes v0.19.0 `hermes kanban list` PROMOTES a
+  # blocked task by reading it - plain and with --status blocked, both probed live. The
+  # approval sweep's first call is a `kanban list`, so a task created --initial-status blocked
+  # was released to a worker by the very sweep that went looking for one to release, with no
+  # human involved and nothing in the log. With no task created there is nothing to promote.
+  #
+  # With this off, every ready issue becomes a task at once and `hermes kanban create` defaults
+  # to `ready` - immediately claimable - so an agent runs it with no human in the loop.
+  require_approval: true
+
+robot:
+  # Writes go through gitea-robot so they carry the NIP-98 agent identity from F1 —
+  # attributable to the agent key, and revocable with it.
+  #
+  # THE DAEMON'S PROCESS NEEDS A CREDENTIAL IN ITS ENVIRONMENT. gitea-robot exits 1 with
+  # "GITEA_TOKEN or GITEA_NOSTR_KEY environment variable required" before it dispatches at all
+  # (cmd/gitea-robot/main.go:165-168), so with neither set, EVERY terminal event fails at its
+  # first action - including the escalation comment that exists to report such failures on the
+  # issue, because it goes through this same binary. Nothing appears on Gitea and the board looks
+  # exactly like an issue nobody picked up. Set one in the unit file:
+  #
+  #   [Service]
+  #   Environment=GITEA_NOSTR_KEY=nsec1...   # preferred: the F1 agent identity
+  #   # or Environment=GITEA_TOKEN=xxxx      # a bearer token, if no agent key is registered
+  #
+  # The bridge passes exactly the one it found, and REMOVES the other from the child's
+  # environment, so the write leg's identity is the one `check` validated rather than whatever
+  # the box happens to export. `check` probes this and says which variable is carrying it.
+  #
+  # GITEA_URL is NOT taken from the environment: the bridge sets it on every call from the
+  # config (see base_url below).
+  binary: gitea-robot
+  # Where the writes go. Defaults to gitea.base_url, which is what a single-instance deployment
+  # wants — set this only when the write-side hostname genuinely differs from the read-side one.
+  #
+  # Leaving it to the environment was the failure this closes: unset, gitea-robot uses its own
+  # documented default of http://localhost:3000 (cmd/gitea-robot/main.go:152-154), so on a box
+  # with a dev Gitea listening there the daemon reads issues from the configured instance and
+  # comments, labels and opens pull requests on the local one — with the agent's identity, and
+  # with no diagnostic anywhere, because the request succeeded. `check` prints the URL it will
+  # write to and warns when it is not the one it reads from.
+  #
+  # With GITEA_NOSTR_KEY, this must equal the instance's ROOT_URL exactly — scheme, host, port
+  # and sub-path. The NIP-98 signature commits to the absolute URL, so a mismatch is rejected as
+  # a bare 401 whose real reason is only in the server's debug log.
+  # base_url: https://git.example.org
+  # Must not contain a slash. The pull-request existence probe is
+  # GET /repos/{o}/{r}/pulls/{base}/{head}, where only {head} is a catch-all segment
+  # (routers/api/v1/api.go:1642), so `release/1.0` would be read as base=release - the probe
+  # would miss, and Gitea's own duplicate check would then reject every pull request.
+  # `check` refuses one rather than letting it wedge later.
+  base_branch: main
+  # Must already exist in every repository above, spelled exactly like this — nothing here
+  # creates repository labels, and a name Gitea cannot resolve is dropped from
+  # POST /issues/{index}/labels in silence (models/issues/label.go:333-341). It is action 0
+  # of every blocked/gave_up/crashed/timed_out plan, so a missing one takes the reason
+  # comment behind it down with it. `check` probes for it.
+  blocked_label: status/blocked
+  draft_pulls: false
+  # Only read when draft_pulls is on. Gitea has no `draft` field on a pull request - it
+  # decides draft-ness by matching the title against PULL_REQUEST.WORK_IN_PROGRESS_PREFIXES
+  # (modules/setting/repository.go:230) - and neither this daemon nor gitea-robot can read
+  # app.ini. So an instance that changed that setting must repeat its first prefix here, or
+  # draft_pulls opens an ordinary, immediately-reviewable pull request and says nothing.
+  wip_prefix: "WIP:"
+
+poll:
+  ready_interval_secs: 60
+  # Reaction polling is the permanent path, not a stopgap: repoevent.Kind is exactly
+  # action, agent_audit, comment, review, status (services/repoevent/event.go:29-37), so a
+  # reaction is not observable through the F2 event stream at all.
+  approval_interval_secs: 60
+  skip_in_progress: true
+  # `kanban watch` is a live stream and each terminal event fires exactly once, so a single
+  # failed gitea-robot call - or a daemon that was down when the event fired - would drop
+  # that issue's feedback for good. This sweep re-drives terminal tasks that carry no report
+  # marker, which is what makes a half-applied plan actually replayable.
+  reconcile_interval_secs: 300
+  # The only bound on this daemon's steady-state cost. /api/v1/robot/ready returns EVERY
+  # unblocked open issue - no limit, no paging (routers/api/v1/robot/ready_graph.go:192-276) -
+  # so uncapped, a board with 300 open issues means 300 entries at the approval gate per sweep
+  # (or 300 `hermes kanban create` subprocesses with the gate off), 300 issues polled for a 🐝
+  # every approval_interval_secs and 300 `kanban show` subprocesses per reconcile sweep,
+  # permanently: an issue the bridge is holding, or whose task is merely blocked, still counts
+  # as "ready" as far as getInProgressIssues is concerned.
+  #
+  # Selection is PageRank descending, ties broken by issue index, so consecutive sweeps pick
+  # the SAME issues and re-creating them is deduplicated by idempotency key - the cap bounds
+  # the board, not just one sweep. Whatever it defers is logged, never dropped silently.
+  # Must be at least 1; raise it to put more work in flight.
+  max_tasks_per_sweep: 25
+
+approval:
+  # The emoji *alias* for U+1F41D (modules/emoji/emoji_data.go:191), which is also the
+  # `content` value the reactions API returns. Never the codepoint.
+  #
+  # This also requires an app.ini change on the Gitea side. Writes are rejected unless the
+  # type is in setting.UI.ReactionsLookup (models/issues/reaction.go:223) and reads filter
+  # on the same allowlist (:165) — an unconfigured 🐝 is invisible, not merely unwritable.
+  # The default omits it (custom/conf/app.example.ini:1361), so set:
+  #
+  #   [ui]
+  #   REACTIONS = +1, -1, laugh, hooray, confused, heart, rocket, eyes, honeybee
+  reaction: honeybee
+  require_write_permission: true
+
+# Optional, and validated only: nothing consults a rule at runtime today. Setting this
+# makes `check` parse the file and fail on a bad one; it does not change what the daemon
+# does. See rules.example.yaml.
+# rules_file: rules.yaml
+
+# Where the approval gate keeps the ready issues it is holding (see kanban.require_approval).
+# The daemon needs write access to this file and its directory; it is rewritten through a
+# temporary file and a rename on every hold and release, so a crash leaves the previous
+# contents rather than a truncated file.
+#
+# Back it up with the deployment, but losing it is not a safety failure in either direction:
+# nothing is released that was not approved, and the held set is rebuilt by the next inbound
+# sweep, because an issue with no task is still ready. `check` prints this path and how many
+# issues are held right now.
+state_file: bridge-state.json

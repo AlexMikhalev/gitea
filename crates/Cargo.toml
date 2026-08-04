@@ -1,0 +1,11 @@
+[workspace]
+members = ["bridge"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+# 1.88, not 1.85: `main.rs` uses a let-chain (`if let Some(x) = … && let Err(e) = …`),
+# which stabilized in 1.88. A 1.85 toolchain does not build this crate.
+rust-version = "1.88"

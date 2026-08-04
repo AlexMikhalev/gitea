@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"code.gitea.io/gitea/modules/nostr"
 	"code.gitea.io/gitea/modules/robotroom"
@@ -36,6 +37,35 @@ var (
 
 // nip98Kind is the NIP-98 "HTTP Auth" event kind.
 const nip98Kind = 27235
+
+// The two refusals main() can produce before it does any work, as constants because another
+// component reads them.
+//
+// The gitea-automations bridge preflights its write leg by spawning this binary once with a
+// command it deliberately does not have (crates/bridge/src/robot.rs, PREFLIGHT_VERB) and telling
+// the two apart on stderr: reaching "unknown command" proves the credential check passed, while
+// the credential error proves it did not. Both exit 1, so the message is the whole signal. That
+// is what stops a daemon starting with no credential in its environment, where every comment,
+// label and pull request fails at the first action - including the escalation comment that
+// exists to report it, since it goes through this same binary.
+//
+// TestBridgePreflightProbeStaysDistinguishable pins the substrings the bridge matches on.
+const (
+	missingCredentialError = "Error: GITEA_TOKEN or GITEA_NOSTR_KEY environment variable required"
+	unknownCommandError    = "Unknown command: %s\n"
+)
+
+// httpTimeout bounds one API round trip.
+//
+// http.DefaultClient has no timeout at all, so a half-open connection to the instance is not
+// an error: the request never returns and the process never exits. That is a wedged CLI when
+// a human runs it, and worse when the gitea-automations bridge does - it shells out to these
+// verbs from inside its outbound leg, which then stops reading kanban events while still
+// looking alive. Every request in this binary goes through httpClient for that reason.
+const httpTimeout = 60 * time.Second
+
+// httpClient is the only client this CLI makes requests with. See httpTimeout.
+var httpClient = &http.Client{Timeout: httpTimeout}
 
 // setRequestAuth sets the Authorization header for one API request.
 //
@@ -150,7 +180,7 @@ func main() {
 	// Nostr key is configured would defeat the point of configuring one: the PAT would still
 	// have to exist on the box for the process to start.
 	if giteaToken == "" && giteaNostrKey == "" {
-		fmt.Fprintln(os.Stderr, "Error: GITEA_TOKEN or GITEA_NOSTR_KEY environment variable required")
+		fmt.Fprintln(os.Stderr, missingCredentialError)
 		os.Exit(1)
 	}
 	if giteaNostrKey != "" {
@@ -165,24 +195,29 @@ func main() {
 	command := os.Args[1]
 	os.Args = os.Args[1:] // Remove command from args
 
-	switch command {
-	case "triage":
-		triageCmd()
-	case "ready":
-		readyCmd()
-	case "graph":
-		graphCmd()
-	case "add-dep":
-		addDepCmd()
-	case "room":
-		roomCmd()
-	case "mcp-server":
-		mcpServerCmd()
-	default:
-		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
+	run, ok := commands[command]
+	if !ok {
+		fmt.Fprintf(os.Stderr, unknownCommandError, command)
 		printUsage()
 		os.Exit(1)
 	}
+	run()
+}
+
+// commands is the dispatch table. It is a map rather than a switch so that one test can
+// assert every verb another component shells out to actually exists here - in particular
+// the gitea-automations bridge's write leg (crates/bridge/src/robot.rs), whose own tests
+// can only check that the bridge agrees with itself about the argv it builds.
+var commands = map[string]func(){
+	"triage":      triageCmd,
+	"ready":       readyCmd,
+	"graph":       graphCmd,
+	"add-dep":     addDepCmd,
+	"room":        roomCmd,
+	"comment":     commentCmd,
+	"edit-issue":  editIssueCmd,
+	"create-pull": createPullCmd,
+	"mcp-server":  mcpServerCmd,
 }
 
 func printUsage() {
@@ -192,12 +227,15 @@ Usage:
   gitea-robot [command] [flags]
 
 Commands:
-  triage      Get prioritized task list
-  ready       Get unblocked (ready) tasks
-  graph       Get dependency graph
-  add-dep     Add dependency between issues
-  room        Manage a branch room issue: open|status|close
-  mcp-server  Start MCP server exposing gitea-robot functionality
+  triage       Get prioritized task list
+  ready        Get unblocked (ready) tasks
+  graph        Get dependency graph
+  add-dep      Add dependency between issues
+  room         Manage a branch room issue: open|status|close
+  comment      Post an issue comment
+  edit-issue   Edit an issue: --add-labels adds labels, keeping the existing ones
+  create-pull  Open a pull request (a no-op if one already exists for base/head)
+  mcp-server   Start MCP server exposing gitea-robot functionality
 
 Environment:
   GITEA_URL        Gitea instance URL (default: http://localhost:3000)
@@ -239,6 +277,14 @@ Examples:
   gitea-robot room open --owner terraphim --repo gitea --branch feat/foo
   gitea-robot room status --owner terraphim --repo gitea --branch feat/foo --state success
   gitea-robot room close --owner terraphim --repo gitea --branch feat/foo
+
+  # Write back to an issue: comment, add a label, open a pull request. These are the
+  # verbs the gitea-automations bridge shells out to, so that its writes carry the
+  # agent's NIP-98 identity rather than a bearer token.
+  gitea-robot comment --owner terraphim --repo gitea --issue 57 --body "done"
+  gitea-robot edit-issue --owner terraphim --repo gitea --issue 57 --add-labels status/blocked
+  gitea-robot create-pull --owner terraphim --repo gitea --title "issue #57: daemon" \
+      --head task/57-daemon --base main --body "Refs #57"
 
   # Start MCP server
   gitea-robot mcp-server`)
@@ -340,7 +386,7 @@ func addDepCmd() {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -389,7 +435,7 @@ func apiSendSafe(method, url, body string) (string, error) {
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("error making request: %v", err)
 	}

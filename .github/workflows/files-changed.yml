@@ -21,6 +21,8 @@ on:
         value: ${{ jobs.detect.outputs.yaml }}
       json:
         value: ${{ jobs.detect.outputs.json }}
+      rust:
+        value: ${{ jobs.detect.outputs.rust }}
 
 jobs:
   detect:
@@ -38,6 +40,7 @@ jobs:
       swagger: ${{ steps.changes.outputs.swagger }}
       yaml: ${{ steps.changes.outputs.yaml }}
       json: ${{ steps.changes.outputs.json }}
+      rust: ${{ steps.changes.outputs.rust }}
     steps:
       - uses: actions/checkout@v6
       - uses: dorny/paths-filter@v3
@@ -107,3 +110,12 @@ jobs:
 
             json:
               - "**/*.json"
+
+            rust:
+              - "crates/**"
+              # The write-leg contract test builds and runs this binary, so a PR touching only
+              # the Go side of that contract has to run the Rust job too — otherwise the one
+              # check that a real gitea-robot accepts the bridge's argv is skipped exactly
+              # when the CLI is what changed.
+              - "cmd/gitea-robot/**"
+              - "Makefile"

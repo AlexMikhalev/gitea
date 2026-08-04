@@ -62,6 +62,8 @@ cpu.out
 
 /bin
 /dist
+# Cargo build output for the Rust crates under /crates (the gitea-automations bridge).
+/crates/target
 /custom/*
 !/custom/conf/app.example.ini
 /data
