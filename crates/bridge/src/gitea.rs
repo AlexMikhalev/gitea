@@ -286,7 +286,7 @@ impl GiteaClient {
             .map_err(GiteaError::Build)?;
         Ok(Self {
             http,
-            base_url: cfg.base_url.trim_end_matches('/').to_string(),
+            base_url: crate::config::normalize_base_url(&cfg.base_url).to_string(),
             token: cfg.token.clone(),
             max_retries: cfg.max_retries,
             retry_backoff: Duration::from_millis(cfg.retry_backoff_ms.max(1)),

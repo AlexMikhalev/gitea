@@ -85,7 +85,7 @@ pub fn task_body(repo: &RepoRef, issue: &ReadyIssue, base_url: &str) -> String {
     let gref = GiteaRef::new(&repo.owner, &repo.repo, issue.index);
     let url = format!(
         "{}/{}/{}/issues/{}",
-        base_url.trim_end_matches('/'),
+        crate::config::normalize_base_url(base_url),
         repo.owner,
         repo.repo,
         issue.index

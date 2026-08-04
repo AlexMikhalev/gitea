@@ -33,6 +33,25 @@ pub const DEFAULT_BLOCKED_LABEL: &str = "status/blocked";
 /// changed the setting must say so — see [`RobotConfig::wip_prefix`].
 pub const DEFAULT_WIP_PREFIX: &str = "WIP:";
 
+/// Strips the one difference between two spellings of the same instance: surrounding
+/// whitespace and a trailing `/`.
+///
+/// Every consumer of a configured base URL goes through here, because the R10 P1 was that they
+/// did not: the read leg ([`crate::gitea::GiteaClient::new`]) and the issue link
+/// ([`crate::inbound::task_body`]) stripped the trailing slash, while [`Config::robot_base_url`]
+/// and [`crate::robot::Robot::with_credential`] did not. `gitea-robot` interpolates `GITEA_URL`
+/// into its path without joining (`cmd/gitea-robot/write.go`), so `https://git.example.org/`
+/// reached it as `https://git.example.org//api/v1/…` — a URL that depends on the server
+/// tolerating the double slash, and one that makes [`Config::reads_and_writes_split`] fire on
+/// two spellings of the same host. Normalizing in one place is what keeps the two legs
+/// comparable at all.
+///
+/// Only the trailing separator is removed. A sub-path install (`https://host/gitea`) is a
+/// different instance from `https://host` and is left exactly as written.
+pub fn normalize_base_url(raw: &str) -> &str {
+    raw.trim().trim_end_matches('/')
+}
+
 /// A single `<owner>/<repo>` the bridge is responsible for.
 ///
 /// Unknown keys are rejected here and in every other config struct — see [`Config`].
@@ -474,13 +493,16 @@ impl Config {
     /// anybody saying so. Reads come from `gitea.base_url`; writes are a `gitea-robot`
     /// subprocess whose `GITEA_URL` decides its own target, and nothing but this ties them
     /// together.
+    ///
+    /// Normalized through [`normalize_base_url`], for the same reason the read leg is: what
+    /// this returns is interpolated into a path by `gitea-robot`, not joined onto one.
     pub fn robot_base_url(&self) -> &str {
         self.robot
             .base_url
             .as_deref()
-            .map(str::trim)
+            .map(normalize_base_url)
             .filter(|u| !u.is_empty())
-            .unwrap_or_else(|| self.gitea.base_url.trim())
+            .unwrap_or_else(|| normalize_base_url(&self.gitea.base_url))
     }
 
     /// Whether the write leg targets an instance other than the one being read.
@@ -488,8 +510,12 @@ impl Config {
     /// Legal — an operator may have a distinct write-side hostname — but never silent: it is
     /// also exactly what a copy-paste error looks like, and its symptom is a *successful* write
     /// on the wrong instance.
+    ///
+    /// Both sides are normalized, so the warning means what it says: a trailing `/` on one of
+    /// the two spellings is not a split, and reporting it as one would train an operator to
+    /// ignore the line that matters.
     pub fn reads_and_writes_split(&self) -> bool {
-        self.robot_base_url() != self.gitea.base_url.trim()
+        self.robot_base_url() != normalize_base_url(&self.gitea.base_url)
     }
 
     /// Ready-poll interval as a [`Duration`].
@@ -780,6 +806,61 @@ mod tests {
             let err = cfg.validate().expect_err("must reject");
             assert!(err.to_string().contains(needle), "{err}");
         }
+    }
+
+    /// The R10 P1: a trailing `/` must not survive into the write leg, and must not read as a
+    /// split instance.
+    ///
+    /// The read leg has always stripped it (`GiteaClient::new`). The write leg did not, and
+    /// `gitea-robot` interpolates `GITEA_URL` into its path rather than joining onto it, so the
+    /// same instance spelled with a trailing slash produced `//api/v1/…` on writes only —
+    /// which the preflight verb cannot catch, because `check` deliberately makes no request.
+    #[test]
+    fn a_trailing_slash_is_not_a_different_instance() {
+        let with_slash =
+            "gitea:\n  base_url: https://git.example.org/\nrepos:\n  - owner: terraphim\n    repo: gitea\n";
+        let cfg: Config = serde_norway::from_str(with_slash).expect("parses");
+        cfg.validate().expect("valid");
+        assert_eq!(
+            cfg.robot_base_url(),
+            "https://git.example.org",
+            "the write leg's GITEA_URL must not carry the slash gitea-robot would double"
+        );
+        assert!(
+            !cfg.reads_and_writes_split(),
+            "one instance spelled two ways is not a split"
+        );
+
+        // …and the mirror case: the slash on the write side only.
+        let cfg: Config = serde_norway::from_str(&format!(
+            "{}robot:\n  base_url: https://git.example.org/\n",
+            minimal()
+        ))
+        .expect("parses");
+        cfg.validate().expect("valid");
+        assert_eq!(cfg.robot_base_url(), "https://git.example.org");
+        assert!(!cfg.reads_and_writes_split());
+
+        // A genuinely different host still reports, slash or no slash: normalizing must not
+        // cost the warning its whole purpose.
+        let cfg: Config = serde_norway::from_str(&format!(
+            "{}robot:\n  base_url: https://writes.example.org/\n",
+            minimal()
+        ))
+        .expect("parses");
+        cfg.validate().expect("valid");
+        assert_eq!(cfg.robot_base_url(), "https://writes.example.org");
+        assert!(cfg.reads_and_writes_split());
+
+        // A sub-path install is a different instance from its host, and stays one.
+        let cfg: Config = serde_norway::from_str(&format!(
+            "{}robot:\n  base_url: https://git.example.org/gitea/\n",
+            minimal()
+        ))
+        .expect("parses");
+        cfg.validate().expect("valid");
+        assert_eq!(cfg.robot_base_url(), "https://git.example.org/gitea");
+        assert!(cfg.reads_and_writes_split());
     }
 
     /// The gate is a file, so a config with nowhere to put it is a config with no gate.

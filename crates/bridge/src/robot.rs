@@ -141,7 +141,11 @@ impl Robot {
     pub fn with_credential(cfg: &RobotConfig, base_url: &str, credential: Option<RobotCredential>) -> Self {
         Self {
             binary: cfg.binary.clone(),
-            base_url: base_url.trim().to_string(),
+            // Normalized here as well as in `Config::robot_base_url`, because this is the last
+            // point before the value becomes `GITEA_URL` and `gitea-robot` interpolates that
+            // into a path rather than joining onto it — a caller that hands over a raw
+            // operator-typed URL must not be the difference between `/api/v1/…` and `//api/v1/…`.
+            base_url: crate::config::normalize_base_url(base_url).to_string(),
             credential,
             base_branch: cfg.base_branch.clone(),
             blocked_label: cfg.blocked_label.clone(),
@@ -687,6 +691,25 @@ mod tests {
             );
         }
         assert_eq!(bare[0], (URL_VAR, Some(TEST_URL)));
+    }
+
+    /// The R10 P1, at the last point where it can still be fixed.
+    ///
+    /// `gitea-robot` builds its request as `GITEA_URL + "/api/v1/…"` (`write.go`), a plain
+    /// interpolation with no path join, so a trailing `/` reaches the server as `//api/v1/…`.
+    /// The read leg has always normalized; this handle now does too, whatever a caller hands
+    /// it — the deployed instance tolerates the double slash, but nothing in this crate is
+    /// entitled to assume that of the next one.
+    #[test]
+    fn a_trailing_slash_never_reaches_the_child_as_gitea_url() {
+        let robot = Robot::new(&RobotConfig::default(), "  https://git.example.org/  ");
+        assert_eq!(robot.base_url(), TEST_URL);
+        assert_eq!(robot.env()[0], (URL_VAR, Some(TEST_URL)));
+
+        // Only the separator goes: a sub-path install must survive intact, or every write
+        // lands one level above the instance.
+        let subpath = Robot::new(&RobotConfig::default(), "https://git.example.org/gitea/");
+        assert_eq!(subpath.base_url(), "https://git.example.org/gitea");
     }
 
     /// A credential is never printed, only named — `Robot` is `Debug`-derived and logged.

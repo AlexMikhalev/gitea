@@ -477,6 +477,10 @@ pub struct PendingApprovals {
 
 impl PendingApprovals {
     /// Loads the gate from `path`. A file that is not there yet is an empty gate, not an error.
+    ///
+    /// The only constructor, deliberately. `check` reports the held count from the same file the
+    /// daemon acts on; an in-memory variant would let it report `0 held` about a gate that is not
+    /// the one holding anything.
     pub fn load(path: &Path) -> Result<Self, PendingError> {
         let held = match std::fs::read_to_string(path) {
             Ok(raw) if raw.trim().is_empty() => BTreeMap::new(),
@@ -496,14 +500,6 @@ impl PendingApprovals {
             path: path.to_path_buf(),
             held: Mutex::new(held),
         })
-    }
-
-    /// An in-memory gate, for tests and for the `check` path that only reports its size.
-    pub fn ephemeral() -> Self {
-        Self {
-            path: PathBuf::new(),
-            held: Mutex::new(BTreeMap::new()),
-        }
     }
 
     /// The file this gate persists to.

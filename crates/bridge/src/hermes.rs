@@ -422,9 +422,12 @@ impl Kanban {
 
     /// Whether the bridge holds a ready issue until a 🐝 rather than creating its task.
     ///
-    /// Nothing in the argv depends on this any more — see [`Kanban::create_args`]. The gate is
-    /// [`crate::state::PendingApprovals`], and this is only how the inbound leg reads the
-    /// setting off the handle it already has.
+    /// Nothing in the argv depends on this any more — see [`Kanban::create_args`] — and neither
+    /// does the inbound leg: `poll_once` is handed the gate itself as an `Option`, derived once
+    /// in `main` from `kanban.require_approval`, so no sweep re-reads the setting. What is left
+    /// is the setting as this handle carries it, which is what the tests assert against: that
+    /// flipping it changes nothing kanban is asked for, because the gate is
+    /// [`crate::state::PendingApprovals`] rather than a kanban status.
     pub fn require_approval(&self) -> bool {
         self.require_approval
     }
