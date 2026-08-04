@@ -258,7 +258,13 @@ jobs:
       - uses: actions/checkout@v6
       # ubuntu-latest ships rustup. crates/Cargo.toml sets rust-version = 1.88: main.rs uses
       # a let-chain, which a 1.85 toolchain does not build.
-      - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
-      - run: rustup default stable
+      #
+      # Pinned, not `stable`: rust-version is only a floor, so a floating toolchain means a
+      # future stable that tightens a clippy lint breaks this job on an unrelated PR, and
+      # nobody can reproduce locally what CI actually ran. Bump this deliberately — the pair
+      # of it and the committed crates/Cargo.lock (enforced by --locked in the Makefile
+      # targets below) is what makes a red `rust` job mean the diff, not the calendar.
+      - run: rustup toolchain install 1.93.1 --profile minimal --component rustfmt,clippy
+      - run: rustup default 1.93.1
       - run: make lint-rust
       - run: make test-rust

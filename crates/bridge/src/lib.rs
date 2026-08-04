@@ -16,6 +16,9 @@
 //!   there is no shell action, and no way to spell one.
 //! * [`approval`] polls 🐝 (`honeybee`) reactions as the human approval signal, because
 //!   reactions are not observable through the F2 event stream.
+//! * [`state`] holds the only in-process state in the crate: dead-letter guards for the
+//!   durable markers the three legs above depend on, and a cost cache for the reconcile
+//!   sweep. Losing it on restart costs at most one extra replay.
 
 pub mod approval;
 pub mod config;
@@ -25,3 +28,4 @@ pub mod inbound;
 pub mod outbound;
 pub mod robot;
 pub mod rules;
+pub mod state;

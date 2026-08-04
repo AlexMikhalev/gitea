@@ -141,7 +141,7 @@ impl RuleSet {
 
     /// Parses a rules document.
     pub fn parse(yaml: &str) -> Result<Self, RulesError> {
-        let raw: RawRuleSet = serde_yaml::from_str(yaml)?;
+        let raw: RawRuleSet = serde_norway::from_str(yaml)?;
         let mut rules = Vec::with_capacity(raw.rules.len());
         let mut seen = std::collections::BTreeSet::new();
         for r in raw.rules {
@@ -221,7 +221,7 @@ pub enum RulesError {
     },
     /// The document is not valid YAML, or not the expected shape.
     #[error("cannot parse rules: {0}")]
-    Yaml(#[from] serde_yaml::Error),
+    Yaml(#[from] serde_norway::Error),
     /// The file could not be read.
     #[error("cannot read rules {path}: {source}")]
     Read {

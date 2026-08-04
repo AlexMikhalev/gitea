@@ -20,7 +20,7 @@
 use std::process::Command;
 
 use bridge::config::KanbanConfig;
-use bridge::hermes::{CreateTask, Kanban};
+use bridge::hermes::{CreateTask, Kanban, RECONCILE_STATUSES};
 use bridge::inbound::{GiteaRef, idempotency_key};
 use bridge::outbound::{PlannedAction, TerminalKind, latest_terminal_kind, plan};
 use bridge::robot::Robot;
@@ -201,6 +201,38 @@ async fn an_approval_gated_task_has_nothing_to_reconcile() {
     board.run(&["block", "--kind", "transient", &id, "flaked"]);
     let detail = kanban.show(&id).await.expect("show");
     assert_eq!(latest_terminal_kind(&detail), Some(TerminalKind::Blocked));
+}
+
+/// The reconcile sweep enumerates every documented status, so every one of them must be a
+/// value `kanban list --status` actually accepts.
+///
+/// If one is not, the sweep lists nothing for it and the widening is decorative — which is
+/// exactly the failure the widening was for: `crashed`, `gave_up` and `timed_out` land in a
+/// status nothing in-repo pins, so the sweep has to be able to ask about all of them.
+#[tokio::test]
+#[ignore = "runs a real hermes kanban on a throwaway board"]
+async fn every_reconcile_status_is_one_kanban_will_list() {
+    let Some(board) = ScratchBoard::new("statuses") else {
+        return;
+    };
+    let kanban = board.kanban();
+    let id = kanban
+        .create(&create_request(63, "live status probe"))
+        .await
+        .expect("create");
+
+    for status in RECONCILE_STATUSES {
+        if let Err(err) = kanban.list(Some(status)).await {
+            panic!("kanban list --status {status} must be accepted: {err}");
+        }
+    }
+
+    // …and the sweep really finds a task through one of them.
+    let blocked = kanban.list(Some("blocked")).await.expect("list blocked");
+    assert!(
+        blocked.iter().any(|t| t.id == id),
+        "a gated task must be listed by the status it holds: {blocked:?}"
+    );
 }
 
 #[tokio::test]

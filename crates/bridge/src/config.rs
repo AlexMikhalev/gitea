@@ -221,7 +221,7 @@ pub enum ConfigError {
         path: PathBuf,
         /// Underlying YAML error.
         #[source]
-        source: serde_yaml::Error,
+        source: serde_norway::Error,
     },
     /// The config parsed but is not usable.
     #[error("invalid config: {0}")]
@@ -235,7 +235,7 @@ impl Config {
             path: path.to_path_buf(),
             source,
         })?;
-        let cfg: Self = serde_yaml::from_str(&raw).map_err(|source| ConfigError::Parse {
+        let cfg: Self = serde_norway::from_str(&raw).map_err(|source| ConfigError::Parse {
             path: path.to_path_buf(),
             source,
         })?;
@@ -426,7 +426,7 @@ mod tests {
 
     #[test]
     fn minimal_config_fills_in_defaults() {
-        let cfg: Config = serde_yaml::from_str(minimal()).expect("parses");
+        let cfg: Config = serde_norway::from_str(minimal()).expect("parses");
         cfg.validate().expect("valid");
         assert_eq!(cfg.approval.reaction, DEFAULT_APPROVAL_REACTION);
         assert!(cfg.approval.require_write_permission);
@@ -445,8 +445,9 @@ mod tests {
     fn a_slashed_base_branch_is_rejected() {
         // Only {head} is a catch-all on GET /pulls/{base}/{head}, so `release/1.0` would
         // make every existence probe ask about a branch that is not the configured base.
-        let cfg: Config = serde_yaml::from_str(&format!("{}robot:\n  base_branch: release/1.0\n", minimal()))
-            .expect("parses");
+        let cfg: Config =
+            serde_norway::from_str(&format!("{}robot:\n  base_branch: release/1.0\n", minimal()))
+                .expect("parses");
         let err = cfg.validate().expect_err("must reject");
         assert!(err.to_string().contains("release/1.0"), "{err}");
         assert!(err.to_string().contains("catch-all"), "{err}");
@@ -454,17 +455,18 @@ mod tests {
 
     #[test]
     fn empty_repos_is_rejected() {
-        let cfg: Config =
-            serde_yaml::from_str("gitea:\n  base_url: https://git.example.org\nrepos: []\n").expect("parses");
+        let cfg: Config = serde_norway::from_str("gitea:\n  base_url: https://git.example.org\nrepos: []\n")
+            .expect("parses");
         let err = cfg.validate().expect_err("must reject");
         assert!(err.to_string().contains("repos"), "{err}");
     }
 
     #[test]
     fn non_http_base_url_is_rejected() {
-        let cfg: Config =
-            serde_yaml::from_str("gitea:\n  base_url: git.example.org\nrepos:\n  - owner: a\n    repo: b\n")
-                .expect("parses");
+        let cfg: Config = serde_norway::from_str(
+            "gitea:\n  base_url: git.example.org\nrepos:\n  - owner: a\n    repo: b\n",
+        )
+        .expect("parses");
         assert!(cfg.validate().is_err());
     }
 
@@ -472,7 +474,7 @@ mod tests {
     fn raw_codepoint_reaction_is_rejected() {
         // The reactions API returns the alias, and the ReactionsLookup allowlist stores the
         // alias. A configured codepoint would silently never match.
-        let cfg: Config = serde_yaml::from_str(
+        let cfg: Config = serde_norway::from_str(
             "gitea:\n  base_url: https://git.example.org\nrepos:\n  - owner: a\n    repo: b\napproval:\n  reaction: \"\u{1f41d}\"\n",
         )
         .expect("parses");

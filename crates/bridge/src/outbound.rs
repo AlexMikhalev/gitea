@@ -27,6 +27,13 @@ pub const PR_MARKER: &str = "gitea-bridge: pr-opened";
 /// Marker comment written on the kanban task once its block was reported to Gitea.
 pub const BLOCK_MARKER: &str = "gitea-bridge: blocked-reported";
 
+/// Marker comment written once a repeatedly-unopenable pull request was reported to Gitea.
+///
+/// Distinct from [`BLOCK_MARKER`] so that escalating a `completed` task does not suppress a
+/// genuine later block, and so the escalation itself is posted exactly once however long the
+/// underlying failure lasts.
+pub const PR_ESCALATION_MARKER: &str = "gitea-bridge: pr-blocked";
+
 /// The five terminal kanban events the bridge acts on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TerminalKind {
@@ -220,6 +227,47 @@ pub fn blocked_comment(
     }
     body.push('\n');
     body
+}
+
+/// Builds the comment posted when a `completed` task's pull request cannot be opened.
+pub fn escalation_comment(task_id: &str, head: &str, attempts: u32, error: &str) -> String {
+    format!(
+        "{PR_ESCALATION_MARKER}\n\nKanban task `{task_id}` completed, but opening its pull \
+         request has failed {attempts} times and the bridge will keep retrying.\n\nHead branch \
+         `{head}` — if it was never pushed to this instance, no pull request can be opened \
+         until it is. Pushing is the worker's job, not the bridge's.\n\n> {error}\n"
+    )
+}
+
+/// The actions that surface a repeatedly-unopenable pull request on the Gitea issue.
+///
+/// `completed` returns work as a pull request against a head branch the bridge does not
+/// push: it reads `branch_name`, or derives `task/<index>-<slug>` from the title. When that
+/// branch is not on the server, `create-pull` fails and the reconcile sweep replays it every
+/// 300s indefinitely — with the only signal a recurring `error!` line in the daemon's log,
+/// while the Gitea issue stays completely silent about work that finished and produced
+/// nothing. A human watching the board cannot tell that from an issue nobody picked up.
+///
+/// So after [`crate::state::ESCALATE_AFTER`] failures the failure is said where the humans
+/// are looking. The retry is *not* abandoned — if the branch is pushed later the pull request
+/// still opens — but [`PR_ESCALATION_MARKER`] makes this comment land exactly once.
+pub fn escalation_actions(
+    detail: &TaskDetail,
+    blocked_label: &str,
+    head: &str,
+    attempts: u32,
+    error: &str,
+) -> Result<Vec<PlannedAction>, PlanError> {
+    if detail.has_marker(PR_ESCALATION_MARKER) {
+        return Err(PlanError::AlreadyReported {
+            task: detail.task.id.clone(),
+            kind: "pr-escalation",
+        });
+    }
+    Ok(vec![
+        PlannedAction::Label(vec![blocked_label.to_string()]),
+        PlannedAction::Comment(escalation_comment(&detail.task.id, head, attempts, error)),
+    ])
 }
 
 /// Maps one terminal event onto Gitea actions.
@@ -554,6 +602,46 @@ mod tests {
             author: Some("bridge".into()),
             body: completed_comment("t_abc123", None),
         });
+        assert!(plan(&d, TerminalKind::Blocked, "status/blocked", true).is_ok());
+    }
+
+    /// A completed task whose branch was never pushed used to retry forever in silence.
+    #[test]
+    fn a_pull_request_that_cannot_be_opened_is_escalated_to_the_issue_once() {
+        let mut d = detail("completed", &[]);
+        let actions =
+            escalation_actions(&d, "status/blocked", "task/57-x", 3, "404 not found").expect("escalates");
+        assert_eq!(actions[0], PlannedAction::Label(vec!["status/blocked".into()]));
+        let PlannedAction::Comment(comment) = &actions[1] else {
+            panic!("comment")
+        };
+        // Naming the head branch is the whole point: it is the one fact that tells a human
+        // this is "the worker never pushed" rather than "nobody picked it up".
+        assert!(comment.contains("task/57-x"), "{comment}");
+        assert!(comment.contains("404 not found"), "{comment}");
+        assert_eq!(comment.lines().next(), Some(PR_ESCALATION_MARKER));
+
+        // Once reported, it is not reported again — the retry continues, the noise does not.
+        d.comments.push(TaskComment {
+            author: Some("bridge".into()),
+            body: PR_ESCALATION_MARKER.into(),
+        });
+        assert!(matches!(
+            escalation_actions(&d, "status/blocked", "task/57-x", 9, "404 not found"),
+            Err(PlanError::AlreadyReported { .. })
+        ));
+    }
+
+    #[test]
+    fn escalating_a_completed_task_does_not_suppress_a_later_block_or_its_own_pull_request() {
+        let mut d = detail("completed", &[]);
+        d.comments.push(TaskComment {
+            author: Some("bridge".into()),
+            body: PR_ESCALATION_MARKER.into(),
+        });
+        // The pull request is still attempted: if the branch is pushed later, it opens.
+        assert!(plan(&d, TerminalKind::Completed, "status/blocked", true).is_ok());
+        // And a real block afterwards is still reported, because the markers are distinct.
         assert!(plan(&d, TerminalKind::Blocked, "status/blocked", true).is_ok());
     }
 

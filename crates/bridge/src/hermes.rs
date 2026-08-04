@@ -40,6 +40,32 @@ where
 /// `status/blocked` label plus a reason comment.
 pub const TERMINAL_KINDS: [&str; 5] = ["completed", "blocked", "gave_up", "crashed", "timed_out"];
 
+/// Every status a task can hold, as [`Task::status`] documents them.
+///
+/// The reconciliation sweep enumerates *all* of these rather than the two a terminal event
+/// was observed to leave behind (`done` after `complete`, `blocked` after `block`). Nothing
+/// pins the status of a `crashed`, `gave_up` or `timed_out` task, and kanban's crash-reclaim
+/// exists precisely to return a dead worker's task to a claimable status — most plausibly
+/// `ready`. A sweep keyed on a hand-maintained pair of statuses would never list those, and
+/// their Gitea feedback would be dropped for good, for the three kinds most likely to
+/// coincide with the infrastructure trouble that made the sweep necessary.
+///
+/// Enumerating widely is safe because the discrimination is done by
+/// [`crate::outbound::latest_terminal_kind`] on the task's *event trail*, not by its status:
+/// a task created `blocked` to await a 🐝 has no terminal event and is skipped whichever
+/// status listed it.
+pub const RECONCILE_STATUSES: [&str; 9] = [
+    "triage",
+    "todo",
+    "ready",
+    "running",
+    "review",
+    "blocked",
+    "scheduled",
+    "done",
+    "archived",
+];
+
 /// A task as `hermes kanban show --json` reports it.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Task {
@@ -156,14 +182,28 @@ impl TaskDetail {
             .find(|e| TERMINAL_KINDS.contains(&e.kind.as_str()))
     }
 
-    /// Whether any comment body contains `marker`.
+    /// Whether any comment carries `marker` as a line of its own.
     ///
     /// This is how the bridge stays idempotent across a restart without keeping in-memory
     /// state: the marker lives in kanban, which is the durable side.
+    ///
+    /// Matched line-exactly rather than by substring, for the same reason
+    /// [`crate::approval::Approval::is_consumed`] is — and this is the guard with the larger
+    /// blast radius, because it decides whether a pull request is opened at all. Under a
+    /// substring match a human (or another agent) commenting *"did the bridge ever post
+    /// gitea-bridge: pr-opened for this?"* would suppress that task's pull request
+    /// permanently, and both the watch path and the reconcile path would read the suppression
+    /// as the routine already-handled case and say nothing.
     pub fn has_marker(&self, marker: &str) -> bool {
-        self.comments.iter().any(|c| c.body.contains(marker))
+        let marker = marker.trim();
+        self.comments
+            .iter()
+            .any(|c| c.body.lines().any(|l| l.trim() == marker))
     }
 }
+
+/// First delay between marker-write attempts; doubled on each further attempt.
+const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// A request to create a kanban task.
 #[derive(Debug, Clone, PartialEq)]
@@ -450,6 +490,46 @@ impl Kanban {
         self.run(&self.comment_args(task_id, body)).await.map(|_| ())
     }
 
+    /// Appends a comment, retrying a failure a bounded number of times.
+    ///
+    /// Every marker this bridge relies on is written by this call, and each one is written
+    /// *after* the move it records — deliberately, because a marker without a move would
+    /// strand the task whereas a move without a marker is retried on the next sweep. That
+    /// ordering is only safe while the marker eventually lands: an unwritten
+    /// `approval-consumed` marker releases the task again on every 60s sweep, and an unwritten
+    /// `pr-opened` / `blocked-reported` marker makes the reconcile sweep repost the same
+    /// user-visible Gitea comment every 300s, forever.
+    ///
+    /// The call is a local subprocess, so a few immediate retries cost nothing and cover the
+    /// failure this is actually for: a momentarily locked board, a transient spawn failure.
+    /// A failure that survives them is *not* transient, and the caller is expected to treat
+    /// the `Err` as load-bearing rather than log it and move on — see
+    /// [`crate::state::BridgeState`].
+    pub async fn comment_with_retry(
+        &self,
+        task_id: &str,
+        body: &str,
+        attempts: u32,
+    ) -> Result<(), KanbanError> {
+        let attempts = attempts.max(1);
+        let mut backoff = RETRY_BACKOFF;
+        for attempt in 1..=attempts {
+            match self.comment(task_id, body).await {
+                Ok(()) => return Ok(()),
+                Err(err) if attempt == attempts => return Err(err),
+                Err(err) => {
+                    tracing::warn!(
+                        task = task_id, attempt, attempts, error = %err,
+                        "cannot record a kanban marker; retrying"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff *= 2;
+                }
+            }
+        }
+        unreachable!("the loop returns on the final attempt")
+    }
+
     /// Moves a todo/blocked task to ready.
     pub async fn promote(&self, task_id: &str) -> Result<(), KanbanError> {
         self.run(&self.promote_args(task_id)).await.map(|_| ())
@@ -709,8 +789,73 @@ mod tests {
         let blocked = detail.last_event("blocked").expect("blocked event");
         assert_eq!(blocked.payload_str("kind").as_deref(), Some("needs_input"));
         assert_eq!(blocked.payload_str("reason").as_deref(), Some("waiting for spec"));
-        assert!(detail.has_marker("BLOCKED:"));
+        assert!(detail.has_marker("BLOCKED: waiting for spec"));
         assert!(!detail.has_marker("gitea-bridge: pr-opened"));
+    }
+
+    #[test]
+    fn a_marker_is_matched_line_exactly_not_by_substring() {
+        // The guard that decides whether a pull request is opened at all must not be
+        // trippable by somebody talking *about* the marker: under a substring match this
+        // comment would suppress the PR permanently, and both the watch path and the
+        // reconcile path would read the suppression as the routine already-handled case.
+        let detail = TaskDetail {
+            comments: vec![
+                TaskComment {
+                    author: Some("alex".into()),
+                    body: "did the bridge ever post gitea-bridge: pr-opened for this?".into(),
+                },
+                TaskComment {
+                    author: Some("bridge".into()),
+                    body: "gitea-bridge: blocked-reported".into(),
+                },
+            ],
+            ..TaskDetail::default()
+        };
+        assert!(!detail.has_marker("gitea-bridge: pr-opened"));
+        assert!(detail.has_marker("gitea-bridge: blocked-reported"));
+
+        // A marker that leads a multi-line body still counts: that is the shape of the
+        // Gitea-side comment, and `first_line` is what gets written back to kanban.
+        let multi = TaskDetail {
+            comments: vec![TaskComment {
+                author: Some("bridge".into()),
+                body: "gitea-bridge: pr-opened\n\nKanban task `t_1` completed.".into(),
+            }],
+            ..TaskDetail::default()
+        };
+        assert!(multi.has_marker("gitea-bridge: pr-opened"));
+    }
+
+    #[test]
+    fn the_reconcile_status_set_covers_every_documented_status() {
+        // The sweep used to enumerate `done` and `blocked` only. Nothing pins the status a
+        // `crashed`, `gave_up` or `timed_out` task lands in, and crash-reclaim plausibly
+        // returns it to `ready` — which that pair does not list, so those three kinds were
+        // never reconciled.
+        for status in ["done", "blocked", "ready", "todo", "running"] {
+            assert!(RECONCILE_STATUSES.contains(&status), "{status}");
+        }
+        let mut sorted = RECONCILE_STATUSES.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), RECONCILE_STATUSES.len(), "no duplicates");
+    }
+
+    #[tokio::test]
+    async fn a_marker_write_is_retried_before_it_is_given_up_on() {
+        // A missing binary is the persistent case: it must exhaust its attempts and surface
+        // the error rather than being swallowed, because the caller keys its dead-letter
+        // guard on exactly this `Err`.
+        let k = Kanban::new(&KanbanConfig {
+            binary: "gitea-automations-no-such-binary".into(),
+            ..KanbanConfig::default()
+        });
+        let err = k
+            .comment_with_retry("t_1", "gitea-bridge: pr-opened", 2)
+            .await
+            .expect_err("a missing binary cannot be retried into success");
+        assert!(matches!(err, KanbanError::Spawn { .. }), "{err:?}");
     }
 
     #[test]

@@ -83,6 +83,18 @@ func escapeBranchPath(branch string) string {
 	return strings.Join(parts, "/")
 }
 
+// repoPath escapes an owner/repo pair for interpolation into an API path.
+//
+// Both are single path segments, so unlike a branch name there is nothing to preserve: a
+// slash in either is data that must not become path structure. The provenance of these two
+// values widened with the bridge - they now arrive from a YAML config and from `gitea-ref:`
+// trailers parsed out of kanban task bodies, not only from a human typing flags. The bridge
+// exact-matches both against its configured repo allowlist before calling any verb, so this
+// is defence-in-depth for direct CLI use rather than a hole being closed.
+func repoPath(owner, repo string) string {
+	return url.PathEscape(owner) + "/" + url.PathEscape(repo)
+}
+
 // splitLabels turns a comma-separated --add-labels value into label names.
 func splitLabels(raw string) []string {
 	var out []string
@@ -123,7 +135,7 @@ func runComment(a commentArgs) (string, error) {
 		return "", usagef("--body required")
 	}
 
-	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/issues/%d/comments", giteaURL, a.Owner, a.Repo, a.Issue)
+	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/issues/%d/comments", giteaURL, repoPath(a.Owner, a.Repo), a.Issue)
 	data, err := apiPostSafe(endpoint, fmt.Sprintf(`{"body": %s}`, jsonString(a.Body)))
 	if err != nil {
 		return "", err
@@ -183,7 +195,7 @@ func runEditIssue(a editIssueArgs) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("cannot encode labels: %v", err)
 	}
-	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/issues/%d/labels", giteaURL, a.Owner, a.Repo, a.Issue)
+	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/issues/%d/labels", giteaURL, repoPath(a.Owner, a.Repo), a.Issue)
 	data, err := apiPostSafe(endpoint, string(payload))
 	if err != nil {
 		return "", err
@@ -303,8 +315,8 @@ func runCreatePull(a createPullArgs) (string, error) {
 			"and this command cannot tell an existing pull request from a missing one", a.Base)
 	}
 
-	probe := fmt.Sprintf("%s/api/v1/repos/%s/%s/pulls/%s/%s",
-		giteaURL, a.Owner, a.Repo, escapeBranchPath(a.Base), escapeBranchPath(a.Head))
+	probe := fmt.Sprintf("%s/api/v1/repos/%s/pulls/%s/%s",
+		giteaURL, repoPath(a.Owner, a.Repo), escapeBranchPath(a.Base), escapeBranchPath(a.Head))
 	data, status, err := apiGetStatus(probe)
 	if err != nil {
 		return "", err
@@ -347,7 +359,7 @@ func runCreatePull(a createPullArgs) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("cannot encode the pull request: %v", err)
 	}
-	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/pulls", giteaURL, a.Owner, a.Repo)
+	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/pulls", giteaURL, repoPath(a.Owner, a.Repo))
 	created, err := apiPostSafe(endpoint, string(payload))
 	if err != nil {
 		return "", err

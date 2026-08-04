@@ -444,6 +444,27 @@ func TestEscapeBranchPathKeepsSlashes(t *testing.T) {
 	}
 }
 
+// TestRepoPathEscapesBothSegments: unlike a branch head, owner and repo are single path
+// segments, so a slash in either is data rather than structure. The bridge feeds these from
+// a YAML config and from `gitea-ref:` trailers parsed out of kanban task bodies, so they are
+// no longer only what a human typed on the command line.
+func TestRepoPathEscapesBothSegments(t *testing.T) {
+	if got := repoPath("o", "r"); got != "o/r" {
+		t.Errorf("repoPath() = %q", got)
+	}
+	if got := repoPath("..", "../admin"); got != "..%2F..%2Fadmin" && got != "../..%2Fadmin" {
+		// url.PathEscape leaves "." alone; what matters is that no unescaped slash from the
+		// repo segment reaches the path.
+		t.Errorf("repoPath() = %q", got)
+	}
+	if strings.Count(repoPath("a/b", "c/d"), "/") != 1 {
+		t.Errorf("repoPath() must contribute exactly one path separator: %q", repoPath("a/b", "c/d"))
+	}
+	if got := repoPath("my org", "my repo"); got != "my%20org/my%20repo" {
+		t.Errorf("repoPath() = %q", got)
+	}
+}
+
 func TestSplitLabelsTrimsAndDropsEmpties(t *testing.T) {
 	got := splitLabels(" a , ,b ,")
 	if len(got) != 2 || got[0] != "a" || got[1] != "b" {

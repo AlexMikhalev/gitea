@@ -352,19 +352,23 @@ lint-go-gitea-vet: ## lint go files with gitea-vet
 # reached by lint-backend or test-backend. It is kept out of `lint`/`test` because it needs a
 # cargo toolchain the rest of the build does not; CI runs these two targets directly when
 # anything under crates/ changes (.github/workflows/pull-compliance.yml).
+#
+# --locked everywhere: crates/Cargo.lock is committed, and without this flag cargo is free to
+# update it in place, so CI would test a dependency set no developer ever ran and the pin
+# would be decorative. With it, a lockfile that does not match Cargo.toml is an error.
 .PHONY: lint-rust
 lint-rust: ## lint rust files (crates/, the gitea-automations bridge)
 	cargo fmt --manifest-path crates/Cargo.toml --all -- --check
-	cargo clippy --manifest-path crates/Cargo.toml --all-targets -- -D warnings
+	cargo clippy --locked --manifest-path crates/Cargo.toml --all-targets -- -D warnings
 
 .PHONY: lint-rust-fix
 lint-rust-fix: ## lint rust files and fix issues
 	cargo fmt --manifest-path crates/Cargo.toml --all
-	cargo clippy --manifest-path crates/Cargo.toml --all-targets --fix --allow-dirty -- -D warnings
+	cargo clippy --locked --manifest-path crates/Cargo.toml --all-targets --fix --allow-dirty -- -D warnings
 
 .PHONY: test-rust
 test-rust: ## test rust files (crates/, the gitea-automations bridge)
-	cargo test --manifest-path crates/Cargo.toml --all
+	cargo test --locked --manifest-path crates/Cargo.toml --all
 
 .PHONY: lint-editorconfig
 lint-editorconfig:

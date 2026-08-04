@@ -21,14 +21,15 @@ use clap::{Parser, Subcommand};
 use bridge::approval::{ApprovalOutcome, Preflight, evaluate, preflight};
 use bridge::config::{Config, RepoRef};
 use bridge::gitea::GiteaClient;
-use bridge::hermes::Kanban;
+use bridge::hermes::{Kanban, RECONCILE_STATUSES, TaskDetail};
 use bridge::inbound::{GiteaRef, poll_once};
 use bridge::outbound::{
-    OutboundPlan, PlanError, PlannedAction, TerminalKind, WatchLine, classify_watch_line,
+    OutboundPlan, PlanError, PlannedAction, TerminalKind, WatchLine, classify_watch_line, escalation_actions,
     latest_terminal_kind, plan,
 };
 use bridge::robot::Robot;
-use bridge::rules::RuleSet;
+use bridge::rules::{Action, RuleSet};
+use bridge::state::{BridgeState, ESCALATE_AFTER, MARKER_ATTEMPTS};
 
 /// Bridge between the Gitea shared board and the Hermes kanban execution fabric.
 #[derive(Debug, Parser)]
@@ -153,11 +154,11 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::ApprovalOnce => {
-            approval_sweep(&gitea, &kanban, &cfg).await;
+            approval_sweep(&gitea, &kanban, &cfg, &BridgeState::new()).await;
             Ok(())
         }
         Command::ReconcileOnce => {
-            reconcile_sweep(&cfg, &kanban, &robot).await;
+            reconcile_sweep(&cfg, &kanban, &robot, &BridgeState::new()).await;
             Ok(())
         }
         Command::Run => run(Arc::new(cfg), gitea, kanban, robot).await,
@@ -189,20 +190,25 @@ async fn run(cfg: Arc<Config>, gitea: GiteaClient, kanban: Kanban, robot: Robot)
         })
     };
 
+    // The only in-process state in the daemon, shared by the three legs that write durable
+    // markers. It holds no truth of its own — kanban stays the durable side — but it is what
+    // stops a marker write that failed *after its retries* from becoming an endless loop.
+    let state = Arc::new(BridgeState::new());
+
     let approval = {
-        let (cfg, gitea, kanban) = (cfg.clone(), gitea.clone(), kanban.clone());
+        let (cfg, gitea, kanban, state) = (cfg.clone(), gitea.clone(), kanban.clone(), state.clone());
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(cfg.approval_interval());
             loop {
                 ticker.tick().await;
-                approval_sweep(&gitea, &kanban, &cfg).await;
+                approval_sweep(&gitea, &kanban, &cfg, &state).await;
             }
         })
     };
 
     let outbound = {
-        let (cfg, kanban, robot) = (cfg.clone(), kanban.clone(), robot.clone());
-        tokio::spawn(async move { outbound_loop(cfg, kanban, robot).await })
+        let (cfg, kanban, robot, state) = (cfg.clone(), kanban.clone(), robot.clone(), state.clone());
+        tokio::spawn(async move { outbound_loop(cfg, kanban, robot, state).await })
     };
 
     // The fourth leg, and the one that makes the other three's failure modes recoverable.
@@ -210,12 +216,12 @@ async fn run(cfg: Arc<Config>, gitea: GiteaClient, kanban: Kanban, robot: Robot)
     // `gitea-robot` call — or a daemon that was down when the event fired — would otherwise
     // drop that issue's feedback for good.
     let reconcile = {
-        let (cfg, kanban, robot) = (cfg.clone(), kanban.clone(), robot.clone());
+        let (cfg, kanban, robot, state) = (cfg.clone(), kanban.clone(), robot.clone(), state.clone());
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(cfg.reconcile_interval());
             loop {
                 ticker.tick().await;
-                reconcile_sweep(&cfg, &kanban, &robot).await;
+                reconcile_sweep(&cfg, &kanban, &robot, &state).await;
             }
         })
     };
@@ -254,7 +260,7 @@ async fn inbound_sweep(gitea: &GiteaClient, kanban: &Kanban, cfg: &Config, repo:
 /// `todo` and `blocked` are the two statuses a human decision can move; `triage` is the
 /// specifier's, not ours. With `kanban.require_approval` on, this is also the leg that
 /// releases a freshly created task — inbound creates it `blocked` precisely so that it does.
-async fn approval_sweep(gitea: &GiteaClient, kanban: &Kanban, cfg: &Config) {
+async fn approval_sweep(gitea: &GiteaClient, kanban: &Kanban, cfg: &Config, state: &BridgeState) {
     for status in ["blocked", "todo"] {
         let tasks = match kanban.list(Some(status)).await {
             Ok(tasks) => tasks,
@@ -287,11 +293,16 @@ async fn approval_sweep(gitea: &GiteaClient, kanban: &Kanban, cfg: &Config) {
                             continue;
                         }
                     };
-                    let Some(approval) = approvals.iter().find(|a| !a.is_consumed(&detail)) else {
+                    // …and the in-process guard covers the case where that durable record
+                    // could not be written at all: without it a marker write that failed
+                    // after its retries releases the task again on every sweep.
+                    let Some(approval) = approvals.iter().find(|a| {
+                        !a.is_consumed(&detail) && !state.is_fingerprint_suppressed(&a.fingerprint)
+                    }) else {
                         tracing::debug!(
                             task = %task.id, issue = gref.index,
-                            "every approval reaction on this issue has already been acted on; \
-                             a new 🐝 is needed to release it again"
+                            "every approval reaction on this issue has already been acted on \
+                             (or suppressed); a new 🐝 is needed to release it again"
                         );
                         continue;
                     };
@@ -306,12 +317,26 @@ async fn approval_sweep(gitea: &GiteaClient, kanban: &Kanban, cfg: &Config) {
                             tracing::info!(task = %task.id, by = %approval.by, action, "approval promoted task");
                             // Written after the move, never before: a marker without a move
                             // would strand the task, whereas a move without a marker is
-                            // retried on the next sweep.
-                            if let Err(err) = kanban.comment(&task.id, &approval.consumed_marker()).await {
-                                tracing::warn!(
-                                    task = %task.id, error = %err,
-                                    "cannot record the consumed approval; this 🐝 may release the task again"
+                            // retried on the next sweep. That "retried on the next sweep" is
+                            // only safe while the marker eventually lands, so it is retried,
+                            // and a failure that survives the retries is a dead letter rather
+                            // than a warning: the same 🐝 would otherwise release this task
+                            // every 60 seconds forever, running an agent each time, while
+                            // Gitea shows nothing because BLOCK_MARKER suppresses the repeat
+                            // comment.
+                            if let Err(err) = kanban
+                                .comment_with_retry(&task.id, &approval.consumed_marker(), MARKER_ATTEMPTS)
+                                .await
+                            {
+                                tracing::error!(
+                                    task = %task.id, fingerprint = %approval.fingerprint,
+                                    attempts = MARKER_ATTEMPTS, error = %err,
+                                    "cannot record the consumed approval after retries; suppressing \
+                                     this fingerprint for the lifetime of this process to avoid a \
+                                     release loop. A fresh 🐝 (removed and re-added) still releases \
+                                     the task, and a restart costs at most one extra release"
                                 );
+                                state.suppress_fingerprint(&approval.fingerprint);
                             }
                         }
                         Err(err) => {
@@ -340,7 +365,7 @@ async fn approval_sweep(gitea: &GiteaClient, kanban: &Kanban, cfg: &Config) {
 ///
 /// The watcher is restarted if it exits, because a dead watcher is silent, and silence here
 /// looks exactly like an idle board.
-async fn outbound_loop(cfg: Arc<Config>, kanban: Kanban, robot: Robot) {
+async fn outbound_loop(cfg: Arc<Config>, kanban: Kanban, robot: Robot, state: Arc<BridgeState>) {
     loop {
         match kanban.watch().await {
             Ok((mut child, mut lines)) => {
@@ -354,7 +379,7 @@ async fn outbound_loop(cfg: Arc<Config>, kanban: Kanban, robot: Robot) {
                         Ok(Some(line)) => match classify_watch_line(&line) {
                             WatchLine::Event(event) => {
                                 parsed += 1;
-                                apply_event(&cfg, &kanban, &robot, &event.task_id, event.kind).await;
+                                apply_event(&cfg, &kanban, &robot, &state, &event.task_id, event.kind).await;
                             }
                             WatchLine::UnexpectedKind { kind } => {
                                 // `watch` is invoked with `--kinds`, so this cannot happen
@@ -405,17 +430,42 @@ async fn outbound_loop(cfg: Arc<Config>, kanban: Kanban, robot: Robot) {
 /// The sweep keys on the task's *event trail*, not its status. A task created with
 /// `--initial-status blocked` to await a 🐝 is `blocked` and has no terminal event, and
 /// labelling its issue `status/blocked` would be a lie about work that never ran.
-async fn reconcile_sweep(cfg: &Config, kanban: &Kanban, robot: &Robot) {
-    let (mut checked, mut replayed) = (0u64, 0u64);
-    for status in ["done", "blocked"] {
+///
+/// It enumerates [`RECONCILE_STATUSES`] — every documented status — rather than the two a
+/// terminal event was *observed* to leave behind. Nothing pins where `crashed`, `gave_up` or
+/// `timed_out` land, and kanban's crash-reclaim exists to return a dead worker's task to a
+/// claimable status, so a `done`/`blocked` scan silently covered two of the five kinds and
+/// dropped the other three's feedback permanently — for the kinds most likely to coincide
+/// with the infrastructure trouble that made this sweep necessary in the first place.
+///
+/// Enumerating widely costs nothing extra per task, because the expensive step — one
+/// `kanban show` subprocess each — is skipped for tasks already settled in the status they
+/// were listed in. Without that cache the sweep's cost would grow without bound with board
+/// history: `done` accumulates for the lifetime of the board and nothing here archives it.
+async fn reconcile_sweep(cfg: &Config, kanban: &Kanban, robot: &Robot, state: &BridgeState) {
+    let (mut checked, mut replayed, mut settled, mut suppressed) = (0u64, 0u64, 0u64, 0u64);
+    let mut seen = std::collections::HashSet::new();
+    let (mut failed_statuses, mut first_error): (Vec<&str>, Option<String>) = (Vec::new(), None);
+    for status in RECONCILE_STATUSES {
         let tasks = match kanban.list(Some(status)).await {
             Ok(tasks) => tasks,
             Err(err) => {
-                tracing::error!(status, error = %err, "kanban list failed");
+                // Aggregated below rather than logged per status: a `--status` value kanban
+                // does not accept is a question about the filter, not about the board, and
+                // one recurring error line per sweep per status would drown the sweep that
+                // actually found something. The first error is kept so the aggregate still
+                // says *why*.
+                failed_statuses.push(status);
+                first_error.get_or_insert_with(|| err.to_string());
                 continue;
             }
         };
         for task in tasks {
+            // A task can be listed under only one status, but the same board is enumerated
+            // nine times and kanban may move a task between two of those listings.
+            if !seen.insert(task.id.clone()) {
+                continue;
+            }
             // Filter on the trailer before paying for a `show`: the board is shared, and
             // this sweep walks all of it rather than only what the watcher happened to see.
             let Some(gref) = task.body.as_deref().and_then(GiteaRef::parse_from_body) else {
@@ -428,6 +478,17 @@ async fn reconcile_sweep(cfg: &Config, kanban: &Kanban, robot: &Robot) {
             {
                 continue;
             }
+            if state.is_settled(&task.id, &task.status) {
+                settled += 1;
+                continue;
+            }
+            // A task whose marker could not be written is deliberately left unmarked, which
+            // is exactly what this sweep looks for — so without this guard it would repost
+            // the same user-visible Gitea comment every sweep, forever.
+            if state.is_task_suppressed(&task.id) {
+                suppressed += 1;
+                continue;
+            }
             let detail = match kanban.show(&task.id).await {
                 Ok(detail) => detail,
                 Err(err) => {
@@ -436,6 +497,10 @@ async fn reconcile_sweep(cfg: &Config, kanban: &Kanban, robot: &Robot) {
                 }
             };
             let Some(kind) = latest_terminal_kind(&detail) else {
+                // Nothing to report while it stands still: a task created blocked to await a
+                // 🐝, or one still running. Every route to a terminal event changes its
+                // status, so this is safe to remember.
+                state.mark_settled(&task.id, &task.status);
                 continue;
             };
             checked += 1;
@@ -446,20 +511,50 @@ async fn reconcile_sweep(cfg: &Config, kanban: &Kanban, robot: &Robot) {
                         "terminal task has no report marker; replaying its plan"
                     );
                     replayed += 1;
-                    apply_plan(cfg, kanban, robot, &task.id, &plan).await;
+                    apply_plan(cfg, kanban, robot, state, &task.id, &plan, &detail).await;
                 }
-                // The overwhelmingly common case: the watcher already handled it.
-                Err(PlanError::AlreadyReported { .. }) => {}
+                // The overwhelmingly common case: the watcher already handled it. The marker
+                // is durable, so a confirmed report can never become unreported.
+                Err(PlanError::AlreadyReported { .. }) => state.mark_settled(&task.id, &task.status),
                 Err(err) => {
                     tracing::error!(task = %task.id, error = %err, "cannot plan outbound actions")
                 }
             }
         }
     }
-    tracing::info!(checked, replayed, "reconciliation sweep complete");
+    let error = first_error.unwrap_or_default();
+    if failed_statuses.len() == RECONCILE_STATUSES.len() {
+        tracing::error!(%error, "kanban list failed for every status; this sweep reconciled nothing at all");
+    } else if !failed_statuses.is_empty() {
+        tracing::warn!(?failed_statuses, %error, "kanban list failed for some statuses");
+    }
+    tracing::info!(
+        checked,
+        replayed,
+        settled,
+        suppressed,
+        candidates = seen.len(),
+        "reconciliation sweep complete"
+    );
 }
 
-async fn apply_event(cfg: &Config, kanban: &Kanban, robot: &Robot, task_id: &str, kind: TerminalKind) {
+async fn apply_event(
+    cfg: &Config,
+    kanban: &Kanban,
+    robot: &Robot,
+    state: &BridgeState,
+    task_id: &str,
+    kind: TerminalKind,
+) {
+    if state.is_task_suppressed(task_id) {
+        tracing::warn!(
+            task = task_id,
+            kind = kind.event_kind(),
+            "ignoring a terminal event for a task whose report marker could not be written; \
+             restart the daemon once kanban accepts comments again"
+        );
+        return;
+    }
     let detail = match kanban.show(task_id).await {
         Ok(detail) => detail,
         Err(err) => {
@@ -494,11 +589,19 @@ async fn apply_event(cfg: &Config, kanban: &Kanban, robot: &Robot, task_id: &str
             return;
         }
     };
-    apply_plan(cfg, kanban, robot, task_id, &plan).await;
+    apply_plan(cfg, kanban, robot, state, task_id, &plan, &detail).await;
 }
 
 /// Applies one planned response to Gitea, then marks the task once all of it landed.
-async fn apply_plan(cfg: &Config, kanban: &Kanban, robot: &Robot, task_id: &str, plan: &OutboundPlan) {
+async fn apply_plan(
+    cfg: &Config,
+    kanban: &Kanban,
+    robot: &Robot,
+    state: &BridgeState,
+    task_id: &str,
+    plan: &OutboundPlan,
+    detail: &TaskDetail,
+) {
     if !cfg
         .repos
         .iter()
@@ -510,8 +613,54 @@ async fn apply_plan(cfg: &Config, kanban: &Kanban, robot: &Robot, task_id: &str,
     }
 
     let (owner, repo, index) = (&plan.gitea_ref.owner, &plan.gitea_ref.repo, plan.gitea_ref.index);
-    let mut marker: Option<&str> = None;
-    for action in &plan.actions {
+    match apply_actions(robot, task_id, owner, repo, index, &plan.actions).await {
+        Ok(marker) => {
+            state.clear_plan_failures(task_id);
+            if let Some(marker) = marker {
+                record_marker(kanban, state, task_id, &marker).await;
+            }
+        }
+        Err((action, err)) => {
+            let failures = state.record_plan_failure(task_id);
+            // A `completed` task whose head branch was never pushed fails here every time,
+            // and the retry has no ceiling: the only signal is a recurring `error!` line in
+            // the daemon's log, while the Gitea issue stays silent about work that finished
+            // and produced nothing — indistinguishable, to a human watching the board, from
+            // an issue nobody picked up. After enough failures, say so where they are looking.
+            if action == Action::OpenPr && failures >= ESCALATE_AFTER {
+                escalate_pull_failure(kanban, robot, state, plan, detail, failures, &err).await;
+            }
+        }
+    }
+}
+
+/// Applies planned actions in order, stopping at the first failure.
+///
+/// On success, returns the marker to record — the first line of the first comment that
+/// landed. On failure, returns which action failed and why; the task is deliberately left
+/// unmarked, because an unmarked task is what `reconcile_sweep` looks for, and that sweep —
+/// not the next terminal event — is what actually replays this plan: a terminal kanban event
+/// fires once, so nothing else would ever come back for this task.
+///
+/// Replaying re-runs the actions that already landed, so the two that can land before a
+/// failure are idempotent on the Gitea side: `create-pull` probes `GET /pulls/{base}/{head}`
+/// and reports an existing *open, unmerged* pull request as success
+/// (`cmd/gitea-robot/write.go`), and adding a label the issue already carries is a no-op
+/// (`models/issues/issue_label.go:125-130`). Without that probe a `completed` plan whose
+/// audit comment failed would wedge forever — Gitea refuses a second pull request for the
+/// same base and head, so every retry would fail on the first action and the comment would
+/// never be posted. The comment itself is last in every plan, so a replay repeats it only
+/// when it was the action that failed.
+async fn apply_actions(
+    robot: &Robot,
+    task_id: &str,
+    owner: &str,
+    repo: &str,
+    index: i64,
+    actions: &[PlannedAction],
+) -> Result<Option<String>, (Action, String)> {
+    let mut marker: Option<String> = None;
+    for action in actions {
         let outcome = match action {
             PlannedAction::OpenPull(pr) => robot.create_pull(owner, repo, pr).await.map(|_| ()),
             PlannedAction::Comment(body) => robot.comment(owner, repo, index, body).await.map(|_| ()),
@@ -521,40 +670,74 @@ async fn apply_plan(cfg: &Config, kanban: &Kanban, robot: &Robot, task_id: &str,
             Ok(()) => {
                 tracing::info!(task = task_id, %owner, %repo, index, action = action.action().name(), "applied");
                 if let PlannedAction::Comment(body) = action {
-                    marker = marker.or(first_line(body));
+                    marker = marker.or_else(|| first_line(body).map(str::to_string));
                 }
             }
             Err(err) => {
-                // Stop at the first failure and leave the task unmarked. The unmarked task
-                // is what `reconcile_sweep` looks for, and that sweep — not the next
-                // terminal event — is what actually replays this plan: a terminal kanban
-                // event fires once, so nothing else would ever come back for this task.
-                //
-                // Replaying re-runs the actions that already landed, so the two that can
-                // land before a failure are idempotent on the Gitea side: `create-pull`
-                // probes `GET /pulls/{base}/{head}` and reports an existing *open, unmerged*
-                // pull request as success (`cmd/gitea-robot/write.go`), and adding a label
-                // the issue already carries is a no-op
-                // (`models/issues/issue_label.go:125-130`). Without that probe a `completed`
-                // plan whose audit comment failed would wedge forever — Gitea refuses a
-                // second pull request for the same base and head, so every retry would fail
-                // on the first action and the comment would never be posted. The comment
-                // itself is last in every plan, so a replay repeats it only when it was the
-                // action that failed.
                 tracing::error!(
                     task = task_id, %owner, %repo, index,
                     action = action.action().name(), error = %err,
                     "action failed; leaving the task unmarked for the reconciliation sweep to replay"
                 );
-                return;
+                return Err((action.action(), err.to_string()));
             }
         }
     }
+    Ok(marker)
+}
 
-    if let Some(marker) = marker
-        && let Err(err) = kanban.comment(task_id, marker).await
-    {
-        tracing::warn!(task = task_id, error = %err, "cannot write the kanban dedup marker");
+/// Records a durable marker, retrying, and dead-letters the task if it will not land.
+///
+/// The marker is the whole idempotence story: while it is missing, `plan()` keeps returning
+/// a plan and `reconcile_sweep` keeps applying it — posting the same comment on a
+/// user-visible Gitea issue every 300 seconds. Suppressing the task bounds that to one
+/// duplicate per process lifetime instead of one per sweep, forever.
+async fn record_marker(kanban: &Kanban, state: &BridgeState, task_id: &str, marker: &str) {
+    if let Err(err) = kanban.comment_with_retry(task_id, marker, MARKER_ATTEMPTS).await {
+        tracing::error!(
+            task = task_id, marker, attempts = MARKER_ATTEMPTS, error = %err,
+            "cannot record the kanban dedup marker after retries; suppressing this task for the \
+             lifetime of this process so its gitea comment is not reposted every sweep. Run \
+             `reconcile-once` once kanban accepts comments again to finish recording it"
+        );
+        state.suppress_task(task_id);
+    }
+}
+
+/// Surfaces a pull request that repeatedly cannot be opened on the Gitea issue itself.
+///
+/// The retry is not abandoned — if the missing head branch is pushed later, the pull request
+/// still opens on a subsequent sweep — but the escalation comment is posted exactly once,
+/// guarded by its own durable marker so it survives a restart and does not collide with a
+/// genuine later block.
+async fn escalate_pull_failure(
+    kanban: &Kanban,
+    robot: &Robot,
+    state: &BridgeState,
+    plan: &OutboundPlan,
+    detail: &TaskDetail,
+    failures: u32,
+    error: &str,
+) {
+    let task_id = detail.task.id.as_str();
+    let Some(head) = plan.actions.iter().find_map(|a| match a {
+        PlannedAction::OpenPull(pr) => Some(pr.head.as_str()),
+        _ => None,
+    }) else {
+        return;
+    };
+    let actions = match escalation_actions(detail, robot.blocked_label(), head, failures, error) {
+        Ok(actions) => actions,
+        // Already escalated: keep retrying quietly rather than commenting again.
+        Err(_) => return,
+    };
+    let (owner, repo, index) = (&plan.gitea_ref.owner, &plan.gitea_ref.repo, plan.gitea_ref.index);
+    tracing::warn!(
+        task = task_id, %owner, %repo, index, head, failures,
+        "a completed task's pull request has failed repeatedly; reporting it on the issue"
+    );
+    if let Ok(Some(marker)) = apply_actions(robot, task_id, owner, repo, index, &actions).await {
+        record_marker(kanban, state, task_id, &marker).await;
     }
 }
 
@@ -628,6 +811,23 @@ mod tests {
         //    would label the issue and comment about work that has not started.
         let gated = task_detail(&[("created", 1)], &[]);
         assert_eq!(latest_terminal_kind(&gated), None);
+    }
+
+    /// The sweep used to enumerate `done` and `blocked`, which covers two of the five
+    /// terminal kinds. kanban's crash-reclaim returns a dead worker's task to a claimable
+    /// status, so a `crashed` task plausibly sits in `ready` — never listed, never labelled,
+    /// never commented on, for the kind most likely to coincide with infrastructure trouble.
+    #[test]
+    fn a_crashed_task_reclaimed_to_a_claimable_status_is_still_reconciled() {
+        let mut reclaimed = task_detail(&[("created", 1), ("claimed", 2), ("crashed", 3)], &[]);
+        reclaimed.task.status = "ready".into();
+        assert!(
+            RECONCILE_STATUSES.contains(&reclaimed.task.status.as_str()),
+            "the sweep must list the status a reclaimed task lands in"
+        );
+        let kind = latest_terminal_kind(&reclaimed).expect("a terminal event");
+        assert_eq!(kind, TerminalKind::Crashed);
+        assert!(plan(&reclaimed, kind, "status/blocked", true).is_ok());
     }
 
     #[test]

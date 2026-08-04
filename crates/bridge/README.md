@@ -17,7 +17,7 @@ This is that bridge — **not** a second rules engine. The fabric is inherited, 
 | inbound (`src/inbound.rs`) | `GET /api/v1/robot/ready` | `hermes kanban create --idempotency-key gitea:<owner>/<repo>#<index> --initial-status blocked` |
 | outbound (`src/outbound.rs`) | `hermes kanban watch --kinds completed,blocked,gave_up,crashed,timed_out` | `gitea-robot create-pull` / `edit-issue --add-labels` / `comment` |
 | approval (`src/approval.rs`) | `GET /repos/{o}/{r}/issues/{index}/reactions` | `hermes kanban promote` / `unblock` |
-| reconcile (`main.rs`) | `hermes kanban list --status done\|blocked` | the outbound sinks, replayed |
+| reconcile (`main.rs`) | `hermes kanban list --status <each of the nine>` | the outbound sinks, replayed |
 
 The fourth leg is not decoration. `watch` is a live stream and a terminal kanban event fires
 exactly once, so a single failed `gitea-robot` call — or a daemon that was simply down when
@@ -27,12 +27,27 @@ terminal tasks carrying no report marker and replays their plan. It keys on the 
 *event trail*, not its status: a task created blocked to await a 🐝 is `blocked` and has
 never run, and labelling its issue would be a lie about work that has not started.
 
+It enumerates *every* documented status rather than the two a terminal event was observed to
+leave behind (`done` after `complete`, `blocked` after `block`). Nothing pins where a
+`crashed`, `gave_up` or `timed_out` task lands, and kanban's crash-reclaim exists to return a
+dead worker's task to a claimable status — so a `done`/`blocked` scan covered two of the five
+terminal kinds and silently dropped the other three, which are precisely the kinds that
+coincide with the infrastructure trouble this leg exists for. Enumerating widely is safe
+because the discrimination is `latest_terminal_kind`, not the status, and it is cheap because
+a task already settled in the status it was listed under is skipped without paying for a
+`kanban show` subprocess.
+
 **`completed` assumes the head branch was pushed.** The bridge derives or reads
 `branch_name` and hands it to `create-pull`; nothing in `src/` pushes anything. kanban
 worktrees are local, so if the agent did not push its branch to the Gitea remote,
 `create-pull` fails — loudly, and the reconcile sweep will keep retrying it, but no pull
 request appears until the branch exists on the server. Pushing is the worker's job, not this
-daemon's.
+daemon's. After three failed attempts the bridge stops keeping that to itself: it labels the
+issue `status/blocked` and comments naming the missing head branch, so the failure appears
+where the humans are looking instead of only in the daemon's log, where it is
+indistinguishable from an issue nobody picked up. The retry continues — push the branch and
+the pull request opens — and the escalation comment is posted exactly once, guarded by its
+own durable marker.
 
 `src/rules.rs` parses the declarative rules file; `src/config.rs` is the daemon config;
 `src/gitea.rs` is the read client and `src/robot.rs` the write side. The three write verbs
@@ -154,6 +169,16 @@ output. Treat the file as a validated declaration of intent for a future release
   as "already exists" forever, and nothing would ever be opened.
 * **A spent approval cannot be spent twice.** Promoting a task records the reaction it acted
   on, so the same durable 🐝 cannot unblock the same task on every sweep.
+* **A marker that will not land is a dead letter, not a loop.** Every marker is written after
+  the move it records — a marker without a move would strand the task — which is only safe
+  while the marker eventually lands. So the write is retried (three attempts, exponential
+  backoff, a local subprocess), and a failure that survives the retries suppresses that
+  fingerprint or that task for the lifetime of the process, at `error!`. Without it an
+  unwritten `approval-consumed` marker releases the same task every 60s forever, and an
+  unwritten report marker reposts the same comment on a user-visible Gitea issue every 300s
+  forever. The suppression is in-process only: kanban stays the durable side, and a restart
+  costs at most one extra release or one duplicate comment — the bound the marker already
+  gives — rather than one per sweep.
 * **Crashes orphan nothing.** Claims, heartbeats, reclaim and the circuit breaker are
   kanban's. Killing the bridge stops the bridge.
 
