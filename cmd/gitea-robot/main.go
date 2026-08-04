@@ -38,6 +38,23 @@ var (
 // nip98Kind is the NIP-98 "HTTP Auth" event kind.
 const nip98Kind = 27235
 
+// The two refusals main() can produce before it does any work, as constants because another
+// component reads them.
+//
+// The gitea-automations bridge preflights its write leg by spawning this binary once with a
+// command it deliberately does not have (crates/bridge/src/robot.rs, PREFLIGHT_VERB) and telling
+// the two apart on stderr: reaching "unknown command" proves the credential check passed, while
+// the credential error proves it did not. Both exit 1, so the message is the whole signal. That
+// is what stops a daemon starting with no credential in its environment, where every comment,
+// label and pull request fails at the first action - including the escalation comment that
+// exists to report it, since it goes through this same binary.
+//
+// TestBridgePreflightProbeStaysDistinguishable pins the substrings the bridge matches on.
+const (
+	missingCredentialError = "Error: GITEA_TOKEN or GITEA_NOSTR_KEY environment variable required"
+	unknownCommandError    = "Unknown command: %s\n"
+)
+
 // httpTimeout bounds one API round trip.
 //
 // http.DefaultClient has no timeout at all, so a half-open connection to the instance is not
@@ -163,7 +180,7 @@ func main() {
 	// Nostr key is configured would defeat the point of configuring one: the PAT would still
 	// have to exist on the box for the process to start.
 	if giteaToken == "" && giteaNostrKey == "" {
-		fmt.Fprintln(os.Stderr, "Error: GITEA_TOKEN or GITEA_NOSTR_KEY environment variable required")
+		fmt.Fprintln(os.Stderr, missingCredentialError)
 		os.Exit(1)
 	}
 	if giteaNostrKey != "" {
@@ -180,7 +197,7 @@ func main() {
 
 	run, ok := commands[command]
 	if !ok {
-		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
+		fmt.Fprintf(os.Stderr, unknownCommandError, command)
 		printUsage()
 		os.Exit(1)
 	}

@@ -26,7 +26,14 @@
 use std::process::Command;
 
 use bridge::config::RobotConfig;
-use bridge::robot::{PullRequest, Robot};
+use bridge::robot::{PullRequest, Robot, RobotCredential, WriteCheck, check_write_leg};
+
+/// The instance these tests claim to write to.
+///
+/// Nothing listens on port 1, deliberately: every test in this file must reach its conclusion
+/// without a request, so a probe that started making one fails here rather than passing quietly
+/// against whatever the developer's `GITEA_URL` pointed at.
+const TEST_URL: &str = "http://127.0.0.1:1";
 
 /// The binary under test, or `None` when the opt-in variable is unset.
 ///
@@ -62,7 +69,7 @@ fn help_exit_code(binary: &str, verb: &str) -> i32 {
 #[ignore = "needs a built gitea-robot; set GITEA_ROBOT_BIN"]
 fn every_verb_the_bridge_emits_is_accepted() {
     let Some(binary) = robot_binary() else { return };
-    let robot = Robot::new(&RobotConfig::default());
+    let robot = Robot::new(&RobotConfig::default(), TEST_URL);
 
     let pr = PullRequest {
         title: "issue #57: automations daemon".into(),
@@ -91,7 +98,7 @@ fn every_verb_the_bridge_emits_is_accepted() {
 #[ignore = "needs a built gitea-robot; set GITEA_ROBOT_BIN"]
 fn every_flag_the_bridge_emits_is_declared() {
     let Some(binary) = robot_binary() else { return };
-    let robot = Robot::new(&RobotConfig::default());
+    let robot = Robot::new(&RobotConfig::default(), TEST_URL);
 
     let pr = PullRequest {
         title: "t".into(),
@@ -101,10 +108,13 @@ fn every_flag_the_bridge_emits_is_declared() {
     // `draft_pulls` is off by default, so a robot built from `RobotConfig::default()` never
     // emits `--draft` or `--wip-prefix` — they were the only flags the bridge can produce that
     // no test running a real binary exercised, covered solely by the Go-side table.
-    let drafting = Robot::new(&RobotConfig {
-        draft_pulls: true,
-        ..RobotConfig::default()
-    });
+    let drafting = Robot::new(
+        &RobotConfig {
+            draft_pulls: true,
+            ..RobotConfig::default()
+        },
+        TEST_URL,
+    );
     for argv in [
         robot.comment_args("o", "r", 1, "b"),
         robot.add_labels_args("o", "r", 1, &["status/blocked".to_string()]),
@@ -131,4 +141,46 @@ fn every_flag_the_bridge_emits_is_declared() {
             );
         }
     }
+}
+
+/// The R9 P1's contract, against the real binary: the write-leg preflight reads
+/// `gitea-robot`'s own two refusals correctly.
+///
+/// Both are string-matched on the CLI's stderr (`crates/bridge/src/robot.rs`,
+/// `classify_preflight`), so this is the test that fails if either message is reworded —
+/// which matters more than it looks, because the failure mode of a preflight that stops
+/// recognising "missing credential" is a green `check` in front of a daemon whose every
+/// terminal event fails at action 0.
+///
+/// It also pins the reason the probe can be run at all: no request is made. `TEST_URL` points
+/// at a closed port, so anything that reached the network would fail here rather than pass.
+#[tokio::test]
+#[ignore = "needs a built gitea-robot; set GITEA_ROBOT_BIN"]
+async fn the_write_preflight_reads_the_binarys_own_answers() {
+    let Some(binary) = robot_binary() else { return };
+    let cfg = RobotConfig {
+        binary,
+        ..RobotConfig::default()
+    };
+
+    let credentialed = Robot::with_credential(
+        &cfg,
+        TEST_URL,
+        Some(RobotCredential::new("GITEA_TOKEN", "contract-test")),
+    );
+    let ready = check_write_leg(&credentialed).await;
+    assert!(
+        ready.is_ready(),
+        "a credentialed gitea-robot must reach its dispatch table: {ready:?}"
+    );
+    assert!(ready.reason().contains(TEST_URL), "{ready:?}");
+
+    // …and with none resolved it is `Broken`, whatever this test process's own environment
+    // holds — the bridge removes the credential variables it did not resolve, so the answer
+    // does not depend on the developer having a GITEA_TOKEN exported.
+    let bare = check_write_leg(&Robot::with_credential(&cfg, TEST_URL, None)).await;
+    assert!(
+        matches!(bare, WriteCheck::Broken { .. }),
+        "a gitea-robot with no credential cannot write: {bare:?}"
+    );
 }

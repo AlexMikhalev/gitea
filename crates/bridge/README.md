@@ -130,7 +130,52 @@ A one-shot starts with none, so its `unlisted=0` means "this process knows of no
 learned the id when it watched the task block); failing that, `hermes kanban unblock <id>` by
 hand returns it to a status the sweeps do list — which is also what a restart costs.
 
-## Seven things that bite
+## Eight things that bite
+
+**The write leg needs a credential in the daemon's environment, and it decides its own
+instance.** Every Gitea write is a `gitea-robot` subprocess, and neither of the two things it
+needs is in the argv.
+
+`main()` exits 1 with *"GITEA_TOKEN or GITEA_NOSTR_KEY environment variable required"* **before**
+it reaches the dispatch table (`cmd/gitea-robot/main.go:165-168`). With neither set, every
+terminal event fails at action 0, the task is left unmarked, the reconcile sweep replays it every
+300s — and the escalation that exists to report a repeatedly failing action goes through the
+*same* binary, so it fails too. Nothing reaches the issue, and the board is indistinguishable
+from one nobody picked up. Set one in the unit file:
+
+```ini
+[Service]
+Environment=GITEA_NOSTR_KEY=nsec1…   # the F1 agent identity: attributable, revocable
+# or Environment=GITEA_TOKEN=…       # a bearer token, if no agent key is registered
+```
+
+The bridge forwards **only** the variable it resolved and removes the other from the child, so
+the write leg's identity is the one `check` validated rather than whatever the box exported.
+
+`GITEA_URL` is not left to the environment at all: the bridge sets it on every call, from
+`robot.base_url` or, unset, from `gitea.base_url`. Inherited-and-unset, `gitea-robot` falls back
+to its own `http://localhost:3000` (`cmd/gitea-robot/main.go:152-154`) — so on a box running a
+dev Gitea, the daemon reads issues from the configured instance and comments, labels and opens
+pull requests on the local one, with the agent's identity and no diagnostic anywhere, because the
+request *succeeded*. Under `GITEA_NOSTR_KEY` the URL must also equal the instance's `ROOT_URL`
+exactly (scheme, host, port, sub-path): the NIP-98 signature commits to the absolute URL, and a
+mismatch is a deliberately opaque 401.
+
+`check` probes all of it — by spawning `gitea-robot` once with a verb it deliberately does not
+have, which reaches the credential check without making a request — and `run` logs the same
+verdict at startup:
+
+```console
+$ gitea-automations --config bridge.yaml check
+write leg OK: Writes go to https://git.example.org (GITEA_URL, set explicitly on every call),
+signed with GITEA_NOSTR_KEY
+```
+
+```console
+$ gitea-automations --config bridge.yaml check
+warning: the write leg cannot write — gitea-robot refuses to start: no credential: none of
+GITEA_NOSTR_KEY or GITEA_TOKEN is set in this process's environment — …
+```
 
 **`robot.blocked_label` must already exist in every repository.** Nothing here creates
 repository labels — creating one is not in the action space — and a label name Gitea cannot
@@ -243,6 +288,16 @@ blocked with `needs_input`, the next sweep spent bo's and re-dispatched the agen
 question nobody had answered. To release a task again, remove and re-add the 🐝 (which changes
 its `created_at`, and so is a new approval), or have a maintainer who has not yet reacted add
 theirs — a genuinely new fingerprint is never one of the marked ones.
+
+Those markers live **on the task**, which is what makes archiving one a restart. The idempotency
+key dedups against non-archived tasks only (`hermes kanban create`, probed live on v0.19.0 —
+`an_archived_task_does_not_dedup_so_an_issue_can_be_restarted`), and the bridge's key never
+rotates: it is a pure function of `owner/repo#index`. So an archived task frees its key, the next
+sweep creates a fresh one for an issue that is still ready, and the 🐝 standing on that issue is
+spent again on the new task. That is the point — a key that dedupped against archived tasks would
+make the issue permanently un-restartable, with the gate resolving forever to a task nobody can
+claim. Archiving means "run this one again"; un-approving means removing the 🐝, or closing the
+issue, which drops it from the gate outright.
 
 **No sweep ever lists `blocked`, and a restart forgets which tasks are.** This is the same
 hermes bug as the gate above, reached by a different road, and it is worth stating on its own
@@ -410,3 +465,11 @@ run a real binary was never true in CI, and the `cmd/gitea-robot/**` filter is w
 touching only the Go side run it at all. What is still **not** covered anywhere is the HTTP
 call itself — 🐝 on a real issue driving a real pull request end to end needs a reachable
 instance and a NIP-98 agent key.
+
+The write-leg *preflight* is checked from both sides for the same reason, because it classifies
+the CLI's refusals by their stderr: `the_write_preflight_reads_the_binarys_own_answers` runs the
+real binary with and without a credential, and `TestBridgePreflightProbeStaysDistinguishable`
+(Go, always runs) pins the two messages and the fact that the probe's verb is *not* in the
+dispatch table. Reword either message with only one side edited and the preflight downgrades a
+missing credential from "will not write" to "cannot verify" — a check green enough to start a
+daemon that reports nothing.

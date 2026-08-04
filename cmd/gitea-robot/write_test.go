@@ -62,6 +62,38 @@ func TestBridgeWriteVerbsExist(t *testing.T) {
 	}
 }
 
+// bridgePreflightVerb is crates/bridge/src/robot.rs's PREFLIGHT_VERB.
+//
+// The bridge spawns this binary once at startup with that argument to check its write leg
+// before any terminal event needs it. The probe works precisely because the verb does not
+// exist: main() validates the credential first and only then refuses to dispatch, so the two
+// answers are distinguishable and neither makes a request.
+const bridgePreflightVerb = "gitea-automations-preflight"
+
+// TestBridgePreflightProbeStaysDistinguishable guards the three facts that probe rests on.
+//
+// Make this a real command and the preflight starts making a request and reading its result as
+// a verdict about the credential. Reword either message and the preflight stops recognising the
+// answer it gets: a missing credential then reports as "cannot verify" instead of "will not
+// write", which is a green-enough `check` in front of a daemon whose every comment, label and
+// pull request fails at action 0 - the escalation comment included.
+func TestBridgePreflightProbeStaysDistinguishable(t *testing.T) {
+	if _, ok := commands[bridgePreflightVerb]; ok {
+		t.Errorf("%q is a dispatchable command; the bridge's write-leg preflight relies on it not being one", bridgePreflightVerb)
+	}
+	// The exact substrings crates/bridge/src/robot.rs (classify_preflight) matches on.
+	if !strings.Contains(missingCredentialError, "environment variable required") {
+		t.Errorf("missingCredentialError = %q, want it to contain \"environment variable required\"", missingCredentialError)
+	}
+	if !strings.Contains(unknownCommandError, "Unknown command") {
+		t.Errorf("unknownCommandError = %q, want it to contain \"Unknown command\"", unknownCommandError)
+	}
+	// …and they must stay two different answers, or the probe cannot tell them apart at all.
+	if strings.Contains(missingCredentialError, "Unknown command") {
+		t.Errorf("the two refusals must not overlap: %q", missingCredentialError)
+	}
+}
+
 // documentedCommands extracts the verbs listed under "Commands:" in printUsage().
 //
 // A substring search over the whole usage text is not enough in either direction: "comment"

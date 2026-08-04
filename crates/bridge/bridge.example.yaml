@@ -57,7 +57,39 @@ kanban:
 robot:
   # Writes go through gitea-robot so they carry the NIP-98 agent identity from F1 —
   # attributable to the agent key, and revocable with it.
+  #
+  # THE DAEMON'S PROCESS NEEDS A CREDENTIAL IN ITS ENVIRONMENT. gitea-robot exits 1 with
+  # "GITEA_TOKEN or GITEA_NOSTR_KEY environment variable required" before it dispatches at all
+  # (cmd/gitea-robot/main.go:165-168), so with neither set, EVERY terminal event fails at its
+  # first action - including the escalation comment that exists to report such failures on the
+  # issue, because it goes through this same binary. Nothing appears on Gitea and the board looks
+  # exactly like an issue nobody picked up. Set one in the unit file:
+  #
+  #   [Service]
+  #   Environment=GITEA_NOSTR_KEY=nsec1...   # preferred: the F1 agent identity
+  #   # or Environment=GITEA_TOKEN=xxxx      # a bearer token, if no agent key is registered
+  #
+  # The bridge passes exactly the one it found, and REMOVES the other from the child's
+  # environment, so the write leg's identity is the one `check` validated rather than whatever
+  # the box happens to export. `check` probes this and says which variable is carrying it.
+  #
+  # GITEA_URL is NOT taken from the environment: the bridge sets it on every call from the
+  # config (see base_url below).
   binary: gitea-robot
+  # Where the writes go. Defaults to gitea.base_url, which is what a single-instance deployment
+  # wants — set this only when the write-side hostname genuinely differs from the read-side one.
+  #
+  # Leaving it to the environment was the failure this closes: unset, gitea-robot uses its own
+  # documented default of http://localhost:3000 (cmd/gitea-robot/main.go:152-154), so on a box
+  # with a dev Gitea listening there the daemon reads issues from the configured instance and
+  # comments, labels and opens pull requests on the local one — with the agent's identity, and
+  # with no diagnostic anywhere, because the request succeeded. `check` prints the URL it will
+  # write to and warns when it is not the one it reads from.
+  #
+  # With GITEA_NOSTR_KEY, this must equal the instance's ROOT_URL exactly — scheme, host, port
+  # and sub-path. The NIP-98 signature commits to the absolute URL, so a mismatch is rejected as
+  # a bare 401 whose real reason is only in the server's debug log.
+  # base_url: https://git.example.org
   # Must not contain a slash. The pull-request existence probe is
   # GET /repos/{o}/{r}/pulls/{base}/{head}, where only {head} is a catch-all segment
   # (routers/api/v1/api.go:1642), so `release/1.0` would be read as base=release - the probe

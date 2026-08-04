@@ -26,6 +26,12 @@ use bridge::outbound::{PlannedAction, TerminalKind, latest_terminal_kind, plan};
 use bridge::robot::Robot;
 use bridge::rules::Action;
 
+/// The instance the `Robot` handles below claim to write to.
+///
+/// Only their argv is asserted — no request is made — so this exists to be named rather than
+/// reached, and it is a closed port so that a test which started making one would fail.
+const WRITE_URL: &str = "http://127.0.0.1:1";
+
 /// A throwaway board, deleted on drop.
 struct ScratchBoard {
     slug: String,
@@ -164,6 +170,66 @@ async fn the_idempotency_key_dedups_against_real_kanban() {
         "blocked",
         "and `create` must not promote it: a 🐝 arriving while a worker waits on an answer \
          would otherwise dispatch the agent back onto the unanswered question"
+    );
+}
+
+/// The **other** branch of the dedup contract, and the R9 P2: an *archived* task does not
+/// dedup.
+///
+/// `CreateTask::idempotency_key` documents the contract as "if a **non-archived** task with
+/// this key exists, its id is returned". The blocked half of that sentence is pinned above; the
+/// archived half was asserted only by the doc comment, and the bridge's behaviour after an
+/// operator archives a task follows entirely from which way it goes.
+///
+/// **Observed on hermes v0.19.0, 2026-08-04**: it creates a **new** task. That is the desired
+/// behaviour and the reason this is a test rather than a fix. The bridge's key is a pure
+/// function of `owner/repo#index` (`inbound::idempotency_key`) and never rotates, so a key that
+/// dedupped against archived tasks would make an issue permanently un-restartable: the gate
+/// would keep resolving to a task no worker can claim, and no `create` could ever replace it.
+/// Archiving means "retire this one"; a still-ready, still-approved issue getting a fresh task
+/// is what that has to mean.
+///
+/// What it costs is stated plainly rather than papered over: the new task's comment list is
+/// empty, so the approvals standing on the issue are unconsumed against *it* and the gate
+/// spends them again (`releasing_a_task_consumes_every_approval_standing_at_the_time` is the
+/// per-task property, and per-task is the whole of it). One archive is one re-dispatch of an
+/// issue a human already approved and nobody has since un-approved — which is what an operator
+/// archiving a bridge task is asking for. Un-approving is removing the 🐝.
+#[tokio::test]
+#[ignore = "runs a real hermes kanban on a throwaway board"]
+async fn an_archived_task_does_not_dedup_so_an_issue_can_be_restarted() {
+    let Some(board) = ScratchBoard::new("archived") else {
+        return;
+    };
+    let kanban = board.kanban();
+    let req = create_request(64, "live archived dedup probe");
+
+    let first = kanban.create(&req).await.expect("first create");
+    assert_eq!(
+        kanban.create(&req).await.expect("second create"),
+        first,
+        "the non-archived branch, restated here so a failure names which half moved"
+    );
+
+    board.run(&["archive", &first]);
+    let second = kanban
+        .create(&req)
+        .await
+        .expect("a duplicate-key create against an archived task must not error");
+    assert_ne!(
+        second, first,
+        "an archived task must not keep its key: the bridge's key never rotates, so an issue \
+         whose task was archived could otherwise never be restarted"
+    );
+
+    // The new task is a real, claimable one — not a resurrection of the archived id.
+    let detail = kanban.show(&second).await.expect("show");
+    assert_eq!(detail.task.status, "ready");
+    assert!(
+        detail.comments.is_empty(),
+        "the restart starts with no consumed-approval markers, which is why the gate spends the \
+         issue's standing 🐝 again: {:?}",
+        detail.comments
     );
 }
 
@@ -384,7 +450,7 @@ async fn create_then_complete_plans_a_pull_request_referencing_the_issue() {
         "kanban recorded the terminal event"
     );
 
-    let robot = Robot::new(&bridge::config::RobotConfig::default());
+    let robot = Robot::new(&bridge::config::RobotConfig::default(), WRITE_URL);
     let plan = plan(&detail, TerminalKind::Completed, robot.blocked_label(), true).expect("plans");
     let PlannedAction::OpenPull(pr) = &plan.actions[0] else {
         panic!("first action must open a PR")
@@ -423,7 +489,7 @@ async fn create_then_block_plans_the_blocked_label_and_a_reason_comment() {
     let detail = kanban.show(&id).await.expect("show");
     assert_eq!(detail.task.status, "blocked");
 
-    let robot = Robot::new(&bridge::config::RobotConfig::default());
+    let robot = Robot::new(&bridge::config::RobotConfig::default(), WRITE_URL);
     let plan = plan(&detail, TerminalKind::Blocked, robot.blocked_label(), true).expect("plans");
     assert_eq!(
         plan.actions[0],

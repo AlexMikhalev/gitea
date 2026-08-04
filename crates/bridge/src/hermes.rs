@@ -249,8 +249,20 @@ pub struct CreateTask {
     pub title: String,
     /// Opening post, carrying the `gitea-ref:` trailer.
     pub body: String,
-    /// Dedup key. If a non-archived task with this key exists, its id is returned instead
+    /// Dedup key. If a **non-archived** task with this key exists, its id is returned instead
     /// of a duplicate being created.
+    ///
+    /// Both branches of that qualifier are probed live rather than taken from this comment —
+    /// `tests/live_kanban.rs`, on hermes v0.19.0, 2026-08-04. A `blocked` task dedups (the same
+    /// id comes back, unpromoted); an **archived** one does not (a new task is created).
+    ///
+    /// The archived branch is the intended behaviour and not a hole to plug: archiving is how an
+    /// operator retires a task, and the bridge's key is a pure function of `owner/repo#index`
+    /// (see [`crate::inbound::idempotency_key`]), so a key that dedupped against archived tasks
+    /// would make an issue *un-restartable* forever — the gate would keep resolving to a task
+    /// nobody can claim and no `create` could replace. What archiving costs instead is one fresh
+    /// dispatch of an issue that is still ready and still approved, which is what "start this
+    /// one over" means.
     pub idempotency_key: String,
 }
 
@@ -778,18 +790,38 @@ pub(crate) fn decode_list(raw: &str) -> Result<Vec<Task>, ListDecodeError> {
     Ok(tasks)
 }
 
+/// One environment variable a child is spawned *with* (`Some`) or explicitly *without*
+/// (`None`).
+///
+/// The removal half is not a formality. A child inherits this process's environment, so a
+/// variable the daemon did not resolve is still whatever the unit file, the shell or a
+/// developer's dotfiles happened to export — and for a credential that means the write leg's
+/// identity is decided by ambient state nothing here validated. Naming the variable either way
+/// makes the child's view of it exactly the daemon's: see [`crate::robot::Robot`].
+pub(crate) type EnvVar<'a> = (&'a str, Option<&'a str>);
+
 /// Runs `binary` with `args` and returns stdout.
 ///
 /// `args` is passed as an argv vector — no shell is involved, so no argument can be
 /// interpreted as shell syntax. The call is bounded by [`RUN_TIMEOUT`].
 pub(crate) async fn run_argv(binary: &str, args: &[String]) -> Result<String, KanbanError> {
-    run_argv_within(binary, args, RUN_TIMEOUT).await
+    run_argv_within(binary, args, &[], RUN_TIMEOUT).await
+}
+
+/// [`run_argv`] with an environment overlay applied to the child.
+pub(crate) async fn run_argv_env(
+    binary: &str,
+    args: &[String],
+    env: &[EnvVar<'_>],
+) -> Result<String, KanbanError> {
+    run_argv_within(binary, args, env, RUN_TIMEOUT).await
 }
 
 /// [`run_argv`] with an explicit deadline, so the timeout itself is testable.
 pub(crate) async fn run_argv_within(
     binary: &str,
     args: &[String],
+    env: &[EnvVar<'_>],
     limit: std::time::Duration,
 ) -> Result<String, KanbanError> {
     let spawn_err = |source| KanbanError::Spawn {
@@ -799,7 +831,14 @@ pub(crate) async fn run_argv_within(
     // Spawned rather than `.output()`ed so the deadline has something to kill: dropping the
     // child at the timeout is what stops a wedged request from becoming an orphan process
     // holding the board's lock.
-    let child = Command::new(binary)
+    let mut command = Command::new(binary);
+    for (name, value) in env {
+        match value {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        };
+    }
+    let child = command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1162,6 +1201,7 @@ mod tests {
         let err = run_argv_within(
             "/bin/sh",
             &["-c".into(), "sleep 30".into()],
+            &[],
             std::time::Duration::from_millis(150),
         )
         .await
@@ -1172,11 +1212,39 @@ mod tests {
         let out = run_argv_within(
             "/bin/sh",
             &["-c".into(), "printf ok".into()],
+            &[],
             std::time::Duration::from_secs(30),
         )
         .await
         .expect("a prompt command still succeeds");
         assert_eq!(out, "ok");
+    }
+
+    /// The overlay has to do both halves, and the *removal* is the load-bearing one.
+    ///
+    /// A child inherits this process's environment, so setting `GITEA_URL` is what stops
+    /// `gitea-robot` falling back to its own `http://localhost:3000` default — and removing a
+    /// credential variable the daemon did not resolve is what stops the write leg picking up an
+    /// identity from ambient state that no preflight ever looked at. See
+    /// `crate::robot::Robot::env`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_environment_overlay_both_sets_and_removes() {
+        // `HOME` rather than `PATH`: a POSIX shell *recreates* an unset PATH from a built-in
+        // default, so removing it would be invisible from inside the child.
+        assert!(
+            std::env::var_os("HOME").is_some(),
+            "the removal half is only meaningful against a variable this process has"
+        );
+        let script = "printf '%s|%s' \"${GITEA_URL-<unset>}\" \"${HOME-<unset>}\"".to_string();
+        let out = run_argv_env(
+            "/bin/sh",
+            &["-c".into(), script],
+            &[("GITEA_URL", Some("https://git.example.org")), ("HOME", None)],
+        )
+        .await
+        .expect("runs");
+        assert_eq!(out, "https://git.example.org|<unset>");
     }
 
     /// A watcher that dies on startup must say why.

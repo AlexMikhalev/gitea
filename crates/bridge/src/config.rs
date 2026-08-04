@@ -143,6 +143,24 @@ pub struct RobotConfig {
     /// `gitea-robot` executable, resolved on `PATH` when not absolute.
     #[serde(default = "default_robot_binary")]
     pub binary: String,
+    /// Instance the writes go to, passed to `gitea-robot` as `GITEA_URL`.
+    ///
+    /// Defaults to [`GiteaConfig::base_url`] — see [`Config::robot_base_url`] — because reads
+    /// and writes addressing different instances is a mistake, not a configuration. It is
+    /// overridable only for the deployment where it is deliberate (a write-side hostname that
+    /// differs from the read-side one), and `check` says so out loud when the two differ.
+    ///
+    /// The bridge passes it explicitly on every call rather than letting it be inherited.
+    /// Unset, `gitea-robot` uses its own `http://localhost:3000` default
+    /// (`cmd/gitea-robot/main.go:152-154`): on a box with a dev Gitea listening there, the
+    /// daemon reads from the configured instance and writes — with the agent's NIP-98 identity,
+    /// and with no diagnostic anywhere, because the request succeeded — to the local one.
+    ///
+    /// Under `GITEA_NOSTR_KEY` this must equal the server's `ROOT_URL` exactly, scheme, host,
+    /// port and sub-path: the NIP-98 signature commits to the absolute URL, and a mismatch is
+    /// a deliberately opaque 401.
+    #[serde(default)]
+    pub base_url: Option<String>,
     /// Base branch for opened pull requests.
     #[serde(default = "default_base_branch")]
     pub base_branch: String,
@@ -333,6 +351,25 @@ impl Config {
                 )));
             }
         }
+        // The write leg's target, when it is spelled at all. An unusable one here is not a
+        // failed write but a *successful* one against something else: `gitea-robot` takes this
+        // as GITEA_URL and joins paths onto it, so a bare host or a typo'd scheme is a request
+        // that goes somewhere nobody is watching — or, resolving to nothing, one that fails
+        // every terminal event with a transport error 300 seconds apart.
+        if let Some(url) = &self.robot.base_url {
+            if url.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "robot.base_url is empty: leave the key out to write to gitea.base_url, which \
+                     is what a single-instance deployment wants"
+                        .into(),
+                ));
+            }
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err(ConfigError::Invalid(format!(
+                    "robot.base_url must be an http(s) URL, got {url:?}"
+                )));
+            }
+        }
         // A slashed base branch cannot be probed for an existing pull request: the route is
         // GET /repos/{o}/{r}/pulls/{base}/{head} and only {head} is a catch-all segment
         // (`routers/api/v1/api.go:1642`). `gitea-robot create-pull` refuses one, so catching
@@ -429,6 +466,30 @@ impl Config {
             )));
         }
         Ok(())
+    }
+
+    /// The instance the write leg targets: [`RobotConfig::base_url`], or the read one.
+    ///
+    /// One place, because the failure this defends against is the two legs disagreeing without
+    /// anybody saying so. Reads come from `gitea.base_url`; writes are a `gitea-robot`
+    /// subprocess whose `GITEA_URL` decides its own target, and nothing but this ties them
+    /// together.
+    pub fn robot_base_url(&self) -> &str {
+        self.robot
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| self.gitea.base_url.trim())
+    }
+
+    /// Whether the write leg targets an instance other than the one being read.
+    ///
+    /// Legal — an operator may have a distinct write-side hostname — but never silent: it is
+    /// also exactly what a copy-paste error looks like, and its symptom is a *successful* write
+    /// on the wrong instance.
+    pub fn reads_and_writes_split(&self) -> bool {
+        self.robot_base_url() != self.gitea.base_url.trim()
     }
 
     /// Ready-poll interval as a [`Duration`].
@@ -528,6 +589,7 @@ impl Default for RobotConfig {
     fn default() -> Self {
         Self {
             binary: default_robot_binary(),
+            base_url: None,
             base_branch: default_base_branch(),
             blocked_label: default_blocked_label(),
             draft_pulls: false,
@@ -684,6 +746,40 @@ mod tests {
         let cfg: Config =
             serde_norway::from_str(&format!("{}robot:\n  wip_prefix: \"\"\n", minimal())).expect("parses");
         cfg.validate().expect("valid");
+    }
+
+    /// The R9 P1's config half: the write leg's target is derived, not ambient.
+    ///
+    /// Left to the environment, an unset `GITEA_URL` puts every write on `gitea-robot`'s
+    /// `http://localhost:3000` default while the reads keep coming from the configured
+    /// instance — a split nothing reports, because the write succeeds.
+    #[test]
+    fn the_write_leg_targets_the_read_instance_unless_told_otherwise() {
+        let cfg: Config = serde_norway::from_str(minimal()).expect("parses");
+        cfg.validate().expect("valid");
+        assert_eq!(cfg.robot_base_url(), "https://git.example.org");
+        assert!(!cfg.reads_and_writes_split());
+
+        // …and an explicit one is honoured, and reported as the split it is.
+        let cfg: Config = serde_norway::from_str(&format!(
+            "{}robot:\n  base_url: https://writes.example.org\n",
+            minimal()
+        ))
+        .expect("parses");
+        cfg.validate().expect("valid");
+        assert_eq!(cfg.robot_base_url(), "https://writes.example.org");
+        assert!(cfg.reads_and_writes_split());
+
+        // A value gitea-robot would join paths onto and send somewhere unintended is refused
+        // here rather than discovered as a write that worked against the wrong thing.
+        for (yaml, needle) in [
+            ("robot:\n  base_url: git.example.org\n", "http(s)"),
+            ("robot:\n  base_url: \"\"\n", "empty"),
+        ] {
+            let cfg: Config = serde_norway::from_str(&format!("{}{yaml}", minimal())).expect("parses");
+            let err = cfg.validate().expect_err("must reject");
+            assert!(err.to_string().contains(needle), "{err}");
+        }
     }
 
     /// The gate is a file, so a config with nowhere to put it is a config with no gate.

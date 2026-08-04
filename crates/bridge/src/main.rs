@@ -33,7 +33,7 @@ use bridge::outbound::{
     OutboundPlan, PlanError, PlannedAction, TerminalKind, WatchLine, classify_watch_line, escalation_actions,
     latest_terminal_kind, plan,
 };
-use bridge::robot::{LabelCheck, Robot, check_blocked_label};
+use bridge::robot::{LabelCheck, Robot, WriteCheck, check_blocked_label, check_write_leg};
 use bridge::rules::{Action, RuleSet};
 use bridge::state::{BridgeState, ESCALATE_AFTER, MARKER_ATTEMPTS, PendingApprovals, UnlistedFailure};
 
@@ -115,7 +115,8 @@ async fn main() -> Result<()> {
 
     let gitea = GiteaClient::new(&cfg.gitea).context("building the gitea client")?;
     let kanban = Kanban::new(&cfg.kanban);
-    let robot = Robot::new(&cfg.robot);
+    // The write leg's target is config, not ambient environment: see `Config::robot_base_url`.
+    let robot = Robot::new(&cfg.robot, cfg.robot_base_url());
     // Loaded before anything runs, and fatal if it will not load: this file *is* the approval
     // gate, so a corrupt one that quietly became an empty gate would forget which issues are
     // waiting on a human and re-create them all on the next 🐝 sweep.
@@ -216,6 +217,12 @@ async fn main() -> Result<()> {
                     println!("warning: cannot verify robot.blocked_label — {reason}")
                 }
             }
+            // The other half of that same call, and the half nothing used to check. A write is
+            // a `gitea-robot` subprocess whose credential and whose *target instance* are
+            // environment variables the daemon never named; both failures are invisible from
+            // here — one fails every write including the escalation that would report it, the
+            // other succeeds against the wrong Gitea.
+            report_write_leg(&cfg, check_write_leg(&robot).await);
             Ok(())
         }
         Command::PollOnce => {
@@ -243,6 +250,45 @@ async fn main() -> Result<()> {
         }
         Command::Run => run(Arc::new(cfg), gitea, kanban, robot, pending, gate).await,
     }
+}
+
+/// Prints the write-leg verdict for `check`, with the two things no probe can answer.
+///
+/// The probe can say the binary starts and got past its own credential check. It cannot say
+/// that the instance being written to is the intended one — writing to the wrong Gitea
+/// *succeeds* — nor that a NIP-98 signature will be accepted there, because that depends on the
+/// server's `ROOT_URL`, which nothing on this side can read. Both are stated rather than
+/// implied.
+fn report_write_leg(cfg: &Config, check: WriteCheck) {
+    match check {
+        WriteCheck::Ready { reason } => println!("write leg OK: {reason}"),
+        WriteCheck::Broken { reason } => {
+            println!("warning: the write leg cannot write — {reason}")
+        }
+        WriteCheck::Unknown { reason } => println!("warning: cannot verify the write leg — {reason}"),
+    }
+    if cfg.reads_and_writes_split() {
+        println!(
+            "warning: robot.base_url {:?} is not gitea.base_url {:?} — this daemon would read from \
+             one instance and comment, label and open pull requests on another. That is legal, and \
+             it is also what a copy-paste error looks like: the write succeeds, so nothing else \
+             will ever report it. Drop robot.base_url to write where you read",
+            cfg.robot_base_url(),
+            cfg.gitea.base_url
+        );
+    }
+    println!(
+        "note: with GITEA_NOSTR_KEY set, GITEA_URL must equal the instance's ROOT_URL exactly — \
+         scheme, host, port and sub-path. The NIP-98 signature commits to the absolute URL, so a \
+         mismatch is rejected as a bare 401 whose real reason is only in the server's debug log. \
+         The bridge sends {:?} (from {}), never whatever the daemon's environment holds",
+        cfg.robot_base_url(),
+        if cfg.robot.base_url.is_some() {
+            "robot.base_url"
+        } else {
+            "gitea.base_url"
+        }
+    );
 }
 
 async fn run(
@@ -281,6 +327,27 @@ async fn run(
         LabelCheck::Unknown { reason } => {
             tracing::warn!(%reason, "cannot verify robot.blocked_label")
         }
+    }
+
+    // And the leg that applies both of them. `error!` rather than `warn!` on a broken one: a
+    // write leg that cannot start makes every terminal event fail at action 0, and the
+    // escalation that exists to say so on the issue goes through the same binary.
+    match check_write_leg(&robot).await {
+        WriteCheck::Ready { reason } => tracing::info!(%reason, "write-leg preflight passed"),
+        WriteCheck::Broken { reason } => tracing::error!(
+            %reason,
+            "write-leg preflight failed: no comment, label or pull request will reach gitea"
+        ),
+        WriteCheck::Unknown { reason } => tracing::warn!(%reason, "cannot verify the write leg"),
+    }
+    if cfg.reads_and_writes_split() {
+        tracing::warn!(
+            reads = %cfg.gitea.base_url,
+            writes = %cfg.robot_base_url(),
+            "robot.base_url differs from gitea.base_url: this daemon reads from one instance and \
+             writes to another. Legal, but it is also what a copy-paste error looks like, and its \
+             symptom is a write that succeeds on the wrong board"
+        );
     }
 
     // The third startup disclosure, and the one with no server-side probe behind it: whether a
@@ -1483,9 +1550,13 @@ async fn apply_plan(
     // than a re-plan because the marker is exactly what `plan()` would refuse on, and it is
     // the one line of the comment that must not be posted twice.
     //
-    // The status of that re-read is kept, because it is what decides the recovery
-    // `record_marker` names below and the one in hand may predate a `kanban show` subprocess.
-    let mut status = detail.task.status.clone();
+    // The *whole* re-read is kept, not merely its status, and that is the R9 P2. Everything
+    // downstream that consults the task's comments has to consult this one: the status decides
+    // the recovery `record_marker` names, and `escalate_plan_failure`'s only cross-restart guard
+    // is an escalation marker it looks for on the detail it is handed. Handed the pre-claim
+    // read, that guard cannot see an escalation the other leg posted inside this very window —
+    // which is the same stale-detail gap this re-read exists to close, one comment further on.
+    let mut current = std::borrow::Cow::Borrowed(detail);
     if let Some(marker) = plan_marker(plan) {
         match kanban.show(task_id).await {
             Ok(fresh) if fresh.has_marker(marker) => {
@@ -1500,7 +1571,7 @@ async fn apply_plan(
             }
             Ok(fresh) => {
                 note_status(state, &fresh);
-                status = fresh.task.status;
+                current = std::borrow::Cow::Owned(fresh);
             }
             Err(err) => {
                 // Deliberately a skip rather than a best-effort apply. The plan in hand may
@@ -1523,7 +1594,7 @@ async fn apply_plan(
         Ok(marker) => {
             state.clear_plan_failures(task_id);
             if let Some(marker) = marker {
-                record_marker(kanban, state, task_id, &marker, &status).await;
+                record_marker(kanban, state, task_id, &marker, &current.task.status).await;
             }
         }
         Err((action, err)) => {
@@ -1545,7 +1616,7 @@ async fn apply_plan(
                     failures,
                     error: &err,
                 };
-                escalate_plan_failure(kanban, robot, state, plan, detail, failure).await;
+                escalate_plan_failure(kanban, robot, state, plan, &current, failure).await;
             }
         }
     }
@@ -1660,6 +1731,11 @@ struct PlanFailure<'a> {
 /// The escalation is a comment and nothing else. That is what makes it reachable for the case
 /// it most needs to cover: when the *label* is what cannot be applied, an escalation leading
 /// with a label would be retrying the one call that is broken.
+///
+/// `detail` must be the read [`apply_plan`] took **under the claim**, because the marker on it
+/// is this comment's only guard across a restart: the pre-claim read predates the window in
+/// which the other leg can have escalated, so passing it would post a second identical
+/// escalation on somebody's issue.
 async fn escalate_plan_failure(
     kanban: &Kanban,
     robot: &Robot,
@@ -2137,6 +2213,7 @@ esac
 set -eu
 root="$(dirname "$0")"
 { printf '%s ' "$@" | tr '\n' ' '; printf '\n'; } >> "$root/robot.log"
+if [ -f "$root/robot-fails" ]; then printf 'stub: refused\n' >&2; exit 1; fi
 printf 'ok\n'
 "#;
 
@@ -2213,10 +2290,23 @@ printf 'ok\n'
         }
 
         fn robot(&self) -> Robot {
-            Robot::new(&RobotConfig {
-                binary: self.robot.to_string_lossy().into_owned(),
-                ..RobotConfig::default()
-            })
+            Robot::new(
+                &RobotConfig {
+                    binary: self.robot.to_string_lossy().into_owned(),
+                    ..RobotConfig::default()
+                },
+                "https://git.example.invalid",
+            )
+        }
+
+        /// Makes every `gitea-robot` verb fail, which is what an unapplied plan looks like.
+        fn robot_fails(&self) {
+            std::fs::write(self.dir.path().join("robot-fails"), "").expect("write sentinel");
+        }
+
+        /// Every argv `gitea-robot` was invoked with.
+        fn robot_calls(&self) -> Vec<String> {
+            self.lines("robot.log")
         }
 
         fn gate(&self) -> PendingApprovals {
@@ -2535,6 +2625,71 @@ printf 'ok\n'
         assert!(
             state.unlisted().contains(&"t_1".to_string()),
             "still blocked, so still only reachable by id"
+        );
+    }
+
+    /// **The R9 P2.** The escalation is guarded by a marker it looks for on the `TaskDetail`
+    /// it is handed — so it has to be handed the read taken *under the claim*, not the one the
+    /// plan was built from.
+    ///
+    /// The window is one leg's `show`→`apply_plan` gap, and it is the same gap the re-read
+    /// exists to close, one comment further on: the reconcile sweep holds the claim, fails on
+    /// the label, posts the escalation on issue #57 and writes `gitea-bridge: report-failed
+    /// label`, then drops the claim. The watch leg — whose `show` predates that marker — claims
+    /// the task, re-reads (the *report* marker is still absent, so it proceeds), fails the same
+    /// label, and reaches `ESCALATE_AFTER`. Checked against the stale detail, the escalation
+    /// marker is not there, and a second identical escalation lands on somebody's issue.
+    #[tokio::test]
+    async fn the_escalation_checks_its_marker_against_the_read_taken_under_the_claim() {
+        let server = MockServer::start().await;
+        let stub = Stub::new();
+        // Every write fails, which is what a plan that escalates looks like.
+        stub.robot_fails();
+        // What the re-read under the claim sees: the other leg's escalation, already posted.
+        // The *report* marker is deliberately absent — with it there nothing would be applied
+        // at all, and this path would never be reached.
+        stub.task(
+            "t_1",
+            &task_json(
+                "blocked",
+                &[("created", 1), ("claimed", 2), ("blocked", 3)],
+                &[&escalation_marker(Action::Label)],
+            ),
+        );
+
+        // The detail this leg planned from, read before the claim — and before that comment.
+        let stale = task_detail(&[("created", 1), ("claimed", 2), ("blocked", 3)], &[]);
+        let planned = plan(&stale, TerminalKind::Blocked, "status/blocked", true).expect("plans");
+        assert!(
+            !stale.has_marker(&escalation_marker(Action::Label)),
+            "the premise: the stale read cannot see the escalation"
+        );
+
+        let state = BridgeState::new();
+        for _ in 1..ESCALATE_AFTER {
+            state.record_plan_failure("t_1");
+        }
+
+        let cfg = config(&server, stub.dir.path().join("gate.json"));
+        apply_plan(
+            &cfg,
+            &stub.kanban(),
+            &stub.robot(),
+            &state,
+            "t_1",
+            &planned,
+            &stale,
+        )
+        .await;
+
+        let calls = stub.robot_calls();
+        assert!(
+            calls.iter().any(|c| c.starts_with("edit-issue")),
+            "the plan itself is still attempted — the retry is never abandoned: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.starts_with("comment")),
+            "a second identical escalation must not be posted on the user's issue: {calls:?}"
         );
     }
 
