@@ -4,6 +4,7 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -102,7 +103,7 @@ func TestRoomOpenCreatesIssue(t *testing.T) {
 func TestRoomOpenIdempotent(t *testing.T) {
 	existing := robotroom.IssueBody("feat/foo", "")
 	issueJSON, _ := json.Marshal([]map[string]any{
-		{"number": 5, "body": existing, "state": "open"},
+		{"number": 5, "title": robotroom.IssueTitle("feat/foo"), "body": existing, "state": "open"},
 	})
 	var posts int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -127,6 +128,96 @@ func TestRoomOpenIdempotent(t *testing.T) {
 	}
 }
 
+// TestRoomFindIssuePagesPastShortPages is the regression test for the paging
+// bug: an instance with MAX_RESPONSE_ITEMS below the requested limit returns a
+// short page for *every* page, so terminating on a short page stopped the
+// walk after the first one - reporting "no room" and duplicating the room.
+// Only an empty page ends the walk.
+func TestRoomFindIssuePagesPastShortPages(t *testing.T) {
+	// The server clamps to 2 items per page; the room sits on page 3.
+	pages := [][]map[string]any{
+		{{"number": 1, "title": "unrelated", "body": "nothing"}, {"number": 2, "title": "unrelated", "body": "nothing"}},
+		{{"number": 3, "title": "unrelated", "body": "nothing"}, {"number": 4, "title": "unrelated", "body": "nothing"}},
+		{{"number": 5, "title": robotroom.IssueTitle("feat/foo"), "body": robotroom.IssueBody("feat/foo", "")}},
+	}
+	var served int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page := r.URL.Query().Get("page")
+		served++
+		idx := 0
+		_, _ = fmt.Sscanf(page, "%d", &idx)
+		if idx < 1 || idx > len(pages) {
+			_, _ = w.Write([]byte(`[]`))
+			return
+		}
+		data, _ := json.Marshal(pages[idx-1])
+		_, _ = w.Write(data)
+	}))
+	defer server.Close()
+	withGiteaURL(t, server.URL)
+	withEnv(t, "tok", "")
+
+	index, found, err := roomFindIssue("o", "r", "feat/foo")
+	if err != nil {
+		t.Fatalf("roomFindIssue failed: %v", err)
+	}
+	if !found || index != 5 {
+		t.Errorf("roomFindIssue() = (%d, %v), want (5, true)", index, found)
+	}
+	if served != 3 {
+		t.Errorf("stopped after %d pages, want 3", served)
+	}
+}
+
+// TestRoomFindIssueRefusesEndlessPaging verifies a server that never returns
+// an empty page produces an error rather than a silent "no room found", which
+// would open a duplicate room.
+func TestRoomFindIssueRefusesEndlessPaging(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`[{"number": 1, "title": "unrelated", "body": "nothing"}]`))
+	}))
+	defer server.Close()
+	withGiteaURL(t, server.URL)
+	withEnv(t, "tok", "")
+
+	if _, _, err := roomFindIssue("o", "r", "feat/foo"); err == nil {
+		t.Error("expected an error after the page limit, got none")
+	}
+}
+
+// TestRoomMatchPredicateParity checks that the CLI matches rooms through the
+// shared predicate: an issue whose title a human edited is not the room, on
+// this side exactly as on the hook side.
+func TestRoomMatchPredicateParity(t *testing.T) {
+	renamed, _ := json.Marshal([]map[string]any{
+		{"number": 9, "title": "Room: feat/foo (WIP)", "body": robotroom.IssueBody("feat/foo", "")},
+	})
+	var posts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			posts++
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"number": 10}`))
+			return
+		}
+		if r.URL.Query().Get("page") == "1" {
+			_, _ = w.Write(renamed)
+			return
+		}
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer server.Close()
+	withGiteaURL(t, server.URL)
+	withEnv(t, "tok", "")
+
+	if _, found, err := roomFindIssue("o", "r", "feat/foo"); err != nil || found {
+		t.Errorf("renamed issue matched as a room: found=%v err=%v", found, err)
+	}
+	if posts != 0 {
+		t.Errorf("lookup posted %d times", posts)
+	}
+}
+
 // TestRoomStatusPostsComment verifies `room status` finds the room and posts
 // exactly one comment on it.
 func TestRoomStatusPostsComment(t *testing.T) {
@@ -135,7 +226,9 @@ func TestRoomStatusPostsComment(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/o/r/issues":
-			issueJSON, _ := json.Marshal([]map[string]any{{"number": 5, "body": existing, "state": "open"}})
+			issueJSON, _ := json.Marshal([]map[string]any{
+				{"number": 5, "title": robotroom.IssueTitle("feat/foo"), "body": existing, "state": "open"},
+			})
 			_, _ = w.Write(issueJSON)
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/comments"):
 			commentPath = r.URL.Path
@@ -198,7 +291,9 @@ func TestRoomClose(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/repos/o/r/issues":
-			issueJSON, _ := json.Marshal([]map[string]any{{"number": 5, "body": existing, "state": "open"}})
+			issueJSON, _ := json.Marshal([]map[string]any{
+				{"number": 5, "title": robotroom.IssueTitle("feat/foo"), "body": existing, "state": "open"},
+			})
 			_, _ = w.Write(issueJSON)
 		case r.Method == http.MethodPatch:
 			patchPath = r.URL.Path

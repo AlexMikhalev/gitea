@@ -21,9 +21,13 @@ var IssueGraphSettings = struct {
 	AuditLog         bool // Enable audit logging for robot API access (default: true)
 	StrictMode       bool // Enable strict mode - deny access on any error (default: false)
 
-	// RoomHookSecret is the HMAC-SHA256 secret for the branch-as-room inbound
-	// webhook route (POST /api/v1/robot/room/hook). When empty the route is
-	// disabled and answers 404; an unsigned request is never accepted.
+	// RoomHookSecret is the instance-wide master secret of the branch-as-room
+	// inbound webhook route (POST /api/v1/robot/room/hook). It is never used
+	// to verify a delivery directly: each repository's webhook secret is
+	// derived from it (see roomHookSecretForRepo in routers/api/v1/robot),
+	// so the secret a repo admin holds only works for their own repository.
+	// When empty the route is disabled and answers 404; an unsigned request is
+	// never accepted. Documented in docs/ROBOT_SECURITY.md.
 	RoomHookSecret string
 }{
 	Enabled:       true,

@@ -8,18 +8,20 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
 
+	"code.gitea.io/gitea/models/db"
 	issues_model "code.gitea.io/gitea/models/issues"
+	access_model "code.gitea.io/gitea/models/perm/access"
 	repo_model "code.gitea.io/gitea/models/repo"
 	user_model "code.gitea.io/gitea/models/user"
 	"code.gitea.io/gitea/modules/git"
 	"code.gitea.io/gitea/modules/gitrepo"
 	"code.gitea.io/gitea/modules/json"
 	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/optional"
 	"code.gitea.io/gitea/modules/robotroom"
 	"code.gitea.io/gitea/modules/setting"
 	api "code.gitea.io/gitea/modules/structs"
@@ -32,13 +34,39 @@ import (
 // featBranchPrefix scopes the whole feature: only feat/* branches get rooms.
 const featBranchPrefix = "feat/"
 
-// roomTitlePrefix is the deterministic title prefix of every room issue; it
-// doubles as a cheap pre-filter when scanning open issues for a room.
-const roomTitlePrefix = "Room: "
+// roomHookEndpoint is the audit-log identity of this route.
+const roomHookEndpoint = "/api/v1/robot/room/hook"
 
-// roomIssueTitle renders the deterministic title of a branch's room issue.
-func roomIssueTitle(branch string) string {
-	return roomTitlePrefix + branch
+// roomLookupLimit bounds every room lookup. A repository has at most one room
+// per branch, so a handful of rows is already far more than a correct
+// instance can produce; the limit exists so a webhook delivery can never turn
+// into a full scan of the repository's open issues.
+const roomLookupLimit = 20
+
+// featBranch reports whether branch is a non-empty feat/* branch name. All
+// three entry points (push refs, delete refs, merged PR head refs) agree on
+// this definition, so a bare "feat/" is a branch to none of them.
+func featBranch(branch string) bool {
+	return strings.HasPrefix(branch, featBranchPrefix) && len(branch) > len(featBranchPrefix)
+}
+
+// roomHookSecretForRepo derives the webhook secret of one repository from the
+// instance-wide ROOM_HOOK_SECRET.
+//
+// This is what keeps the endpoint's blast radius inside a single repository.
+// A delivery is verified with the secret of the repository it names, so the
+// repo admin who is handed their own repository's secret - which they must be,
+// to configure the webhook - still cannot produce a valid signature for any
+// other repository: that would take the instance-wide master secret, which
+// never leaves app.ini.
+//
+// Owner and repo are lower-cased because Gitea repository lookup is
+// case-insensitive; without it, "Org/Repo" and "org/repo" would resolve to the
+// same repository through two different secrets.
+func roomHookSecretForRepo(master, owner, repo string) string {
+	mac := hmac.New(sha256.New, []byte(master))
+	fmt.Fprintf(mac, "gitea-robot/room:v1:%s/%s", strings.ToLower(owner), strings.ToLower(repo))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 // verifyRoomHookSignature checks the X-Gitea-Signature header against the
@@ -70,7 +98,7 @@ func verifyRoomHookSignature(secret string, body []byte, giteaSig, hubSig string
 // branch. An empty branch name (e.g. "refs/heads/feat/") is rejected.
 func featBranchRef(ref string) (string, bool) {
 	branch, ok := strings.CutPrefix(ref, git.BranchPrefix)
-	if !ok || !strings.HasPrefix(branch, featBranchPrefix) || len(branch) == len(featBranchPrefix) {
+	if !ok || !featBranch(branch) {
 		return "", false
 	}
 	return branch, true
@@ -90,47 +118,111 @@ func isZeroSHA(s string) bool {
 	return true
 }
 
-// roomPayloadRepoHint extracts owner/repo from a webhook body for audit
-// logging only. The body may be unsigned or badly signed, so the values are
-// untrusted hints, never inputs to any decision.
-func roomPayloadRepoHint(body []byte) (owner, repo string) {
+// roomRepoClaim is the repository a delivery claims to be about. Every
+// webhook payload this hook handles carries it under the same "repository"
+// key, so it can be read once, before the payload's concrete type is known.
+//
+// The claim selects the signing key (roomHookSecretForRepo) and, once the
+// signature verifies against that key, it is also what the repository is
+// resolved from - one value for both, so the repository whose secret signed
+// the delivery is necessarily the repository that gets written to.
+type roomRepoClaim struct {
+	Owner string
+	Name  string
+}
+
+// roomPayloadRepoClaim extracts the claimed repository from a webhook body.
+// It runs before signature verification, on a body that may be unsigned: the
+// claim is not trusted, it only decides which secret the signature has to
+// match.
+func roomPayloadRepoClaim(body []byte) roomRepoClaim {
 	var p struct {
 		Repository *api.Repository `json:"repository"`
 	}
 	if err := json.Unmarshal(body, &p); err != nil || p.Repository == nil || p.Repository.Owner == nil {
-		return "", ""
+		return roomRepoClaim{}
 	}
-	return p.Repository.Owner.UserName, p.Repository.Name
+	return roomRepoClaim{Owner: p.Repository.Owner.UserName, Name: p.Repository.Name}
+}
+
+// roomIssuesByTitle returns at most roomLookupLimit issues of repoID with the
+// exact room title for branch, in the requested open/closed state.
+//
+// The title match is pushed into the query on purpose: it is what makes a
+// delivery cost one bounded, indexable lookup instead of loading and
+// hydrating every open issue in the repository.
+func roomIssuesByTitle(ctx *context.APIContext, repoID int64, branch string, isClosed bool) ([]*issues_model.Issue, error) {
+	order := "`issue`.id ASC"
+	if isClosed {
+		// Among closed rooms the newest is the one a re-push should revive.
+		order = "`issue`.id DESC"
+	}
+	issues := make([]*issues_model.Issue, 0, 4)
+	if err := db.GetEngine(ctx).
+		Where("`issue`.repo_id = ?", repoID).
+		And("`issue`.is_pull = ?", false).
+		And("`issue`.is_closed = ?", isClosed).
+		And("`issue`.name = ?", robotroom.IssueTitle(branch)).
+		OrderBy(order).
+		Limit(roomLookupLimit).
+		Find(&issues); err != nil {
+		return nil, err
+	}
+	return issues, nil
+}
+
+// findRoomIssueInState returns the room issue for branch in the given
+// open/closed state, fully loaded and ready to be mutated.
+func findRoomIssueInState(ctx *context.APIContext, repoID int64, branch string, isClosed bool) (*issues_model.Issue, bool, error) {
+	issues, err := roomIssuesByTitle(ctx, repoID, branch, isClosed)
+	if err != nil {
+		return nil, false, err
+	}
+	for _, issue := range issues {
+		if !robotroom.IsRoomFor(issue.Title, issue.Content, branch) {
+			continue
+		}
+		// Only the one matched issue is hydrated - the mutation services and
+		// their notifications need the attributes, the lookup does not.
+		if err := issue.LoadAttributes(ctx); err != nil {
+			return nil, false, err
+		}
+		return issue, true, nil
+	}
+	return nil, false, nil
 }
 
 // findRoomIssue returns the open room issue for branch in repoID. Idempotency
 // of room-open rests entirely on this lookup.
 func findRoomIssue(ctx *context.APIContext, repoID int64, branch string) (*issues_model.Issue, bool, error) {
-	issues, err := issues_model.Issues(ctx, &issues_model.IssuesOptions{
-		RepoIDs:  []int64{repoID},
-		IsClosed: optional.Some(false),
-		IsPull:   optional.Some(false),
-	})
-	if err != nil {
-		return nil, false, err
-	}
-	for _, issue := range issues {
-		// Cheap pre-filter on the deterministic title before parsing the
-		// body, so a delivery does not scan every open issue's content.
-		// Trade-off: a room a human renamed no longer matches - renaming a
-		// room detaches it from the automation.
-		if issue.Title != roomIssueTitle(branch) {
-			continue
-		}
-		if m, ok := robotroom.ParseMarker(issue.Content); ok && m.Branch == branch {
-			return issue, true, nil
-		}
-	}
-	return nil, false, nil
+	return findRoomIssueInState(ctx, repoID, branch, false)
 }
 
-// openRoom creates the room issue for branch unless one already exists. It
-// reports whether a new issue was created.
+// roomOpenResult reports what an openRoom call did to the branch's room.
+type roomOpenResult struct {
+	Created  bool
+	Reopened bool
+}
+
+// refreshRoomHead rewrites the marker head of an existing room, so the
+// git-free status fallback (findRoomBranchByHead) tracks the branch's current
+// tip instead of only ever matching the creation-time head.
+func refreshRoomHead(ctx *context.APIContext, issue *issues_model.Issue, doer *user_model.User, head string) error {
+	content, changed := robotroom.WithMarkerHead(issue.Content, head)
+	if !changed {
+		return nil
+	}
+	return issue_service.ChangeContent(ctx, issue, doer, content, issue.ContentVersion)
+}
+
+// openRoom makes the room for branch current: it refreshes an open room,
+// reopens a closed one, and creates a new issue only when the branch has never
+// had a room. It reports which of the three happened.
+//
+// Reopening rather than creating is what keeps the acceptance criterion
+// ("push to feat/foo creates exactly one room issue") true across a branch's
+// whole life: a branch that is merged or deleted and later pushed again gets
+// its room back instead of a second issue with an identical title.
 //
 // Idempotency is search-then-create with no unique constraint behind it, so
 // two deliveries for the same new branch processed concurrently could both
@@ -138,35 +230,40 @@ func findRoomIssue(ctx *context.APIContext, repoID int64, branch string) (*issue
 // typically serialized per hook, which keeps the window theoretical in
 // practice; tightening this would need a DB-level constraint this automation
 // deliberately avoids (no schema change).
-func openRoom(ctx *context.APIContext, repository *repo_model.Repository, doer *user_model.User, branch, head string) (bool, error) {
+func openRoom(ctx *context.APIContext, repository *repo_model.Repository, doer *user_model.User, branch, head string) (roomOpenResult, error) {
 	existing, found, err := findRoomIssue(ctx, repository.ID, branch)
 	if err != nil {
-		return false, err
+		return roomOpenResult{}, err
 	}
 	if found {
-		// A re-push of the same branch refreshes the marker head, so the
-		// git-free status fallback (findRoomBranchByHead) tracks the branch's
-		// current tip instead of only ever matching the creation-time head.
-		if content, changed := robotroom.WithMarkerHead(existing.Content, head); changed {
-			existing.Repo = repository
-			if err := issue_service.ChangeContent(ctx, existing, doer, content, existing.ContentVersion); err != nil {
-				return false, err
-			}
-		}
-		return false, nil
+		existing.Repo = repository
+		return roomOpenResult{}, refreshRoomHead(ctx, existing, doer, head)
 	}
+
+	closed, found, err := findRoomIssueInState(ctx, repository.ID, branch, true)
+	if err != nil {
+		return roomOpenResult{}, err
+	}
+	if found {
+		closed.Repo = repository
+		if err := issue_service.ReopenIssue(ctx, closed, doer, ""); err != nil {
+			return roomOpenResult{}, err
+		}
+		return roomOpenResult{Reopened: true}, refreshRoomHead(ctx, closed, doer, head)
+	}
+
 	issue := &issues_model.Issue{
 		RepoID:   repository.ID,
 		Repo:     repository,
-		Title:    roomIssueTitle(branch),
+		Title:    robotroom.IssueTitle(branch),
 		PosterID: doer.ID,
 		Poster:   doer,
 		Content:  robotroom.IssueBody(branch, head),
 	}
 	if err := issue_service.NewIssue(ctx, repository, issue, nil, nil, nil, 0); err != nil {
-		return false, err
+		return roomOpenResult{}, err
 	}
-	return true, nil
+	return roomOpenResult{Created: true}, nil
 }
 
 // closeRoom closes the room issue for branch, if one is open.
@@ -197,31 +294,116 @@ func statusComment(ctx *context.APIContext, repository *repo_model.Repository, d
 	return true, nil
 }
 
-// resolveRoomRepo maps the webhook payload's repository to the local repo.
-func resolveRoomRepo(ctx *context.APIContext, payloadRepo *api.Repository) (*repo_model.Repository, error) {
-	if payloadRepo == nil || payloadRepo.Owner == nil {
+// errRoomActorUnknown means the delivery named no user who could act on the
+// repository, and the repository's own owner cannot act either (an
+// organization cannot author issues).
+var errRoomActorUnknown = errors.New("delivery names no eligible room actor for the target repository")
+
+// errRoomActorDenied means the delivery named a real user who has no
+// issue-write access to the repository the delivery is for.
+var errRoomActorDenied = errors.New("room actor has no issue-write access to the target repository")
+
+// resolveRoomRepo maps the claimed repository of a verified delivery to the
+// local repo.
+func resolveRoomRepo(ctx *context.APIContext, claim roomRepoClaim) (*repo_model.Repository, error) {
+	if claim.Owner == "" || claim.Name == "" {
 		return nil, errors.New("payload carries no repository owner")
 	}
-	return repo_model.GetRepositoryByOwnerAndName(ctx, payloadRepo.Owner.UserName, payloadRepo.Name)
+	return repo_model.GetRepositoryByOwnerAndName(ctx, claim.Owner, claim.Name)
 }
 
-// resolveRoomDoer attributes room mutations to the webhook sender, falling
-// back to the repository owner when the sender is not a local user. For
-// organization-owned repos the owner cannot author issues or comments, so a
-// site admin acts instead.
+// resolveRoomDoer picks the user a room mutation is attributed to and checks
+// that they may actually perform it.
+//
+// The webhook sender is a *claim*, not a credential: the delivery is
+// authenticated as coming from the repository (its derived hook secret signed
+// it), never as coming from a particular user. So the named user is only an
+// attribution preference, and it is authorized against the target repository
+// like any other actor before a single write happens. A sender who is not a
+// local user falls back to the repository owner - and there is deliberately no
+// site-admin fallback for organization-owned repositories: attributing
+// automated content to whichever admin happens to have the lowest id both
+// misrepresents who acted and hands the hook far more power than it needs.
 func resolveRoomDoer(ctx *context.APIContext, repository *repo_model.Repository, sender *api.User) (*user_model.User, error) {
+	var doer *user_model.User
 	if sender != nil && sender.UserName != "" {
-		if doer, err := user_model.GetUserByName(ctx, sender.UserName); err == nil {
-			return doer, nil
+		u, err := user_model.GetUserByName(ctx, sender.UserName)
+		switch {
+		case err == nil:
+			doer = u
+		case !user_model.IsErrUserNotExist(err):
+			return nil, err
 		}
 	}
-	if err := repository.LoadOwner(ctx); err != nil {
+	if doer == nil {
+		if err := repository.LoadOwner(ctx); err != nil {
+			return nil, err
+		}
+		if repository.Owner.IsOrganization() {
+			return nil, errRoomActorUnknown
+		}
+		doer = repository.Owner
+	}
+	// An organization is not an author, and neither is a user who cannot log
+	// in; both would otherwise pass the permission check on their own repos.
+	if doer.IsOrganization() || doer.ProhibitLogin || !doer.IsActive {
+		return nil, errRoomActorUnknown
+	}
+
+	perm, err := access_model.GetUserRepoPermission(ctx, repository, doer)
+	if err != nil {
 		return nil, err
 	}
-	if repository.Owner.IsOrganization() {
-		return user_model.GetAdminUser(ctx)
+	if !perm.CanWriteIssuesOrPulls(false) {
+		return nil, errRoomActorDenied
 	}
-	return repository.Owner, nil
+	return doer, nil
+}
+
+// roomAudit records one outcome of the room hook. Failures are logged as well
+// as successes: a caller probing for repository names, or one whose actor is
+// refused, is exactly what an operator needs to see.
+func roomAudit(ctx *context.APIContext, doer *user_model.User, claim roomRepoClaim, success bool, reason string) {
+	var (
+		doerID   int64
+		doerName = "webhook"
+	)
+	if doer != nil {
+		doerID, doerName = doer.ID, doer.Name
+	}
+	robot.LogRobotAccessQuick(doerID, doerName, claim.Owner, claim.Name, roomHookEndpoint, ctx.RemoteAddr(), success, reason)
+}
+
+// roomTarget resolves the repository and the acting user of a verified
+// delivery, writing the API error response and the audit record itself when
+// either cannot be established. A false second return means the response is
+// already sent.
+func roomTarget(ctx *context.APIContext, claim roomRepoClaim, sender *api.User) (*repo_model.Repository, *user_model.User, bool) {
+	repository, err := resolveRoomRepo(ctx, claim)
+	if err != nil {
+		roomAudit(ctx, nil, claim, false, "repo_not_found")
+		ctx.APIErrorNotFound()
+		return nil, nil, false
+	}
+	doer, err := resolveRoomDoer(ctx, repository, sender)
+	if err != nil {
+		if errors.Is(err, errRoomActorUnknown) || errors.Is(err, errRoomActorDenied) {
+			roomAudit(ctx, nil, claim, false, "actor_denied")
+			ctx.APIError(http.StatusForbidden, err)
+			return nil, nil, false
+		}
+		roomAudit(ctx, nil, claim, false, "doer_error")
+		ctx.APIError(http.StatusInternalServerError, err)
+		return nil, nil, false
+	}
+	return repository, doer, true
+}
+
+// roomMutationError reports a failed room mutation, auditing it before the
+// response goes out.
+func roomMutationError(ctx *context.APIContext, doer *user_model.User, claim roomRepoClaim, err error) {
+	roomAudit(ctx, doer, claim, false, "room_error")
+	ctx.APIError(http.StatusInternalServerError, err)
 }
 
 // featBranchesAtHead returns the feat/* branches whose head is commit sha.
@@ -258,12 +440,13 @@ func featBranchesAtHead(ctx *context.APIContext, repository *repo_model.Reposito
 
 // RoomHook handles POST /api/v1/robot/room/hook, the inbound webhook endpoint
 // of branch-as-room automation (issue #56). It accepts Gitea webhook
-// deliveries signed with the ROOM_HOOK_SECRET from app.ini; with no secret
-// configured the route is disabled and answers 404, and an unsigned or
-// badly-signed delivery is always rejected with 401.
+// deliveries signed with the repository's secret, derived from the
+// instance-wide ROOM_HOOK_SECRET in app.ini (see roomHookSecretForRepo); with
+// no secret configured the route is disabled and answers 404, and an unsigned
+// or badly-signed delivery is always rejected with 401.
 func RoomHook(ctx *context.APIContext) {
-	secret := setting.IssueGraphSettings.RoomHookSecret
-	if secret == "" {
+	master := setting.IssueGraphSettings.RoomHookSecret
+	if master == "" {
 		// Route disabled: indistinguishable from "no such route".
 		ctx.APIErrorNotFound()
 		return
@@ -275,26 +458,28 @@ func RoomHook(ctx *context.APIContext) {
 		return
 	}
 
-	if !verifyRoomHookSignature(secret, body,
+	// The claimed repository selects the key the signature must match. It is
+	// read from an as-yet-unverified body, which is safe precisely because it
+	// only narrows what the delivery can be accepted as: naming another
+	// repository means having to sign with that repository's secret.
+	claim := roomPayloadRepoClaim(body)
+	if !verifyRoomHookSignature(roomHookSecretForRepo(master, claim.Owner, claim.Name), body,
 		ctx.Req.Header.Get("X-Gitea-Signature"),
 		ctx.Req.Header.Get("X-Hub-Signature-256")) {
-		// The body is untrusted, but a best-effort owner/repo hint makes the
-		// audit record useful; it feeds nothing but the log line.
-		owner, repo := roomPayloadRepoHint(body)
-		robot.LogRobotAccessQuick(0, "webhook", owner, repo, "/api/v1/robot/room/hook", ctx.RemoteAddr(), false, "bad_signature")
+		roomAudit(ctx, nil, claim, false, "bad_signature")
 		ctx.APIError(http.StatusUnauthorized, "invalid signature")
 		return
 	}
 
 	switch webhook_module.HookEventType(ctx.Req.Header.Get("X-Gitea-Event")) {
 	case webhook_module.HookEventPush:
-		handleRoomPush(ctx, body)
+		handleRoomPush(ctx, body, claim)
 	case webhook_module.HookEventDelete:
-		handleRoomDelete(ctx, body)
+		handleRoomDelete(ctx, body, claim)
 	case webhook_module.HookEventStatus:
-		handleRoomStatus(ctx, body)
+		handleRoomStatus(ctx, body, claim)
 	case webhook_module.HookEventPullRequest:
-		handleRoomPullRequest(ctx, body)
+		handleRoomPullRequest(ctx, body, claim)
 	default:
 		// Signed, but not an event this automation cares about.
 		ctx.JSON(http.StatusAccepted, map[string]string{"status": "ignored"})
@@ -303,7 +488,7 @@ func RoomHook(ctx *context.APIContext) {
 
 // handleRoomPush opens the room for a pushed feat/* branch, and closes it when
 // the push deleted the branch (zero "after" SHA).
-func handleRoomPush(ctx *context.APIContext, body []byte) {
+func handleRoomPush(ctx *context.APIContext, body []byte, claim roomRepoClaim) {
 	var p api.PushPayload
 	if err := json.Unmarshal(body, &p); err != nil {
 		ctx.APIError(http.StatusBadRequest, "invalid push payload")
@@ -314,54 +499,51 @@ func handleRoomPush(ctx *context.APIContext, body []byte) {
 		ctx.JSON(http.StatusAccepted, map[string]string{"status": "ignored", "reason": "not a feat/* branch"})
 		return
 	}
-	repository, err := resolveRoomRepo(ctx, p.Repo)
-	if err != nil {
-		ctx.APIErrorNotFound()
-		return
-	}
 	sender := p.Sender
 	if sender == nil {
 		sender = p.Pusher
 	}
-	doer, err := resolveRoomDoer(ctx, repository, sender)
-	if err != nil {
-		ctx.APIError(http.StatusInternalServerError, err)
+	repository, doer, ok := roomTarget(ctx, claim, sender)
+	if !ok {
 		return
 	}
 
 	if isZeroSHA(p.After) {
 		closed, err := closeRoom(ctx, repository, doer, branch)
 		if err != nil {
-			ctx.APIError(http.StatusInternalServerError, err)
+			roomMutationError(ctx, doer, claim, err)
 			return
 		}
-		robot.LogRobotAccessQuick(doer.ID, doer.Name, repository.OwnerName, repository.Name, "/api/v1/robot/room/hook", ctx.RemoteAddr(), true, "")
+		roomAudit(ctx, doer, claim, true, "")
 		ctx.JSON(http.StatusOK, map[string]any{"status": "closed", "branch": branch, "changed": closed})
 		return
 	}
 
-	created, err := openRoom(ctx, repository, doer, branch, p.After)
+	result, err := openRoom(ctx, repository, doer, branch, p.After)
 	if err != nil {
-		ctx.APIError(http.StatusInternalServerError, err)
+		roomMutationError(ctx, doer, claim, err)
 		return
 	}
-	robot.LogRobotAccessQuick(doer.ID, doer.Name, repository.OwnerName, repository.Name, "/api/v1/robot/room/hook", ctx.RemoteAddr(), true, "")
-	ctx.JSON(http.StatusOK, map[string]any{"status": "open", "branch": branch, "created": created})
+	roomAudit(ctx, doer, claim, true, "")
+	ctx.JSON(http.StatusOK, map[string]any{
+		"status": "open", "branch": branch, "created": result.Created, "reopened": result.Reopened,
+	})
 }
 
 // deleteTargetsRoom reports whether a delete event closes a room. Only feat/*
 // branch deletions do: the payload's ref_type distinguishes branch from tag
 // deletions (services/webhook/notifier.go sets it from the git ref), and a
-// tag named like a feat branch never carried a room.
+// tag named like a feat branch never carried a room. The bare "feat/" ref is
+// not a branch here either, matching featBranchRef and mergedFeatBranch.
 func deleteTargetsRoom(refType, ref string) bool {
-	return refType == "branch" && strings.HasPrefix(ref, featBranchPrefix)
+	return refType == "branch" && featBranch(ref)
 }
 
 // handleRoomDelete closes the room when a feat/* branch is deleted. Gitea
 // fires a dedicated delete event for branch deletion - the push payload has no
 // deleted flag - so room-close lives here, with the zero-after push path in
 // handleRoomPush as a fallback.
-func handleRoomDelete(ctx *context.APIContext, body []byte) {
+func handleRoomDelete(ctx *context.APIContext, body []byte, claim roomRepoClaim) {
 	var p api.DeletePayload
 	if err := json.Unmarshal(body, &p); err != nil {
 		ctx.APIError(http.StatusBadRequest, "invalid delete payload")
@@ -371,22 +553,16 @@ func handleRoomDelete(ctx *context.APIContext, body []byte) {
 		ctx.JSON(http.StatusAccepted, map[string]string{"status": "ignored"})
 		return
 	}
-	repository, err := resolveRoomRepo(ctx, p.Repo)
-	if err != nil {
-		ctx.APIErrorNotFound()
-		return
-	}
-	doer, err := resolveRoomDoer(ctx, repository, p.Sender)
-	if err != nil {
-		ctx.APIError(http.StatusInternalServerError, err)
+	repository, doer, ok := roomTarget(ctx, claim, p.Sender)
+	if !ok {
 		return
 	}
 	closed, err := closeRoom(ctx, repository, doer, p.Ref)
 	if err != nil {
-		ctx.APIError(http.StatusInternalServerError, err)
+		roomMutationError(ctx, doer, claim, err)
 		return
 	}
-	robot.LogRobotAccessQuick(doer.ID, doer.Name, repository.OwnerName, repository.Name, "/api/v1/robot/room/hook", ctx.RemoteAddr(), true, "")
+	roomAudit(ctx, doer, claim, true, "")
 	ctx.JSON(http.StatusOK, map[string]any{"status": "closed", "branch": p.Ref, "changed": closed})
 }
 
@@ -398,7 +574,7 @@ func mergedFeatBranch(p *api.PullRequestPayload) (string, bool) {
 		return "", false
 	}
 	branch := p.PullRequest.Head.Ref
-	if !strings.HasPrefix(branch, featBranchPrefix) || len(branch) == len(featBranchPrefix) {
+	if !featBranch(branch) {
 		return "", false
 	}
 	return branch, true
@@ -408,7 +584,7 @@ func mergedFeatBranch(p *api.PullRequestPayload) (string, bool) {
 // merged: the "merge" half of "branch merge/delete closes the room issue".
 // A merged branch is often kept around without an explicit deletion, which
 // would otherwise leak its open room forever.
-func handleRoomPullRequest(ctx *context.APIContext, body []byte) {
+func handleRoomPullRequest(ctx *context.APIContext, body []byte, claim roomRepoClaim) {
 	var p api.PullRequestPayload
 	if err := json.Unmarshal(body, &p); err != nil {
 		ctx.APIError(http.StatusBadRequest, "invalid pull_request payload")
@@ -419,22 +595,16 @@ func handleRoomPullRequest(ctx *context.APIContext, body []byte) {
 		ctx.JSON(http.StatusAccepted, map[string]string{"status": "ignored"})
 		return
 	}
-	repository, err := resolveRoomRepo(ctx, p.Repository)
-	if err != nil {
-		ctx.APIErrorNotFound()
-		return
-	}
-	doer, err := resolveRoomDoer(ctx, repository, p.Sender)
-	if err != nil {
-		ctx.APIError(http.StatusInternalServerError, err)
+	repository, doer, ok := roomTarget(ctx, claim, p.Sender)
+	if !ok {
 		return
 	}
 	closed, err := closeRoom(ctx, repository, doer, branch)
 	if err != nil {
-		ctx.APIError(http.StatusInternalServerError, err)
+		roomMutationError(ctx, doer, claim, err)
 		return
 	}
-	robot.LogRobotAccessQuick(doer.ID, doer.Name, repository.OwnerName, repository.Name, "/api/v1/robot/room/hook", ctx.RemoteAddr(), true, "")
+	roomAudit(ctx, doer, claim, true, "")
 	ctx.JSON(http.StatusOK, map[string]any{"status": "closed", "branch": branch, "changed": closed})
 }
 
@@ -443,7 +613,7 @@ func handleRoomPullRequest(ctx *context.APIContext, body []byte) {
 // recovered from the commit graph; as a fallback a room whose marker head
 // matches the SHA is used, which keeps working when the git repo is
 // unavailable to this process.
-func handleRoomStatus(ctx *context.APIContext, body []byte) {
+func handleRoomStatus(ctx *context.APIContext, body []byte, claim roomRepoClaim) {
 	var p api.CommitStatusPayload
 	if err := json.Unmarshal(body, &p); err != nil {
 		ctx.APIError(http.StatusBadRequest, "invalid status payload")
@@ -453,14 +623,8 @@ func handleRoomStatus(ctx *context.APIContext, body []byte) {
 		ctx.APIError(http.StatusBadRequest, "status payload carries no sha")
 		return
 	}
-	repository, err := resolveRoomRepo(ctx, p.Repo)
-	if err != nil {
-		ctx.APIErrorNotFound()
-		return
-	}
-	doer, err := resolveRoomDoer(ctx, repository, p.Sender)
-	if err != nil {
-		ctx.APIError(http.StatusInternalServerError, err)
+	repository, doer, ok := roomTarget(ctx, claim, p.Sender)
+	if !ok {
 		return
 	}
 
@@ -478,12 +642,12 @@ func handleRoomStatus(ctx *context.APIContext, body []byte) {
 
 	commented := make([]string, 0, len(branches))
 	for _, branch := range branches {
-		ok, err := statusComment(ctx, repository, doer, branch, &p)
+		posted, err := statusComment(ctx, repository, doer, branch, &p)
 		if err != nil {
-			ctx.APIError(http.StatusInternalServerError, err)
+			roomMutationError(ctx, doer, claim, err)
 			return
 		}
-		if ok {
+		if posted {
 			commented = append(commented, branch)
 		}
 	}
@@ -495,27 +659,52 @@ func handleRoomStatus(ctx *context.APIContext, body []byte) {
 		ctx.JSON(http.StatusAccepted, map[string]string{"status": "ignored", "reason": "no_open_room"})
 		return
 	}
-	robot.LogRobotAccessQuick(doer.ID, doer.Name, repository.OwnerName, repository.Name, "/api/v1/robot/room/hook", ctx.RemoteAddr(), true, "")
+	roomAudit(ctx, doer, claim, true, "")
 	ctx.JSON(http.StatusOK, map[string]any{"status": "commented", "branches": commented})
 }
 
+// isHexSHA reports whether s is a non-empty hex string. It gates the marker
+// lookup below: a SHA that reached the LIKE pattern with wildcards in it would
+// turn a bounded lookup into a scan.
+func isHexSHA(s string) bool {
+	if s == "" || len(s) > 64 {
+		return false
+	}
+	for _, c := range s {
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f', c >= 'A' && c <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // findRoomBranchByHead returns the branch of an open room whose marker head is
-// sha - the git-free fallback for status-to-room resolution.
+// sha - the git-free fallback for status-to-room resolution. Both filters (the
+// room title prefix and the head recorded in the marker) run in the database,
+// so the fallback costs a bounded lookup rather than a pass over every open
+// issue's body.
 func findRoomBranchByHead(ctx *context.APIContext, repoID int64, sha string) (string, bool) {
-	issues, err := issues_model.Issues(ctx, &issues_model.IssuesOptions{
-		RepoIDs:  []int64{repoID},
-		IsClosed: optional.Some(false),
-		IsPull:   optional.Some(false),
-	})
-	if err != nil {
+	if !isHexSHA(sha) {
+		return "", false
+	}
+	issues := make([]*issues_model.Issue, 0, 4)
+	if err := db.GetEngine(ctx).
+		Where("`issue`.repo_id = ?", repoID).
+		And("`issue`.is_pull = ?", false).
+		And("`issue`.is_closed = ?", false).
+		And("`issue`.name LIKE ?", robotroom.TitlePrefix+"%").
+		And("`issue`.content LIKE ?", "%"+robotroom.MarkerHeadFragment(sha)+"%").
+		Limit(roomLookupLimit).
+		Find(&issues); err != nil {
+		log.Error("room hook: cannot look up room by marker head in repo %d: %v", repoID, err)
 		return "", false
 	}
 	for _, issue := range issues {
-		// Same title pre-filter as findRoomIssue: a renamed room is detached.
-		if !strings.HasPrefix(issue.Title, roomTitlePrefix) {
-			continue
-		}
-		if m, ok := robotroom.ParseMarker(issue.Content); ok && m.Head == sha {
+		// The SQL filters narrow; the marker parse decides. A renamed room is
+		// detached from the automation, same rule as robotroom.IsRoomFor.
+		if m, ok := robotroom.ParseMarker(issue.Content); ok && m.Head == sha && issue.Title == robotroom.IssueTitle(m.Branch) {
 			return m.Branch, true
 		}
 	}

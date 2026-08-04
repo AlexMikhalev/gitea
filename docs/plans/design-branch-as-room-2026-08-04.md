@@ -18,11 +18,14 @@ the branch merges or is deleted. Automation-side only (gitea-robot + one inbound
    closed+merged PR from a feat/* branch → room-close; `status` (type.go:34 `HookEventStatus`) → parse
    `CommitStatusPayload` (modules/structs/hook.go:568), resolve SHA → room of the feat/* branch whose head is the
    SHA (marker-head match as git-free fallback), append status comment. All other events: 202 + ignore.
-3. Room-open is idempotent: search open issues (`GET`-equivalent of `repo.SearchIssues`, api.go:1732) for a body
-   containing the room marker for that branch; create via the `repo.CreateIssue` path (api.go:1736-1737) only when
-   absent. Marker = machine-readable JSON front-matter block at the top of the issue body, aligning with #39's
-   convention. Known limitation: search-then-create has no unique constraint, so two concurrent deliveries for the
-   same new branch could create duplicate rooms; serialized webhook delivery keeps the window theoretical.
+3. Room-open is idempotent: look up the issue with the room's deterministic title (`Room: <branch>`) and the room
+   marker for that branch — an indexed, `LIMIT`-ed query, never a walk over the repository's open issues — and
+   create via the `repo.CreateIssue` path (api.go:1736-1737) only when the branch has never had a room. Marker =
+   machine-readable JSON front-matter block at the top of the issue body, aligning with #39's convention. Title
+   and marker together are the match predicate, and it lives in `modules/robotroom` so hook and CLI cannot drift:
+   a room a human renamed is detached from the automation on *both* sides rather than one. Known limitation:
+   search-then-create has no unique constraint, so two concurrent deliveries for the same new branch could create
+   duplicate rooms; serialized webhook delivery keeps the window theoretical.
 4. `cmd/gitea-robot/main.go` — `room` subcommand (`open|status|close` actions) in the `switch command` dispatch
    (:167-181) + `printUsage()` (:185), reusing `apiGet`/`apiPostSafe` (:349, :1002) and `setRequestAuth` (:50) so
    NIP-98 agent identity works unchanged; plus a `room` MCP tool beside `handleTriageTool`/`handleAddDepTool` (:737, :904).
@@ -51,11 +54,24 @@ the branch merges or is deleted. Automation-side only (gitea-robot + one inbound
   (`REQUIRE_SIGNIN_VIEW`, `Service.RequireSignInViewStrict`; checked in `verifyAuthWithOptions`,
   routers/api/v1/api.go:1043-1045) tokenless requests are rejected with 403 before the HMAC check runs — the room
   hook requires anonymous API access to be allowed.
-- Room mutations are attributed to the webhook sender; if the sender is not a local user, the repo owner acts,
-  and for organization-owned repos (an org cannot author issues) a site admin acts instead.
+- **`ROOM_HOOK_SECRET` is a master secret, not a webhook secret.** Each repository's webhook secret is
+  `HMAC-SHA256(ROOM_HOOK_SECRET, "gitea-robot/room:v1:<owner>/<repo>")`, hex, owner and repo lower-cased. The
+  signature is checked against the secret of the repository the payload *names*, so the repo admin who must be
+  given a secret to configure the hook holds one that only works for their own repository; the master never
+  leaves `app.ini`. Documented for operators in `docs/ROBOT_SECURITY.md`.
+- **A signature authenticates the repository, never a user.** `sender` is an attribution preference: the resolved
+  actor (sender → repo owner) must be an active individual account *with issue-write access to that repository*,
+  or the delivery is refused with 403 before any write. There is deliberately no site-admin fallback for
+  organization-owned repos — attributing automated content to the lowest-id site admin both misstates who acted
+  and gives the hook far more reach than it needs.
+- Every outcome is audited, failures included (`bad_signature`, `repo_not_found`, `actor_denied`, `doer_error`,
+  `room_error`): the caller who is refused is more interesting to an operator than the one who succeeds.
 
 ## Acceptance criteria
 - Push to `feat/foo` creates exactly one room issue; re-pushing never creates a duplicate (idempotent by marker).
+- The "exactly one" holds for the life of the branch *name*: pushing a branch whose room was already closed
+  (merged, deleted, or closed by hand) **reopens that room** rather than opening a second issue with the same
+  title. The push response distinguishes the three outcomes (`created`, `reopened`, or neither).
 - CI status change on the branch's head SHA posts one status comment on the room issue.
 - Branch merge (pull_request closed+merged) or delete (delete event / zero-after push) closes the room issue;
   hook with bad/missing signature is rejected (401, or 403 under strict sign-in).
@@ -71,7 +87,9 @@ UI; no outbound webhooks/SSE; no Nostr relay publishing; no handling of non-`fea
 - Unit (`cmd/gitea-robot/main_test.go` pattern): `room` subcommand arg validation and request shapes against an
   httptest fake server (wiremock-style; no live instance).
 - Integration (`tests/integration/api_robot_room_test.go`, beside api_robot_test.go): full hook flow in-process —
-  push event opens room, duplicate push is a no-op, status event comments, unsigned POST rejected.
+  push event opens room, duplicate push is a no-op, status event comments, unsigned POST rejected, a delivery
+  signed with another repository's derived secret rejected (401), a sender without issue-write access rejected
+  (403), and a push after close reopening the same issue.
 
 ## Gates
 `make fmt` · `make lint-go` · `make test-backend` · `make test-sqlite#TestAPIRobotRoom` · `make tidy` only if

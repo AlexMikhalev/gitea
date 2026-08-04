@@ -813,6 +813,21 @@ func handleToolsCall(req MCPRequest) any {
 	}
 }
 
+// mcpInternalError turns a failed API call into a JSON-RPC internal error.
+// Inside mcp-server the alternative is os.Exit (apiGet), which would take the
+// whole server process down on a transient 500 or a network blip instead of
+// failing the one tool call the client made.
+func mcpInternalError(id *json.RawMessage, tool string, err error) MCPErrorResponse {
+	return MCPErrorResponse{
+		JSONRPC: "2.0",
+		ID:      id,
+		Error: &MCPError{
+			Code:    -32603, // Internal error
+			Message: tool + " failed: " + err.Error(),
+		},
+	}
+}
+
 // handleTriageTool executes the triage tool
 func handleTriageTool(args json.RawMessage, id *json.RawMessage) any {
 	// Parse arguments
@@ -862,7 +877,10 @@ func handleTriageTool(args json.RawMessage, id *json.RawMessage) any {
 
 	// Call API directly instead of using triageCmd to avoid os.Exit()
 	url := fmt.Sprintf("%s/api/v1/robot/triage?owner=%s&repo=%s", giteaURL, *argsStruct.Owner, *argsStruct.Repo)
-	output := apiGet(url)
+	output, err := apiGetSafe(url)
+	if err != nil {
+		return mcpInternalError(id, "triage", err)
+	}
 
 	// For markdown format, we would need to parse and format the JSON
 	// For now, return JSON regardless of format parameter
@@ -918,7 +936,10 @@ func handleReadyTool(args json.RawMessage, id *json.RawMessage) any {
 
 	// Call API directly instead of using readyCmd to avoid os.Exit()
 	url := fmt.Sprintf("%s/api/v1/robot/ready?owner=%s&repo=%s", giteaURL, *argsStruct.Owner, *argsStruct.Repo)
-	output := apiGet(url)
+	output, err := apiGetSafe(url)
+	if err != nil {
+		return mcpInternalError(id, "ready", err)
+	}
 
 	// Return the output as the result
 	return MCPResponse{
@@ -970,7 +991,10 @@ func handleGraphTool(args json.RawMessage, id *json.RawMessage) any {
 
 	// Call API directly instead of using graphCmd to avoid os.Exit()
 	url := fmt.Sprintf("%s/api/v1/robot/graph?owner=%s&repo=%s", giteaURL, *argsStruct.Owner, *argsStruct.Repo)
-	output := apiGet(url)
+	output, err := apiGetSafe(url)
+	if err != nil {
+		return mcpInternalError(id, "graph", err)
+	}
 
 	// Return the output as the result
 	return MCPResponse{
@@ -1100,15 +1124,27 @@ func handlePing(req MCPRequest) any {
 // roomIssueListEntry is the subset of the API issue shape the room commands need.
 type roomIssueListEntry struct {
 	Index int64  `json:"number"`
+	Title string `json:"title"`
 	Body  string `json:"body"`
 }
+
+const (
+	// roomIssuePageSize is the page size *requested* when listing issues. The
+	// server clamps it to MAX_RESPONSE_ITEMS (default 50, operator-tunable),
+	// so a short page says nothing about whether more pages follow.
+	roomIssuePageSize = 50
+	// roomIssuePageLimit stops the paging loop from running forever against a
+	// server that never returns an empty page. Reaching it is an error, not a
+	// silent "no room found": a wrong answer here duplicates rooms.
+	roomIssuePageLimit = 200
+)
 
 // roomFindIssue locates the open room issue for branch, paging through the
 // repo's open issues. It returns the issue index and whether a room exists.
 func roomFindIssue(owner, repo, branch string) (int64, bool, error) {
-	for page := 1; ; page++ {
-		url := fmt.Sprintf("%s/api/v1/repos/%s/%s/issues?state=open&type=issues&limit=50&page=%d",
-			giteaURL, owner, repo, page)
+	for page := 1; page <= roomIssuePageLimit; page++ {
+		url := fmt.Sprintf("%s/api/v1/repos/%s/%s/issues?state=open&type=issues&limit=%d&page=%d",
+			giteaURL, owner, repo, roomIssuePageSize, page)
 		data, err := apiGetSafe(url)
 		if err != nil {
 			return 0, false, err
@@ -1118,14 +1154,22 @@ func roomFindIssue(owner, repo, branch string) (int64, bool, error) {
 			return 0, false, fmt.Errorf("error parsing issue list: %v", err)
 		}
 		for _, issue := range issues {
-			if m, ok := robotroom.ParseMarker(issue.Body); ok && m.Branch == branch {
+			// The same predicate the server-side hook matches rooms with, so
+			// the two sides can never operate on different issues for one
+			// branch.
+			if robotroom.IsRoomFor(issue.Title, issue.Body, branch) {
 				return issue.Index, true, nil
 			}
 		}
-		if len(issues) < 50 {
+		// Only an empty page ends the walk. A page shorter than requested is
+		// what a server with a lower MAX_RESPONSE_ITEMS returns for every
+		// page, so treating it as the last one would stop after the first.
+		if len(issues) == 0 {
 			return 0, false, nil
 		}
 	}
+	return 0, false, fmt.Errorf("scanned %d pages of open issues in %s/%s without reaching the end of the list; refusing to report 'no room' for %s",
+		roomIssuePageLimit, owner, repo, branch)
 }
 
 // roomOpen creates the room issue unless one already exists. It reports
@@ -1141,7 +1185,7 @@ func roomOpen(owner, repo, branch, head string) (bool, int64, error) {
 	}
 	url := fmt.Sprintf("%s/api/v1/repos/%s/%s/issues", giteaURL, owner, repo)
 	body := fmt.Sprintf(`{"title": %s, "body": %s}`,
-		jsonString("Room: "+branch), jsonString(robotroom.IssueBody(branch, head)))
+		jsonString(robotroom.IssueTitle(branch)), jsonString(robotroom.IssueBody(branch, head)))
 	data, err := apiPostSafe(url, body)
 	if err != nil {
 		return false, 0, err

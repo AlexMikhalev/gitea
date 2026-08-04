@@ -33,6 +33,33 @@ type Marker struct {
 	Head    string `json:"head,omitempty"`
 }
 
+// TitlePrefix is the deterministic title prefix of every room issue. It lives
+// here rather than in either caller because the title is half of a room's
+// identity: both sides match rooms on it, so both sides must render it the
+// same way.
+const TitlePrefix = "Room: "
+
+// IssueTitle renders the deterministic title of a branch's room issue.
+func IssueTitle(branch string) string {
+	return TitlePrefix + branch
+}
+
+// IsRoomFor is the single room-match predicate, shared by the room hook and
+// the gitea-robot CLI so the two can never disagree about which issue is the
+// room for a branch. A room is an issue whose title is exactly IssueTitle(branch)
+// *and* whose body carries the marker for that branch.
+//
+// Requiring the title means renaming a room detaches it from the automation -
+// a deliberate trade-off: the title is what makes the lookup an indexed,
+// bounded query instead of a scan over every open issue's body.
+func IsRoomFor(title, body, branch string) bool {
+	if title != IssueTitle(branch) {
+		return false
+	}
+	m, ok := ParseMarker(body)
+	return ok && m.Branch == branch
+}
+
 // MarkerJSON renders the marker for a branch as compact JSON. The head is the
 // branch tip SHA, refreshed on every push, and lets a status event find its
 // room even when git branch resolution is unavailable.
@@ -40,6 +67,14 @@ func MarkerJSON(branch, head string) string {
 	m := Marker{Type: MarkerType, Version: 1, Branch: branch, Head: head}
 	data, _ := json.Marshal(m) // cannot fail: all fields are strings/ints
 	return string(data)
+}
+
+// MarkerHeadFragment renders the marker's head field exactly as MarkerJSON
+// writes it. It exists so a caller can pre-filter room issues by recorded head
+// in the database (a substring match on the body) without duplicating the
+// marker's JSON shape.
+func MarkerHeadFragment(head string) string {
+	return `"head":"` + head + `"`
 }
 
 // IssueBody builds the full body of a room issue: marker first, then a short

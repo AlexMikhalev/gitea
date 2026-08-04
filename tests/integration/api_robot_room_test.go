@@ -55,6 +55,23 @@ func signRoomHookBody(secret, body string) string {
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
+// roomRepoSecret derives one repository's hook secret from the instance-wide
+// ROOM_HOOK_SECRET. It is spelled out here rather than imported so the test
+// pins the operator-facing formula documented in docs/ROBOT_SECURITY.md: if
+// the handler's derivation changes, every configured webhook breaks and this
+// test says so.
+func roomRepoSecret(master, owner, repo string) string {
+	mac := hmac.New(sha256.New, []byte(master))
+	fmt.Fprintf(mac, "gitea-robot/room:v1:%s/%s", strings.ToLower(owner), strings.ToLower(repo))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// signRoomDelivery signs a delivery for user2/repo1, the repository every
+// payload in this test names.
+func signRoomDelivery(body string) string {
+	return signRoomHookBody(roomRepoSecret(roomHookTestSecret, "user2", "repo1"), body)
+}
+
 // makeRoomHookRequest POSTs a webhook delivery to the room hook endpoint.
 func makeRoomHookRequest(t *testing.T, event, body, sig string, expectedStatus int) *httptest.ResponseRecorder {
 	t.Helper()
@@ -94,7 +111,7 @@ func TestAPIRobotRoom(t *testing.T) {
 		setting.IssueGraphSettings.RoomHookSecret = ""
 		defer func() { setting.IssueGraphSettings.RoomHookSecret = roomHookTestSecret }()
 		body := roomPushPayload(ref, head)
-		makeRoomHookRequest(t, "push", body, signRoomHookBody(roomHookTestSecret, body), http.StatusNotFound)
+		makeRoomHookRequest(t, "push", body, signRoomDelivery(body), http.StatusNotFound)
 	})
 
 	t.Run("UnsignedRejected", func(t *testing.T) {
@@ -106,29 +123,63 @@ func TestAPIRobotRoom(t *testing.T) {
 		assert.Equal(t, 0, unittest.GetCount(t, &issues_model.Issue{RepoID: 1, Title: title}))
 	})
 
+	t.Run("SecretIsScopedToOneRepository", func(t *testing.T) {
+		// The instance-wide master secret never verifies a delivery on its
+		// own, and a repository's own secret verifies only that repository's
+		// deliveries. This is what keeps a repo admin who was handed their
+		// own hook secret from writing to anyone else's repository.
+		body := roomPushPayload(ref, head)
+
+		makeRoomHookRequest(t, "push", body, signRoomHookBody(roomHookTestSecret, body), http.StatusUnauthorized)
+		makeRoomHookRequest(t, "push", body,
+			signRoomHookBody(roomRepoSecret(roomHookTestSecret, "user2", "repo2"), body), http.StatusUnauthorized)
+
+		// The same holds in the other direction: repo1's secret does not sign
+		// a delivery that names repo2.
+		otherRepo := fmt.Sprintf(`{"ref":%q,"after":%q,`+
+			`"repository":{"name":"repo2","owner":{"login":"user2"}},"sender":{"login":"user2"}}`, ref, head)
+		makeRoomHookRequest(t, "push", otherRepo, signRoomDelivery(otherRepo), http.StatusUnauthorized)
+
+		assert.Equal(t, 0, unittest.GetCount(t, &issues_model.Issue{RepoID: 1, Title: title}))
+		assert.Equal(t, 0, unittest.GetCount(t, &issues_model.Issue{RepoID: 2, Title: title}))
+	})
+
+	t.Run("SenderWithoutWriteAccessRejected", func(t *testing.T) {
+		// A correctly signed delivery still has to name an actor who may write
+		// issues in the target repository: the sender is a claim in the body,
+		// not a credential. user4 is neither owner nor collaborator of repo1.
+		const foreignBranch = "feat/room-inttest-foreign"
+		foreignTitle := "Room: " + foreignBranch
+		body := fmt.Sprintf(`{"ref":%q,"after":%q,`+
+			`"repository":{"name":"repo1","owner":{"login":"user2"}},"sender":{"login":"user4"}}`,
+			"refs/heads/"+foreignBranch, head)
+		makeRoomHookRequest(t, "push", body, signRoomDelivery(body), http.StatusForbidden)
+		assert.Equal(t, 0, unittest.GetCount(t, &issues_model.Issue{RepoID: 1, Title: foreignTitle}))
+	})
+
 	t.Run("UnknownEventIgnored", func(t *testing.T) {
 		body := `{}`
-		makeRoomHookRequest(t, "issues", body, signRoomHookBody(roomHookTestSecret, body), http.StatusAccepted)
+		makeRoomHookRequest(t, "issues", body, signRoomDelivery(body), http.StatusAccepted)
 	})
 
 	t.Run("PushOpensRoomIdempotently", func(t *testing.T) {
 		body := roomPushPayload(ref, head)
 
 		// First push creates the room
-		makeRoomHookRequest(t, "push", body, signRoomHookBody(roomHookTestSecret, body), http.StatusOK)
+		makeRoomHookRequest(t, "push", body, signRoomDelivery(body), http.StatusOK)
 		issue := unittest.AssertExistsAndLoadBean(t, &issues_model.Issue{RepoID: 1, Title: title})
 		assert.Contains(t, issue.Content, "gitea-robot/room")
 		assert.Contains(t, issue.Content, branch)
 		assert.False(t, issue.IsClosed)
 
 		// Re-pushing never creates a duplicate
-		makeRoomHookRequest(t, "push", body, signRoomHookBody(roomHookTestSecret, body), http.StatusOK)
+		makeRoomHookRequest(t, "push", body, signRoomDelivery(body), http.StatusOK)
 		assert.Equal(t, 1, unittest.GetCount(t, &issues_model.Issue{RepoID: 1, Title: title}))
 	})
 
 	t.Run("NonFeatPushIgnored", func(t *testing.T) {
 		body := roomPushPayload("refs/heads/main", head)
-		makeRoomHookRequest(t, "push", body, signRoomHookBody(roomHookTestSecret, body), http.StatusAccepted)
+		makeRoomHookRequest(t, "push", body, signRoomDelivery(body), http.StatusAccepted)
 		assert.Equal(t, 0, unittest.GetCount(t, &issues_model.Issue{RepoID: 1, Title: "Room: main"}))
 	})
 
@@ -140,7 +191,7 @@ func TestAPIRobotRoom(t *testing.T) {
 		// resolves to this room even without a feat branch in the git repo.
 		body := fmt.Sprintf(`{"sha":%q,"state":"success","context":"ci/test","description":"all green",`+
 			`"repository":{"name":"repo1","owner":{"login":"user2"}},"sender":{"login":"user2"}}`, head)
-		makeRoomHookRequest(t, "status", body, signRoomHookBody(roomHookTestSecret, body), http.StatusOK)
+		makeRoomHookRequest(t, "status", body, signRoomDelivery(body), http.StatusOK)
 
 		after := unittest.GetCount(t, &issues_model.Comment{IssueID: issue.ID, Type: issues_model.CommentTypeComment})
 		assert.Equal(t, before+1, after)
@@ -153,7 +204,7 @@ func TestAPIRobotRoom(t *testing.T) {
 		body := fmt.Sprintf(`{"sha":%q,"state":"failure",`+
 			`"repository":{"name":"repo1","owner":{"login":"user2"}},"sender":{"login":"user2"}}`,
 			"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-		makeRoomHookRequest(t, "status", body, signRoomHookBody(roomHookTestSecret, body), http.StatusAccepted)
+		makeRoomHookRequest(t, "status", body, signRoomDelivery(body), http.StatusAccepted)
 
 		after := unittest.GetCount(t, &issues_model.Comment{IssueID: issue.ID, Type: issues_model.CommentTypeComment})
 		assert.Equal(t, before, after)
@@ -162,13 +213,40 @@ func TestAPIRobotRoom(t *testing.T) {
 	t.Run("DeleteClosesRoom", func(t *testing.T) {
 		body := fmt.Sprintf(`{"ref":%q,"ref_type":"branch",`+
 			`"repository":{"name":"repo1","owner":{"login":"user2"}},"sender":{"login":"user2"}}`, branch)
-		makeRoomHookRequest(t, "delete", body, signRoomHookBody(roomHookTestSecret, body), http.StatusOK)
+		makeRoomHookRequest(t, "delete", body, signRoomDelivery(body), http.StatusOK)
 
 		issue := unittest.AssertExistsAndLoadBean(t, &issues_model.Issue{RepoID: 1, Title: title})
 		assert.True(t, issue.IsClosed)
 
 		// Closing an already-closed room is a no-op, not an error
-		makeRoomHookRequest(t, "delete", body, signRoomHookBody(roomHookTestSecret, body), http.StatusOK)
+		makeRoomHookRequest(t, "delete", body, signRoomDelivery(body), http.StatusOK)
+	})
+
+	t.Run("PushAfterCloseReopensTheSameRoom", func(t *testing.T) {
+		// DeleteClosesRoom just closed this branch's room. Pushing the branch
+		// again revives that issue instead of opening a second one with an
+		// identical title - "exactly one room issue per branch" holds across
+		// the whole life of a branch name, not just until its first close.
+		issue := unittest.AssertExistsAndLoadBean(t, &issues_model.Issue{RepoID: 1, Title: title})
+		require.True(t, issue.IsClosed)
+
+		body := roomPushPayload(ref, head)
+		resp := makeRoomHookRequest(t, "push", body, signRoomDelivery(body), http.StatusOK)
+		var payload map[string]any
+		DecodeJSON(t, resp, &payload)
+		assert.Equal(t, false, payload["created"])
+		assert.Equal(t, true, payload["reopened"])
+
+		assert.Equal(t, 1, unittest.GetCount(t, &issues_model.Issue{RepoID: 1, Title: title}))
+		reopened := unittest.AssertExistsAndLoadBean(t, &issues_model.Issue{RepoID: 1, Title: title})
+		assert.Equal(t, issue.ID, reopened.ID)
+		assert.False(t, reopened.IsClosed)
+
+		// Put the room back the way DeleteClosesRoom left it, so the subtests
+		// after this one see the state they were written against.
+		del := fmt.Sprintf(`{"ref":%q,"ref_type":"branch",`+
+			`"repository":{"name":"repo1","owner":{"login":"user2"}},"sender":{"login":"user2"}}`, branch)
+		makeRoomHookRequest(t, "delete", del, signRoomDelivery(del), http.StatusOK)
 	})
 
 	t.Run("ZeroAfterPushClosesRoom", func(t *testing.T) {
@@ -179,12 +257,12 @@ func TestAPIRobotRoom(t *testing.T) {
 		zapTitle := "Room: " + zapBranch
 
 		body := roomPushPayload(zapRef, head)
-		makeRoomHookRequest(t, "push", body, signRoomHookBody(roomHookTestSecret, body), http.StatusOK)
+		makeRoomHookRequest(t, "push", body, signRoomDelivery(body), http.StatusOK)
 		issue := unittest.AssertExistsAndLoadBean(t, &issues_model.Issue{RepoID: 1, Title: zapTitle})
 		require.False(t, issue.IsClosed)
 
 		delBody := roomPushPayload(zapRef, strings.Repeat("0", 40))
-		makeRoomHookRequest(t, "push", delBody, signRoomHookBody(roomHookTestSecret, delBody), http.StatusOK)
+		makeRoomHookRequest(t, "push", delBody, signRoomDelivery(delBody), http.StatusOK)
 		issue = unittest.AssertExistsAndLoadBean(t, &issues_model.Issue{RepoID: 1, Title: zapTitle})
 		assert.True(t, issue.IsClosed)
 	})
@@ -194,20 +272,20 @@ func TestAPIRobotRoom(t *testing.T) {
 		mergeTitle := "Room: " + mergeBranch
 
 		body := roomPushPayload("refs/heads/"+mergeBranch, head)
-		makeRoomHookRequest(t, "push", body, signRoomHookBody(roomHookTestSecret, body), http.StatusOK)
+		makeRoomHookRequest(t, "push", body, signRoomDelivery(body), http.StatusOK)
 		unittest.AssertExistsAndLoadBean(t, &issues_model.Issue{RepoID: 1, Title: mergeTitle})
 
 		// A PR closed without a merge leaves the branch (and room) alone.
 		unmerged := fmt.Sprintf(`{"action":"closed","pull_request":{"merged":false,"head":{"ref":%q}},`+
 			`"repository":{"name":"repo1","owner":{"login":"user2"}},"sender":{"login":"user2"}}`, mergeBranch)
-		makeRoomHookRequest(t, "pull_request", unmerged, signRoomHookBody(roomHookTestSecret, unmerged), http.StatusAccepted)
+		makeRoomHookRequest(t, "pull_request", unmerged, signRoomDelivery(unmerged), http.StatusAccepted)
 		issue := unittest.AssertExistsAndLoadBean(t, &issues_model.Issue{RepoID: 1, Title: mergeTitle})
 		assert.False(t, issue.IsClosed)
 
 		// A merged PR closes the room even though the branch still exists.
 		merged := fmt.Sprintf(`{"action":"closed","pull_request":{"merged":true,"head":{"ref":%q}},`+
 			`"repository":{"name":"repo1","owner":{"login":"user2"}},"sender":{"login":"user2"}}`, mergeBranch)
-		makeRoomHookRequest(t, "pull_request", merged, signRoomHookBody(roomHookTestSecret, merged), http.StatusOK)
+		makeRoomHookRequest(t, "pull_request", merged, signRoomDelivery(merged), http.StatusOK)
 		issue = unittest.AssertExistsAndLoadBean(t, &issues_model.Issue{RepoID: 1, Title: mergeTitle})
 		assert.True(t, issue.IsClosed)
 	})
@@ -239,7 +317,7 @@ func TestAPIRobotRoom(t *testing.T) {
 		// Open the room with a marker head that does NOT match the branch
 		// head, so only git resolution can find this room below.
 		openBody := roomPushPayload("refs/heads/"+gitBranch, "ffffffffffffffffffffffffffffffffffffffff")
-		makeRoomHookRequest(t, "push", openBody, signRoomHookBody(roomHookTestSecret, openBody), http.StatusOK)
+		makeRoomHookRequest(t, "push", openBody, signRoomDelivery(openBody), http.StatusOK)
 		issue := unittest.AssertExistsAndLoadBean(t, &issues_model.Issue{RepoID: 1, Title: gitTitle})
 		countComments := func() int {
 			return unittest.GetCount(t, &issues_model.Comment{IssueID: issue.ID, Type: issues_model.CommentTypeComment})
@@ -249,14 +327,14 @@ func TestAPIRobotRoom(t *testing.T) {
 		// A status on the branch head comments via git resolution.
 		statusBody := fmt.Sprintf(`{"sha":%q,"state":"success","context":"ci/build",`+
 			`"repository":{"name":"repo1","owner":{"login":"user2"}},"sender":{"login":"user2"}}`, headSHA)
-		makeRoomHookRequest(t, "status", statusBody, signRoomHookBody(roomHookTestSecret, statusBody), http.StatusOK)
+		makeRoomHookRequest(t, "status", statusBody, signRoomDelivery(statusBody), http.StatusOK)
 		assert.Equal(t, before+1, countComments())
 
 		// A status for a commit merely contained in the branch (its parent)
 		// is not the branch's CI state: ignored, no fan-out comment.
 		parentBody := fmt.Sprintf(`{"sha":%q,"state":"failure",`+
 			`"repository":{"name":"repo1","owner":{"login":"user2"}},"sender":{"login":"user2"}}`, parentID.String())
-		makeRoomHookRequest(t, "status", parentBody, signRoomHookBody(roomHookTestSecret, parentBody), http.StatusAccepted)
+		makeRoomHookRequest(t, "status", parentBody, signRoomDelivery(parentBody), http.StatusAccepted)
 		assert.Equal(t, before+1, countComments())
 	})
 
@@ -282,7 +360,7 @@ func TestAPIRobotRoom(t *testing.T) {
 
 		body := fmt.Sprintf(`{"sha":%q,"state":"success",`+
 			`"repository":{"name":"repo1","owner":{"login":"user2"}},"sender":{"login":"user2"}}`, parentID.String())
-		resp := makeRoomHookRequest(t, "status", body, signRoomHookBody(roomHookTestSecret, body), http.StatusAccepted)
+		resp := makeRoomHookRequest(t, "status", body, signRoomDelivery(body), http.StatusAccepted)
 		var payload map[string]any
 		DecodeJSON(t, resp, &payload)
 		assert.Equal(t, "ignored", payload["status"])
@@ -302,12 +380,12 @@ func TestAPIRobotRoom(t *testing.T) {
 		)
 
 		body := roomPushPayload("refs/heads/"+reBranch, oldHead)
-		makeRoomHookRequest(t, "push", body, signRoomHookBody(roomHookTestSecret, body), http.StatusOK)
+		makeRoomHookRequest(t, "push", body, signRoomDelivery(body), http.StatusOK)
 		issue := unittest.AssertExistsAndLoadBean(t, &issues_model.Issue{RepoID: 1, Title: reTitle})
 		require.Contains(t, issue.Content, oldHead)
 
 		body = roomPushPayload("refs/heads/"+reBranch, newHead)
-		makeRoomHookRequest(t, "push", body, signRoomHookBody(roomHookTestSecret, body), http.StatusOK)
+		makeRoomHookRequest(t, "push", body, signRoomDelivery(body), http.StatusOK)
 		issue = unittest.AssertExistsAndLoadBean(t, &issues_model.Issue{RepoID: 1, Title: reTitle})
 		assert.Contains(t, issue.Content, newHead)
 		assert.NotContains(t, issue.Content, oldHead)
@@ -320,13 +398,13 @@ func TestAPIRobotRoom(t *testing.T) {
 		// marker-head fallback is in play. The new head resolves...
 		statusBody := fmt.Sprintf(`{"sha":%q,"state":"success",`+
 			`"repository":{"name":"repo1","owner":{"login":"user2"}},"sender":{"login":"user2"}}`, newHead)
-		makeRoomHookRequest(t, "status", statusBody, signRoomHookBody(roomHookTestSecret, statusBody), http.StatusOK)
+		makeRoomHookRequest(t, "status", statusBody, signRoomDelivery(statusBody), http.StatusOK)
 		assert.Equal(t, before+1, countComments())
 
 		// ...and the stale creation-time head no longer does.
 		staleBody := fmt.Sprintf(`{"sha":%q,"state":"failure",`+
 			`"repository":{"name":"repo1","owner":{"login":"user2"}},"sender":{"login":"user2"}}`, oldHead)
-		makeRoomHookRequest(t, "status", staleBody, signRoomHookBody(roomHookTestSecret, staleBody), http.StatusAccepted)
+		makeRoomHookRequest(t, "status", staleBody, signRoomDelivery(staleBody), http.StatusAccepted)
 		assert.Equal(t, before+1, countComments())
 	})
 
@@ -338,12 +416,12 @@ func TestAPIRobotRoom(t *testing.T) {
 		tagTitle := "Room: " + tagBranch
 
 		body := roomPushPayload("refs/heads/"+tagBranch, head)
-		makeRoomHookRequest(t, "push", body, signRoomHookBody(roomHookTestSecret, body), http.StatusOK)
+		makeRoomHookRequest(t, "push", body, signRoomDelivery(body), http.StatusOK)
 		unittest.AssertExistsAndLoadBean(t, &issues_model.Issue{RepoID: 1, Title: tagTitle})
 
 		del := fmt.Sprintf(`{"ref":%q,"ref_type":"tag",`+
 			`"repository":{"name":"repo1","owner":{"login":"user2"}},"sender":{"login":"user2"}}`, tagBranch)
-		makeRoomHookRequest(t, "delete", del, signRoomHookBody(roomHookTestSecret, del), http.StatusAccepted)
+		makeRoomHookRequest(t, "delete", del, signRoomDelivery(del), http.StatusAccepted)
 
 		issue := unittest.AssertExistsAndLoadBean(t, &issues_model.Issue{RepoID: 1, Title: tagTitle})
 		assert.False(t, issue.IsClosed)
@@ -352,7 +430,7 @@ func TestAPIRobotRoom(t *testing.T) {
 	t.Run("NonFeatBranchDeleteIgnored", func(t *testing.T) {
 		del := `{"ref":"main","ref_type":"branch",` +
 			`"repository":{"name":"repo1","owner":{"login":"user2"}},"sender":{"login":"user2"}}`
-		makeRoomHookRequest(t, "delete", del, signRoomHookBody(roomHookTestSecret, del), http.StatusAccepted)
+		makeRoomHookRequest(t, "delete", del, signRoomDelivery(del), http.StatusAccepted)
 		assert.Equal(t, 0, unittest.GetCount(t, &issues_model.Issue{RepoID: 1, Title: "Room: main"}))
 	})
 }

@@ -162,3 +162,57 @@ func TestStatusComment(t *testing.T) {
 		})
 	}
 }
+
+// TestIssueTitle pins the room title, half of a room's identity and the field
+// both sides match on.
+func TestIssueTitle(t *testing.T) {
+	if got := IssueTitle("feat/foo"); got != "Room: feat/foo" {
+		t.Errorf("IssueTitle() = %q, want %q", got, "Room: feat/foo")
+	}
+	if !strings.HasPrefix(IssueTitle("feat/foo"), TitlePrefix) {
+		t.Error("IssueTitle() does not start with TitlePrefix")
+	}
+}
+
+// TestIsRoomFor covers the shared match predicate: the room hook and the
+// gitea-robot CLI both decide "is this issue the room for that branch?"
+// through it, so it is the one place the rule is written down.
+func TestIsRoomFor(t *testing.T) {
+	body := IssueBody("feat/foo", "abc123")
+
+	tests := []struct {
+		name   string
+		title  string
+		body   string
+		branch string
+		want   bool
+	}{
+		{"exact title and marker", IssueTitle("feat/foo"), body, "feat/foo", true},
+		{"renamed title", "Room: feat/foo (WIP)", body, "feat/foo", false},
+		{"empty title", "", body, "feat/foo", false},
+		{"title of another branch", IssueTitle("feat/bar"), body, "feat/foo", false},
+		{"marker of another branch", IssueTitle("feat/foo"), IssueBody("feat/bar", ""), "feat/foo", false},
+		{"no marker at all", IssueTitle("feat/foo"), "just an issue", "feat/foo", false},
+		{"marker but wrong type", IssueTitle("feat/foo"), "```json\n{\"type\":\"other\",\"branch\":\"feat/foo\"}\n```", "feat/foo", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsRoomFor(tt.title, tt.body, tt.branch); got != tt.want {
+				t.Errorf("IsRoomFor() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestMarkerHeadFragment checks the fragment really is a substring of the
+// marker JSON: the room hook uses it as a database pre-filter, so a drift
+// between the two would silently stop the marker-head fallback from matching.
+func TestMarkerHeadFragment(t *testing.T) {
+	const head = "0123456789abcdef0123456789abcdef01234567"
+	if frag := MarkerHeadFragment(head); !strings.Contains(MarkerJSON("feat/foo", head), frag) {
+		t.Errorf("MarkerHeadFragment(%q) = %q, not a substring of %q", head, frag, MarkerJSON("feat/foo", head))
+	}
+	if strings.Contains(MarkerJSON("feat/foo", "other"), MarkerHeadFragment(head)) {
+		t.Error("MarkerHeadFragment matched a marker with a different head")
+	}
+}

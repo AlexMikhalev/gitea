@@ -73,6 +73,7 @@ func TestDeleteTargetsRoom(t *testing.T) {
 		{"branch", "feat/foo", true},
 		{"branch", "feat/56-branch-as-room", true},
 		{"tag", "feat/foo", false}, // a tag named like a feat branch never carried a room
+		{"branch", "feat/", false}, // empty branch name: not a branch to any entry point
 		{"branch", "main", false},
 		{"branch", "feature/foo", false},
 		{"tag", "v1.0.0", false},
@@ -222,16 +223,74 @@ func TestMergedFeatBranch(t *testing.T) {
 	}
 }
 
-// TestRoomPayloadRepoHint covers the untrusted owner/repo hint used to make
-// bad-signature audit records useful.
-func TestRoomPayloadRepoHint(t *testing.T) {
-	owner, repo := roomPayloadRepoHint([]byte(`{"repository":{"name":"repo1","owner":{"login":"user2"}}}`))
-	if owner != "user2" || repo != "repo1" {
-		t.Errorf("hint = (%q, %q), want (user2, repo1)", owner, repo)
+// TestRoomPayloadRepoClaim covers the repository claim read from the delivery
+// body: it selects the signing key and, once verified, the target repository.
+func TestRoomPayloadRepoClaim(t *testing.T) {
+	claim := roomPayloadRepoClaim([]byte(`{"repository":{"name":"repo1","owner":{"login":"user2"}}}`))
+	if claim.Owner != "user2" || claim.Name != "repo1" {
+		t.Errorf("claim = %+v, want {user2 repo1}", claim)
 	}
 	for _, body := range []string{`{invalid`, `{}`, `{"repository":{"name":"r"}}`, `{"repository":null}`} {
-		if owner, repo := roomPayloadRepoHint([]byte(body)); owner != "" || repo != "" {
-			t.Errorf("hint(%s) = (%q, %q), want empty", body, owner, repo)
+		if claim := roomPayloadRepoClaim([]byte(body)); claim.Owner != "" || claim.Name != "" {
+			t.Errorf("claim(%s) = %+v, want empty", body, claim)
+		}
+	}
+}
+
+// TestRoomHookSecretForRepo pins the per-repository secret derivation: it is
+// deterministic, case-insensitive in owner/repo (Gitea repo lookup is), and
+// distinct for every repository and every master secret - which is what stops
+// one repository's hook secret from signing another repository's deliveries.
+func TestRoomHookSecretForRepo(t *testing.T) {
+	const master = "instance-master-secret"
+
+	got := roomHookSecretForRepo(master, "user2", "repo1")
+	if got == "" || got == master {
+		t.Fatalf("derived secret = %q", got)
+	}
+	if again := roomHookSecretForRepo(master, "user2", "repo1"); again != got {
+		t.Errorf("derivation is not deterministic: %q vs %q", got, again)
+	}
+	if mixed := roomHookSecretForRepo(master, "User2", "Repo1"); mixed != got {
+		t.Errorf("derivation is case-sensitive: %q vs %q", mixed, got)
+	}
+	for _, other := range [][2]string{{"user2", "repo2"}, {"user3", "repo1"}, {"user2r", "epo1"}} {
+		if s := roomHookSecretForRepo(master, other[0], other[1]); s == got {
+			t.Errorf("%s/%s derives the same secret as user2/repo1", other[0], other[1])
+		}
+	}
+	if s := roomHookSecretForRepo("other-master", "user2", "repo1"); s == got {
+		t.Error("a different master secret derives the same repository secret")
+	}
+
+	// A delivery signed with repo1's secret must not verify as repo2's.
+	body := []byte(`{"repository":{"name":"repo1","owner":{"login":"user2"}}}`)
+	sig := signBody(t, got, body)
+	if !verifyRoomHookSignature(got, body, sig, "") {
+		t.Error("delivery did not verify against its own repository secret")
+	}
+	if verifyRoomHookSignature(roomHookSecretForRepo(master, "user2", "repo2"), body, sig, "") {
+		t.Error("repo1's signature verified against repo2's secret")
+	}
+}
+
+// TestIsHexSHA covers the guard in front of the marker-head LIKE lookup.
+func TestIsHexSHA(t *testing.T) {
+	tests := []struct {
+		sha  string
+		want bool
+	}{
+		{"0123456789abcdef0123456789abcdef01234567", true},
+		{"ABCDEF", true},
+		{"", false},
+		{"%", false},
+		{"012345_789abcdef0123456789abcdef01234567", false},
+		{"0123456789abcdef0123456789abcdef0123456%", false},
+		{strings.Repeat("a", 65), false},
+	}
+	for _, tt := range tests {
+		if got := isHexSHA(tt.sha); got != tt.want {
+			t.Errorf("isHexSHA(%q) = %v, want %v", tt.sha, got, tt.want)
 		}
 	}
 }
