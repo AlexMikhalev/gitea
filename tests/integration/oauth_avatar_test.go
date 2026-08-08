@@ -28,7 +28,7 @@ func TestOAuth2AvatarFromPicture(t *testing.T) {
 	defer tests.PrepareTestEnv(t)()
 	defer test.MockVariableValue(&setting.OAuth2Client.UpdateAvatar, true)()
 
-	mockServer := createOAuth2MockProvider()
+	mockServer := createMockServer()
 	defer mockServer.Close()
 	addOAuth2Source(t, "test-oidc-avatar", oauth2.Source{
 		Provider:                      "openidConnect",
