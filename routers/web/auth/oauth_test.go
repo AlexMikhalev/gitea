@@ -4,7 +4,11 @@
 package auth
 
 import (
+	"errors"
+	"net"
+	"net/http"
 	"testing"
+	"time"
 
 	"code.gitea.io/gitea/models/auth"
 	"code.gitea.io/gitea/models/unittest"
@@ -37,6 +41,36 @@ func createAndParseToken(t *testing.T, grant *auth.OAuth2Grant) *oauth2_provider
 	assert.NotNil(t, oidcToken)
 
 	return oidcToken
+}
+
+func TestAvatarErrForLog(t *testing.T) {
+	// A real request to a closed port produces the *url.Error that http.Client
+	// returns in production; its Error() embeds the whole request URL.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	assert.NoError(t, err)
+	closedAddr := listener.Addr().String()
+	assert.NoError(t, listener.Close())
+
+	const secret = "s3cret-signature-value"
+	avatarURL := "http://" + closedAddr + "/avatar.png?token=" + secret
+
+	req, err := http.NewRequest(http.MethodGet, avatarURL, nil)
+	assert.NoError(t, err)
+	_, err = (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	assert.Error(t, err)
+
+	// Guard against the test going vacuous: the raw error must leak the secret,
+	// otherwise it is not exercising the case this sanitiser exists for.
+	assert.Contains(t, err.Error(), secret)
+
+	sanitised := avatarErrForLog(err).Error()
+	assert.NotContains(t, sanitised, secret)
+	assert.NotContains(t, sanitised, "?")
+	assert.NotEmpty(t, sanitised)
+
+	// Errors that do not wrap a URL are passed through untouched.
+	plain := errors.New("some unrelated failure")
+	assert.Equal(t, plain, avatarErrForLog(plain))
 }
 
 func TestNewAccessTokenResponse_OIDCToken(t *testing.T) {

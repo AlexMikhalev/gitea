@@ -8,6 +8,8 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
+	"image"
+	"image/png"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1168,6 +1170,13 @@ func createMockServer() *httptest.Server {
 	var mockServer *httptest.Server
 	mockServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
+		case "/avatar.png":
+			if !strings.HasPrefix(r.Header.Get("User-Agent"), "Gitea ") {
+				http.Error(w, "user agent doesn't match", http.StatusForbidden)
+				return
+			}
+			w.Header().Set("Content-Type", "image/png")
+			_ = png.Encode(w, image.NewRGBA(image.Rect(0, 0, 8, 8)))
 		case "/.well-known/openid-configuration":
 			_, _ = w.Write([]byte(`{
 				"issuer": "` + mockServer.URL + `",
