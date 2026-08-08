@@ -302,6 +302,16 @@ func GetActionsUserRepoPermission(ctx context.Context, repo *repo_model.Reposito
 	return perm, nil
 }
 
+// GetDoerRepoPermission returns the permissions of the request doer to the repository.
+// Unlike GetUserRepoPermission it resolves Actions task users to their task-scoped
+// permissions, so request paths reachable by an Actions runner must use this.
+func GetDoerRepoPermission(ctx context.Context, repo *repo_model.Repository, user *user_model.User) (Permission, error) {
+	if taskID, ok := user_model.GetActionsUserTaskID(user); ok {
+		return GetActionsUserRepoPermission(ctx, repo, user, taskID)
+	}
+	return GetUserRepoPermission(ctx, repo, user)
+}
+
 // GetUserRepoPermission returns the user permissions to the repository
 func GetUserRepoPermission(ctx context.Context, repo *repo_model.Repository, user *user_model.User) (perm Permission, err error) {
 	defer func() {
