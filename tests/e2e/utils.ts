@@ -2,6 +2,15 @@ import {env} from 'node:process';
 import {expect} from '@playwright/test';
 import type {APIRequestContext, Locator, Page} from '@playwright/test';
 
+export function randomString(length: number): string {
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  let result = '';
+  for (let index = 0; index < length; index++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return result;
+}
+
 export function apiBaseUrl() {
   return env.GITEA_TEST_E2E_URL?.replace(/\/$/g, '');
 }
@@ -31,6 +40,22 @@ export async function apiCreateRepo(requestContext: APIRequestContext, {name, au
   }), 'apiCreateRepo');
 }
 
+export async function apiCreateIssue(
+  requestContext: APIRequestContext,
+  {owner, repo, title, body}: {owner: string; repo: string; title: string; body?: string},
+): Promise<{index: number}> {
+  let index = 0;
+  await apiRetry(async () => {
+    const response = await requestContext.post(`${apiBaseUrl()}/api/v1/repos/${owner}/${repo}/issues`, {
+      headers: apiHeaders(),
+      data: {title, body: body || ''},
+    });
+    if (response.ok()) ({index} = await response.json());
+    return response;
+  }, 'apiCreateIssue');
+  return {index};
+}
+
 export async function apiDeleteRepo(requestContext: APIRequestContext, owner: string, name: string) {
   await apiRetry(() => requestContext.delete(`${apiBaseUrl()}/api/v1/repos/${owner}/${name}`, {
     headers: apiHeaders(),
@@ -41,6 +66,10 @@ export async function apiDeleteOrg(requestContext: APIRequestContext, name: stri
   await apiRetry(() => requestContext.delete(`${apiBaseUrl()}/api/v1/orgs/${name}`, {
     headers: apiHeaders(),
   }), 'apiDeleteOrg');
+}
+
+export async function assertNoJsError(page: Page) {
+  await expect(page.locator('.js-global-error')).toHaveCount(0);
 }
 
 export async function clickDropdownItem(page: Page, trigger: Locator, itemText: string) {
