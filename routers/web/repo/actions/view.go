@@ -420,6 +420,22 @@ func checkRunRerunAllowed(ctx *context_module.Context, run *actions_model.Action
 	return true
 }
 
+// handleRerunError writes a user-facing JSON error for a rerun the service rejected on
+// validation grounds, and a server error for anything else. Without it, a run with
+// nothing to rerun would surface as a 500 on a button click.
+func handleRerunError(ctx *context_module.Context, err error) {
+	switch {
+	case errors.Is(err, actions_service.ErrNoJobsToRerun):
+		ctx.JSONError(ctx.Locale.Tr("actions.runs.no_jobs_to_rerun"))
+	case errors.Is(err, util.ErrInvalidArgument):
+		// Defensive: checkRunRerunAllowed already reports the run-not-done and
+		// workflow-disabled cases with localised messages before we reach here.
+		ctx.JSONError(err.Error()) // has no translation
+	default:
+		ctx.ServerError("RerunWorkflowRunJobs", err)
+	}
+}
+
 // Rerun will rerun jobs in the given run
 // If jobIndexStr is a blank string, it means rerun all jobs
 func Rerun(ctx *context_module.Context) {
@@ -453,7 +469,7 @@ func Rerun(ctx *context_module.Context) {
 	}
 
 	if err := actions_service.RerunWorkflowRunJobs(ctx, ctx.Repo.Repository, run, jobsToRerun); err != nil {
-		ctx.ServerError("RerunWorkflowRunJobs", err)
+		handleRerunError(ctx, err)
 		return
 	}
 
@@ -481,7 +497,7 @@ func RerunFailed(ctx *context_module.Context) {
 	}
 
 	if err := actions_service.RerunWorkflowRunJobs(ctx, ctx.Repo.Repository, run, actions_service.GetFailedRerunJobs(jobs)); err != nil {
-		ctx.ServerError("RerunWorkflowRunJobs", err)
+		handleRerunError(ctx, err)
 		return
 	}
 

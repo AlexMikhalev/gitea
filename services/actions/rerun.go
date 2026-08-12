@@ -69,20 +69,34 @@ func GetAllRerunJobs(job *actions_model.ActionRunJob, allJobs []*actions_model.A
 	return rerunJobs
 }
 
+// ErrNoJobsToRerun is returned when a rerun request resolves to no jobs at all, for
+// example a rerun-failed request against a run in which nothing failed.
+var ErrNoJobsToRerun = util.NewInvalidArgumentErrorf("no jobs to rerun")
+
+// validateRunRerun reports whether a rerun of the given run is permitted. It only
+// inspects state and never mutates the run, so it is safe to call before knowing
+// whether there is any work to do.
+func validateRunRerun(ctx context.Context, repo *repo_model.Repository, run *actions_model.ActionRun) error {
+	// Rerun is not allowed if the run is not done.
+	if !run.Status.IsDone() {
+		return util.NewInvalidArgumentErrorf("this workflow run is not done")
+	}
+
+	// Rerun is not allowed when workflow is disabled.
+	cfg := repo.MustGetUnit(ctx, unit.TypeActions).ActionsConfig()
+	if cfg.IsWorkflowDisabled(run.WorkflowID) {
+		return util.NewInvalidArgumentErrorf("workflow %s is disabled", run.WorkflowID)
+	}
+
+	return nil
+}
+
 // prepareRunRerun validates the run, resets its state, handles concurrency, persists the
 // updated run, and fires a status-update notification.
 // It returns isRunBlocked (true when the run itself is held by a concurrency group).
 func prepareRunRerun(ctx context.Context, repo *repo_model.Repository, run *actions_model.ActionRun, jobs []*actions_model.ActionRunJob) (isRunBlocked bool, err error) {
-	if !run.Status.IsDone() {
-		return false, util.NewInvalidArgumentErrorf("this workflow run is not done")
-	}
-
-	cfgUnit := repo.MustGetUnit(ctx, unit.TypeActions)
-
-	// Rerun is not allowed when workflow is disabled.
-	cfg := cfgUnit.ActionsConfig()
-	if cfg.IsWorkflowDisabled(run.WorkflowID) {
-		return false, util.NewInvalidArgumentErrorf("workflow %s is disabled", run.WorkflowID)
+	if err := validateRunRerun(ctx, repo, run); err != nil {
+		return false, err
 	}
 
 	// Reset run's timestamps and status.
@@ -133,9 +147,18 @@ func prepareRunRerun(ctx context.Context, repo *repo_model.Repository, run *acti
 // jobsToRerun must include all jobs to be rerun (the target job and its transitively dependent jobs).
 // A job is blocked (waiting for dependencies) if the run itself is blocked or if any of its
 // needs are also being rerun.
+//
+// The run is validated before the empty-set check so that an unrunnable rerun is always
+// rejected, even when it resolves to no jobs. Validation is deliberately separate from
+// prepareRunRerun, which mutates the run: resetting a run that has nothing to rerun would
+// leave it waiting forever.
 func RerunWorkflowRunJobs(ctx context.Context, repo *repo_model.Repository, run *actions_model.ActionRun, jobsToRerun []*actions_model.ActionRunJob) error {
+	if err := validateRunRerun(ctx, repo, run); err != nil {
+		return err
+	}
+
 	if len(jobsToRerun) == 0 {
-		return nil
+		return ErrNoJobsToRerun
 	}
 
 	isRunBlocked, err := prepareRunRerun(ctx, repo, run, jobsToRerun)

@@ -233,6 +233,90 @@ func TestAPIActionsRerunWorkflowRun(t *testing.T) {
 	})
 }
 
+// TestAPIActionsRerunFailedWorkflowRun covers the rerun-failed-jobs endpoint added by
+// upstream #36924, which shipped without integration coverage.
+//
+// The first two sub-cases pin a fork-side divergence: upstream skips all validation when
+// the failed-job set is empty and answers 201 Created for a rerun it never performed.
+// Both now answer 400.
+func TestAPIActionsRerunFailedWorkflowRun(t *testing.T) {
+	defer prepareTestEnvActionsArtifacts(t)()
+
+	t.Run("NotDoneWithNoFailedJobs", func(t *testing.T) {
+		// Run 793 is still running and nothing in it has failed, so the failed set is
+		// empty. Upstream returns 201 here without ever checking the run state.
+		repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 4})
+		user := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: repo.OwnerID})
+		session := loginUser(t, user.Name)
+		writeToken := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeWriteRepository)
+
+		req := NewRequest(t, "POST", fmt.Sprintf("/api/v1/repos/%s/actions/runs/793/rerun-failed-jobs", repo.FullName())).
+			AddTokenAuth(writeToken)
+		MakeRequest(t, req, http.StatusBadRequest)
+
+		// The run must be untouched, not reset to waiting.
+		run, err := actions_model.GetRunByRepoAndID(t.Context(), repo.ID, 793)
+		require.NoError(t, err)
+		assert.Equal(t, actions_model.StatusRunning, run.Status)
+	})
+
+	t.Run("DoneWithNoFailedJobs", func(t *testing.T) {
+		// Run 792 completed successfully, so there is nothing to rerun.
+		repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 4})
+		user := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: repo.OwnerID})
+		session := loginUser(t, user.Name)
+		writeToken := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeWriteRepository)
+
+		req := NewRequest(t, "POST", fmt.Sprintf("/api/v1/repos/%s/actions/runs/792/rerun-failed-jobs", repo.FullName())).
+			AddTokenAuth(writeToken)
+		MakeRequest(t, req, http.StatusBadRequest)
+
+		run, err := actions_model.GetRunByRepoAndID(t.Context(), repo.ID, 792)
+		require.NoError(t, err)
+		assert.Equal(t, actions_model.StatusSuccess, run.Status)
+	})
+
+	repo := unittest.AssertExistsAndLoadBean(t, &repo_model.Repository{ID: 2})
+	user := unittest.AssertExistsAndLoadBean(t, &user_model.User{ID: repo.OwnerID})
+	session := loginUser(t, user.Name)
+
+	writeToken := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeWriteRepository)
+	readToken := getTokenForLoggedInUser(t, session, auth_model.AccessTokenScopeReadRepository)
+
+	t.Run("ForbiddenWithoutWriteScope", func(t *testing.T) {
+		req := NewRequest(t, "POST", fmt.Sprintf("/api/v1/repos/%s/actions/runs/795/rerun-failed-jobs", repo.FullName())).
+			AddTokenAuth(readToken)
+		MakeRequest(t, req, http.StatusForbidden)
+	})
+
+	t.Run("NotFound", func(t *testing.T) {
+		req := NewRequest(t, "POST", fmt.Sprintf("/api/v1/repos/%s/actions/runs/999999/rerun-failed-jobs", repo.FullName())).
+			AddTokenAuth(writeToken)
+		MakeRequest(t, req, http.StatusNotFound)
+	})
+
+	t.Run("Success", func(t *testing.T) {
+		// Run 795 failed: job 199 failed, job 198 succeeded and nothing depends on it.
+		// Only the failed job is rerun.
+		req := NewRequest(t, "POST", fmt.Sprintf("/api/v1/repos/%s/actions/runs/795/rerun-failed-jobs", repo.FullName())).
+			AddTokenAuth(writeToken)
+		MakeRequest(t, req, http.StatusCreated)
+
+		run, err := actions_model.GetRunByRepoAndID(t.Context(), repo.ID, 795)
+		require.NoError(t, err)
+		assert.Equal(t, actions_model.StatusWaiting, run.Status)
+
+		job198, err := actions_model.GetRunJobByID(t.Context(), 198)
+		require.NoError(t, err)
+		assert.Equal(t, actions_model.StatusSuccess, job198.Status, "a job that succeeded must not be rerun")
+
+		job199, err := actions_model.GetRunJobByID(t.Context(), 199)
+		require.NoError(t, err)
+		assert.Equal(t, actions_model.StatusWaiting, job199.Status)
+		assert.Equal(t, int64(0), job199.TaskID)
+	})
+}
+
 func TestAPIActionsRerunWorkflowJob(t *testing.T) {
 	defer prepareTestEnvActionsArtifacts(t)()
 
