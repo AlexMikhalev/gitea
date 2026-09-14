@@ -6,6 +6,7 @@ package setting
 import (
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -237,4 +238,19 @@ DEFAULT_ACTIONS_URL = gitea
 			assert.Equal(t, tt.wantURL, Actions.DefaultActionsURL.URL())
 		})
 	}
+}
+
+// TestActions_ZombieTaskTimeoutDefault verifies that the default value for
+// ZOMBIE_TASK_TIMEOUT is 60 minutes, not the upstream 10-minute default. The
+// 60-minute default is required to avoid premature finalization of long
+// workflows (e.g. the 14-step terraphim/clients native-ci which takes 12-14
+// minutes). See terraphim/gitea#116 GAP-5.
+func TestActions_ZombieTaskTimeoutDefault(t *testing.T) {
+	// When no ZOMBIE_TASK_TIMEOUT ini key is set, the default must be 60min.
+	iniStr := ""
+	cfg, err := NewConfigProviderFromData(iniStr)
+	require.NoError(t, err)
+	require.NoError(t, loadActionsFrom(cfg))
+	assert.EqualValues(t, 60*time.Minute, Actions.ZombieTaskTimeout,
+		"ZombieTaskTimeout default should be 60min (was 10min upstream); see #116 GAP-5")
 }

@@ -114,7 +114,12 @@ func loadActionsFrom(rootCfg ConfigProvider) error {
 		Actions.ArtifactRetentionDays = 90
 	}
 
-	Actions.ZombieTaskTimeout = sec.Key("ZOMBIE_TASK_TIMEOUT").MustDuration(10 * time.Minute)
+	// Default raised to 60min from the upstream 10min default to avoid premature
+	// finalization of long workflows. The longest workflow we run today
+	// (terraphim/clients native-ci, 14 steps) takes 12-14min, so 60min gives 4-5x
+	// headroom. Operators can still tighten via app.ini ZOMBIE_TASK_TIMEOUT if
+	// they want stricter behaviour. See terraphim/gitea#116 GAP-5.
+	Actions.ZombieTaskTimeout = sec.Key("ZOMBIE_TASK_TIMEOUT").MustDuration(60 * time.Minute)
 	Actions.EndlessTaskTimeout = sec.Key("ENDLESS_TASK_TIMEOUT").MustDuration(3 * time.Hour)
 	Actions.AbandonedJobTimeout = sec.Key("ABANDONED_JOB_TIMEOUT").MustDuration(24 * time.Hour)
 
